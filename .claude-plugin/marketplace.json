@@ -1,0 +1,15 @@
+{
+  "name": "inferlab",
+  "description": "Inferlab is a reproducible LLM inference experiment harness: versioned workspaces, closed-loop serve/eval/bench recipes, runtime images, and file-first evidence.",
+  "owner": {
+    "name": "Zihua Wu"
+  },
+  "plugins": [
+    {
+      "name": "inferlab",
+      "description": "Agent Skill for operating the Inferlab CLI: serve lifecycles, closed-loop recipes, benches, runtime images, and the scratchpad journal.",
+      "version": "0.1.0",
+      "source": "./plugins/inferlab"
+    }
+  ]
+}

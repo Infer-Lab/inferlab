@@ -1,0 +1,8 @@
+{
+  "name": "inferlab",
+  "description": "Agent Skill for operating the Inferlab CLI: reproducible LLM inference experiments with file-first evidence.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Zihua Wu"
+  }
+}

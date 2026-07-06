@@ -1,0 +1,12 @@
+{
+  "status": "ok",
+  "protocol_version": "3",
+  "result": {
+    "operation": "plan_serve",
+    "output": {
+      "resources": {
+        "accelerator_count": 4
+      }
+    }
+  }
+}

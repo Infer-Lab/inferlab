@@ -1,0 +1,21 @@
+[package]
+name = "inferlab-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire types for the Inferlab framework-integration protocol: strict, versioned one-shot JSON adapter operations."
+keywords = ["llm", "inference", "protocol", "json"]
+categories = ["encoding"]
+include = ["src/**", "LICENSE"]
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

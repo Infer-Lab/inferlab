@@ -1,0 +1,22 @@
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["python"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = [
+    "python/inferlab-adapter-sdk/src",
+    "python/inferlab-eval-runner/src",
+    "python/inferlab-integration-vllm/src",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [
+    "python/inferlab-adapter-sdk/src/inferlab_adapter_sdk/_generated.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

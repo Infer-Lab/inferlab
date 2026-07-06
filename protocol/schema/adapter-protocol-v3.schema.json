@@ -1,0 +1,1764 @@
+{
+  "$id": "https://inferlab.dev/schema/adapter-protocol/v3",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdapterProtocol",
+  "description": "The schema root aggregating every wire type. It exists to generate one\ncommitted JSON schema (and the Python SDK models); its optional client\nfields are never all populated in a single message.",
+  "type": "object",
+  "properties": {
+    "bench_client_request": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BenchClientRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bench_client_result": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BenchClientResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "eval_client_request": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EvalClientRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "eval_client_result": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EvalClientResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request": {
+      "$ref": "#/$defs/AdapterRequest"
+    },
+    "response": {
+      "$ref": "#/$defs/AdapterResponse"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "request",
+    "response"
+  ],
+  "$defs": {
+    "AdapterError": {
+      "description": "A structured rejection an integration returns in an [`AdapterResponse::Error`].",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/AdapterErrorCode"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "AdapterErrorCode": {
+      "description": "Machine-readable failure category an adapter reports in an [`AdapterError`].",
+      "oneOf": [
+        {
+          "description": "The request was malformed or missing required fields.",
+          "type": "string",
+          "const": "invalid_request"
+        },
+        {
+          "description": "The request's protocol version is not accepted.",
+          "type": "string",
+          "const": "unsupported_protocol_version"
+        },
+        {
+          "description": "A framework setting was unknown or invalid.",
+          "type": "string",
+          "const": "invalid_settings"
+        },
+        {
+          "description": "An unexpected internal failure occurred in the integration.",
+          "type": "string",
+          "const": "internal"
+        },
+        {
+          "description": "The requested operation is not supported by this integration.",
+          "type": "string",
+          "const": "unsupported_operation"
+        }
+      ]
+    },
+    "AdapterRequest": {
+      "description": "The one JSON request an integration reads from stdin, tagged by the\nrequested operation.",
+      "oneOf": [
+        {
+          "description": "Plan a serve topology: declare roles, per-replica requirements, links,\nand endpoint requirements from the requested shape.",
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/PlanServeInput"
+            },
+            "operation": {
+              "type": "string",
+              "const": "plan_serve"
+            },
+            "protocol_version": {
+              "$ref": "#/$defs/ProtocolVersion"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "operation",
+            "protocol_version",
+            "input"
+          ]
+        },
+        {
+          "description": "Render final process invocations for a planned topology, given the\ncontrol plane's concrete process allocations.",
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/RenderServeInput"
+            },
+            "operation": {
+              "type": "string",
+              "const": "render_serve"
+            },
+            "protocol_version": {
+              "$ref": "#/$defs/ProtocolVersion"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "operation",
+            "protocol_version",
+            "input"
+          ]
+        }
+      ]
+    },
+    "AdapterResponse": {
+      "description": "The one JSON response an integration writes to stdout, tagged by outcome.",
+      "oneOf": [
+        {
+          "description": "The operation succeeded and carries its result.",
+          "type": "object",
+          "properties": {
+            "protocol_version": {
+              "$ref": "#/$defs/ProtocolVersion"
+            },
+            "result": {
+              "$ref": "#/$defs/AdapterResult"
+            },
+            "status": {
+              "type": "string",
+              "const": "ok"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "protocol_version",
+            "result"
+          ]
+        },
+        {
+          "description": "The operation was rejected with a structured error.",
+          "type": "object",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/AdapterError"
+            },
+            "protocol_version": {
+              "$ref": "#/$defs/ProtocolVersion"
+            },
+            "status": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "protocol_version",
+            "error"
+          ]
+        }
+      ]
+    },
+    "AdapterResult": {
+      "description": "The successful result of an [`AdapterRequest`], tagged by the operation it\nanswers.",
+      "oneOf": [
+        {
+          "description": "The planned topology from a `PlanServe` request.",
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "const": "plan_serve"
+            },
+            "output": {
+              "$ref": "#/$defs/PlanServeResult"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "operation",
+            "output"
+          ]
+        },
+        {
+          "description": "The rendered process invocations from a `RenderServe` request.",
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "string",
+              "const": "render_serve"
+            },
+            "output": {
+              "$ref": "#/$defs/RenderServeResult"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "operation",
+            "output"
+          ]
+        }
+      ]
+    },
+    "BenchCaseInput": {
+      "description": "A single Bench case: its load shape and the number of requests to send.",
+      "type": "object",
+      "properties": {
+        "load_shape": {
+          "$ref": "#/$defs/BenchLoadInput"
+        },
+        "request_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "load_shape",
+        "request_count"
+      ]
+    },
+    "BenchClientRequest": {
+      "description": "The request the Bench measurement runtime passes to its client: the\nendpoint, model, bench definition, the load case to run, and the artifact\ndirectory.",
+      "type": "object",
+      "properties": {
+        "artifact_dir": {
+          "type": "string"
+        },
+        "case": {
+          "$ref": "#/$defs/BenchCaseInput"
+        },
+        "definition": {
+          "$ref": "#/$defs/BenchDefinitionInput"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/ClientEndpointInput"
+        },
+        "model": {
+          "$ref": "#/$defs/ServeModelInput"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "endpoint",
+        "model",
+        "definition",
+        "case",
+        "artifact_dir"
+      ]
+    },
+    "BenchClientResult": {
+      "description": "The result a Bench client writes for the measurement runtime to consume.",
+      "type": "object",
+      "properties": {
+        "completed_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failed_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "native_command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "native_exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "normalization_schema": {
+          "type": "string"
+        },
+        "raw_artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RawArtifact"
+          }
+        },
+        "schema_version": {
+          "description": "Result envelope version; clients write `1`. The measurement runtime\nrejects a bench result whose version is not `1`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ClientStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "completed_requests",
+        "failed_requests",
+        "normalization_schema",
+        "metrics",
+        "native_command",
+        "raw_artifacts"
+      ]
+    },
+    "BenchDefinitionInput": {
+      "description": "The workload shape a Bench client drives, shared across its load cases.",
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "reset_prefix_cache": {
+          "type": "boolean",
+          "default": false
+        },
+        "seed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "temperature": {
+          "type": "number",
+          "format": "double"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "seed",
+        "temperature",
+        "timeout_seconds"
+      ]
+    },
+    "BenchLoadInput": {
+      "description": "How a Bench case paces its requests.",
+      "oneOf": [
+        {
+          "description": "A fixed number of in-flight requests.",
+          "type": "object",
+          "properties": {
+            "concurrency": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "concurrency_limited"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "concurrency"
+          ]
+        },
+        {
+          "description": "A target arrival rate, optionally shaped by a burstiness factor.",
+          "type": "object",
+          "properties": {
+            "burstiness": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "kind": {
+              "type": "string",
+              "const": "request_rate_limited"
+            },
+            "request_rate": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "request_rate"
+          ]
+        },
+        {
+          "description": "All requests issued as fast as possible.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unbounded_request_rate"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "CaptureControlRequirement": {
+      "description": "The HTTP paths a capture target exposes to open and close a capture window.",
+      "type": "object",
+      "properties": {
+        "start_path": {
+          "type": "string"
+        },
+        "stop_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "start_path",
+        "stop_path"
+      ]
+    },
+    "CaptureTargetRequirement": {
+      "description": "Marks a replica as a profiling capture target and carries its window\ncontrol ([[RFC-0004:C-WORKLOAD-PROFILING]]).",
+      "type": "object",
+      "properties": {
+        "control": {
+          "$ref": "#/$defs/CaptureControlRequirement"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "control"
+      ]
+    },
+    "ClientEndpointInput": {
+      "description": "The public workload endpoint an Eval or Bench client connects to.",
+      "type": "object",
+      "properties": {
+        "api_path": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "protocol": {
+          "$ref": "#/$defs/EndpointProtocol"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "host",
+        "port",
+        "api_path"
+      ]
+    },
+    "ClientStatus": {
+      "description": "The terminal outcome a measurement client reports.",
+      "oneOf": [
+        {
+          "description": "The client completed its measurement successfully.",
+          "type": "string",
+          "const": "succeeded"
+        },
+        {
+          "description": "The client did not complete successfully.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "EndpointAssignment": {
+      "description": "A concrete host/port endpoint the control plane allocated for a process.",
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "port"
+      ]
+    },
+    "EndpointProtocol": {
+      "description": "The application protocol a workload endpoint speaks.",
+      "oneOf": [
+        {
+          "description": "HTTP.",
+          "type": "string",
+          "const": "http"
+        }
+      ]
+    },
+    "EndpointRequirement": {
+      "description": "The workload endpoint's protocol and API path, plus an optional\nprefix-cache-reset action a Bench case can invoke between runs.",
+      "type": "object",
+      "properties": {
+        "api_path": {
+          "type": "string"
+        },
+        "prefix_cache_reset": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpActionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol": {
+          "$ref": "#/$defs/EndpointProtocol"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "api_path"
+      ]
+    },
+    "EvalClientRequest": {
+      "description": "The request the Eval measurement runtime passes to its client: the endpoint\nto hit, the model, the eval definition, and where to write artifacts.",
+      "type": "object",
+      "properties": {
+        "artifact_dir": {
+          "type": "string"
+        },
+        "definition": {
+          "$ref": "#/$defs/EvalDefinitionInput"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/ClientEndpointInput"
+        },
+        "model": {
+          "$ref": "#/$defs/ServeModelInput"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "endpoint",
+        "model",
+        "definition",
+        "artifact_dir"
+      ]
+    },
+    "EvalClientResult": {
+      "description": "The result an Eval client writes for the measurement runtime to consume.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "native_command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "raw_artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RawArtifact"
+          }
+        },
+        "schema_version": {
+          "description": "Result envelope version; clients write `1`. The measurement runtime\nrejects an eval result whose version is not `1`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ClientStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "metrics",
+        "native_command",
+        "raw_artifacts"
+      ]
+    },
+    "EvalDefinitionInput": {
+      "description": "The measurement an Eval client runs against the workload endpoint.",
+      "oneOf": [
+        {
+          "description": "A single-prompt liveness check.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "openai_smoke"
+            },
+            "max_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "prompt",
+            "max_tokens",
+            "timeout_seconds"
+          ]
+        },
+        {
+          "description": "An lm-eval task run with a pass threshold on the chosen metric.",
+          "type": "object",
+          "properties": {
+            "concurrency": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "dataset": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "few_shot": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "lm_eval"
+            },
+            "limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "max_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "metric": {
+              "type": "string"
+            },
+            "seed": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "split": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "task": {
+              "type": "string"
+            },
+            "threshold": {
+              "type": "number",
+              "format": "double"
+            },
+            "timeout_seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "task",
+            "metric",
+            "threshold",
+            "timeout_seconds"
+          ]
+        }
+      ]
+    },
+    "HttpActionSpec": {
+      "description": "An HTTP action (method and path) invoked against the workload endpoint.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "$ref": "#/$defs/HttpMethod"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path"
+      ]
+    },
+    "HttpMethod": {
+      "description": "The HTTP method of an [`HttpActionSpec`].",
+      "oneOf": [
+        {
+          "description": "HTTP POST.",
+          "type": "string",
+          "const": "post"
+        }
+      ]
+    },
+    "IntegrationIdentity": {
+      "description": "The integration's identity recorded on its results: adapter id, adapter\nversion, and the framework it lowers to.",
+      "type": "object",
+      "properties": {
+        "adapter_id": {
+          "type": "string"
+        },
+        "adapter_version": {
+          "type": "string"
+        },
+        "framework": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "adapter_id",
+        "adapter_version",
+        "framework"
+      ]
+    },
+    "KvTransferMechanism": {
+      "description": "The KV-transfer mechanism connecting prefill and decode.",
+      "oneOf": [
+        {
+          "description": "Mooncake KV-cache transfer.",
+          "type": "string",
+          "const": "mooncake"
+        },
+        {
+          "description": "NIXL KV-cache transfer.",
+          "type": "string",
+          "const": "nixl"
+        }
+      ]
+    },
+    "Parallelism": {
+      "description": "Framework-neutral component-aware parallelism ([[RFC-0003:C-SERVE-PARALLELISM]]).\nEvery component is optional so an operator can override one without\nrepeating the rest; omitted components are filled by the integration into a\ncomplete effective shape.",
+      "type": "object",
+      "properties": {
+        "attention": {
+          "description": "Attention-block parallelism.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParallelismAttention"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "experts": {
+          "description": "MoE expert parallelism.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParallelismExperts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outer": {
+          "description": "Outer deployment parallelism shared by attention and experts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ParallelismOuter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ParallelismAttention": {
+      "description": "Attention-block parallelism: tensor, data, and context degrees.",
+      "type": "object",
+      "properties": {
+        "context_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "data_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "tensor_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ParallelismExperts": {
+      "description": "MoE expert parallelism: tensor, data, expert, and dense-tensor degrees.",
+      "type": "object",
+      "properties": {
+        "data_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "dense_tensor_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "expert_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "tensor_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ParallelismOuter": {
+      "description": "Outer deployment parallelism: tensor and pipeline degrees.",
+      "type": "object",
+      "properties": {
+        "pipeline_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "tensor_parallel_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "PlanServeInput": {
+      "description": "The requested serve shape a `PlanServe` operation lowers into a topology.",
+      "type": "object",
+      "properties": {
+        "kv_transfer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvTransferMechanism"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "$ref": "#/$defs/ServeModelInput"
+        },
+        "parallelism": {
+          "$ref": "#/$defs/Parallelism"
+        },
+        "profiling": {
+          "type": "boolean",
+          "default": false
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeRoleInput"
+          }
+        },
+        "routing_backend": {
+          "type": "string"
+        },
+        "settings": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        "topology": {
+          "$ref": "#/$defs/ServeTopology"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "topology",
+        "routing_backend",
+        "parallelism",
+        "settings",
+        "roles"
+      ]
+    },
+    "PlanServeResult": {
+      "description": "The lowered topology returned by a `PlanServe`: the effective server-level\nshape, per-role resolution, whole-replica requirements, role links, and the\npublic and per-role endpoint requirements the control plane then allocates.",
+      "type": "object",
+      "properties": {
+        "effective_parallelism": {
+          "$ref": "#/$defs/Parallelism"
+        },
+        "effective_settings": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        "endpoint": {
+          "$ref": "#/$defs/EndpointRequirement"
+        },
+        "integration": {
+          "$ref": "#/$defs/IntegrationIdentity"
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeRoleLink"
+          }
+        },
+        "public_endpoint": {
+          "$ref": "#/$defs/PublicEndpointRequirement"
+        },
+        "replicas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeReplicaRequirement"
+          }
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeRoleResult"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "integration",
+        "effective_settings",
+        "effective_parallelism",
+        "roles",
+        "replicas",
+        "links",
+        "public_endpoint",
+        "endpoint"
+      ]
+    },
+    "ProcessSpec": {
+      "description": "A launchable process: its argument vector and environment.",
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "env"
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "The adapter protocol version an integration speaks. The only accepted value\nis `3` (serialized as the string `\"3\"`); a mismatch is rejected before\nlowering.",
+      "oneOf": [
+        {
+          "description": "Protocol version 3.",
+          "type": "string",
+          "const": "3"
+        }
+      ]
+    },
+    "PublicEndpointRequirement": {
+      "description": "How the topology's public workload endpoint is exposed.",
+      "oneOf": [
+        {
+          "description": "The endpoint is served directly by a single replica.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "replica"
+            },
+            "replica_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "replica_id"
+          ]
+        },
+        {
+          "description": "The endpoint is fronted by an Inferlab-owned built-in proxy routing\nacross the named prefill and decode roles.",
+          "type": "object",
+          "properties": {
+            "decode_role": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "builtin_proxy"
+            },
+            "prefill_role": {
+              "type": "string"
+            },
+            "process_id": {
+              "type": "string"
+            },
+            "readiness": {
+              "$ref": "#/$defs/ReadinessProbe"
+            },
+            "role_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "process_id",
+            "role_id",
+            "prefill_role",
+            "decode_role",
+            "readiness"
+          ]
+        }
+      ]
+    },
+    "RawArtifact": {
+      "description": "A raw output file a client produced, retained as workload evidence.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind",
+        "path"
+      ]
+    },
+    "ReadinessProbe": {
+      "description": "How the control plane decides a process is ready.",
+      "oneOf": [
+        {
+          "description": "Ready when an HTTP GET of `path` succeeds.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "http"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        },
+        {
+          "description": "Ready as soon as the process is alive.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "process_alive"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "RenderServeInput": {
+      "description": "The planned topology plus the control plane's concrete allocations that a\n`RenderServe` operation turns into final process invocations.",
+      "type": "object",
+      "properties": {
+        "allocations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeProcessAllocation"
+          }
+        },
+        "kv_transfer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvTransferMechanism"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeRoleLink"
+          }
+        },
+        "model": {
+          "$ref": "#/$defs/ServeModelInput"
+        },
+        "parallelism": {
+          "$ref": "#/$defs/Parallelism"
+        },
+        "profiling": {
+          "type": "boolean",
+          "default": false
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServeRoleResult"
+          }
+        },
+        "routing_backend": {
+          "type": "string"
+        },
+        "settings": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        "topology": {
+          "$ref": "#/$defs/ServeTopology"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "topology",
+        "routing_backend",
+        "parallelism",
+        "settings",
+        "roles",
+        "links",
+        "allocations"
+      ]
+    },
+    "RenderServeResult": {
+      "description": "The final process invocations returned by a `RenderServe`, one per supplied\nallocation.",
+      "type": "object",
+      "properties": {
+        "integration": {
+          "$ref": "#/$defs/IntegrationIdentity"
+        },
+        "processes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RenderedServeProcess"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "integration",
+        "processes"
+      ]
+    },
+    "RenderedServeProcess": {
+      "description": "A rendered process bound to the allocation `id` it was produced for.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessSpec"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "process"
+      ]
+    },
+    "ServeModelInput": {
+      "description": "The model to serve: its resolved locator and the name it is served under.",
+      "type": "object",
+      "properties": {
+        "locator": {
+          "type": "string"
+        },
+        "served_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "locator",
+        "served_name"
+      ]
+    },
+    "ServeProcessAllocation": {
+      "description": "One concrete process the control plane placed, supplied to `RenderServe`:\nits identity, rank, machine, devices, model locator, and allocated\nendpoints and named ports.",
+      "type": "object",
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "endpoint": {
+          "$ref": "#/$defs/EndpointAssignment"
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "model_locator": {
+          "type": "string"
+        },
+        "ports": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/EndpointAssignment"
+          }
+        },
+        "process_id": {
+          "type": "string"
+        },
+        "rank": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "replica_id": {
+          "type": "string"
+        },
+        "replica_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "role_id": {
+          "type": "string"
+        },
+        "runtime_cache_root": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "process_id",
+        "role_id",
+        "replica_id",
+        "replica_index",
+        "rank",
+        "machine_id",
+        "model_locator",
+        "runtime_cache_root",
+        "devices",
+        "endpoint",
+        "ports"
+      ]
+    },
+    "ServeReplicaRequirement": {
+      "description": "A whole-replica resource and readiness requirement the integration declares\nwithout choosing placement, ranks, or concrete endpoints.",
+      "type": "object",
+      "properties": {
+        "accelerator_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "capture_target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CaptureTargetRequirement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "primary_ports": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "primary_readiness": {
+          "$ref": "#/$defs/ReadinessProbe"
+        },
+        "replica_index": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "role_id": {
+          "type": "string"
+        },
+        "worker_readiness": {
+          "$ref": "#/$defs/ReadinessProbe"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role_id",
+        "replica_index",
+        "accelerator_count",
+        "ports",
+        "primary_ports",
+        "primary_readiness",
+        "worker_readiness"
+      ]
+    },
+    "ServeRoleInput": {
+      "description": "A requested serving role: its identity, kind, replica cardinality, and\ndeclared (not-yet-completed) parallelism and settings.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ServeRoleKind"
+        },
+        "parallelism": {
+          "$ref": "#/$defs/Parallelism"
+        },
+        "replica_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "settings": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "replica_count",
+        "parallelism",
+        "settings"
+      ]
+    },
+    "ServeRoleKind": {
+      "description": "The logical role a replica plays in a serve topology.",
+      "oneOf": [
+        {
+          "description": "Aggregated serving role of a single topology.",
+          "type": "string",
+          "const": "serve"
+        },
+        {
+          "description": "Prefill role of a disaggregated topology.",
+          "type": "string",
+          "const": "prefill"
+        },
+        {
+          "description": "Decode role of a disaggregated topology.",
+          "type": "string",
+          "const": "decode"
+        },
+        {
+          "description": "Request-routing role that does not execute model inference.",
+          "type": "string",
+          "const": "router"
+        }
+      ]
+    },
+    "ServeRoleLink": {
+      "description": "A directed link between serve roles the integration declares as part of the\ntopology.",
+      "oneOf": [
+        {
+          "description": "The source role routes requests to the target roles.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "request_routing"
+            },
+            "source": {
+              "type": "string"
+            },
+            "targets": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "source",
+            "targets"
+          ]
+        },
+        {
+          "description": "KV cache is transferred from source to target over `mechanism`.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "kv_transfer"
+            },
+            "mechanism": {
+              "$ref": "#/$defs/KvTransferMechanism"
+            },
+            "source": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "source",
+            "target",
+            "mechanism"
+          ]
+        },
+        {
+          "description": "The source discovers the target through a bootstrap port.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bootstrap"
+            },
+            "port": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "source",
+            "target",
+            "port"
+          ]
+        },
+        {
+          "description": "The source and target exchange out-of-band data over a side-channel port.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "side_channel"
+            },
+            "port": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "source",
+            "target",
+            "port"
+          ]
+        }
+      ]
+    },
+    "ServeRoleResult": {
+      "description": "A role as the integration resolved it: preserved identity and cardinality\nwith the complete effective settings and parallelism.",
+      "type": "object",
+      "properties": {
+        "effective_parallelism": {
+          "$ref": "#/$defs/Parallelism"
+        },
+        "effective_settings": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ServeRoleKind"
+        },
+        "replica_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "replica_count",
+        "effective_settings",
+        "effective_parallelism"
+      ]
+    },
+    "ServeTopology": {
+      "description": "The serving deployment topology.",
+      "oneOf": [
+        {
+          "description": "One aggregated serving role.",
+          "type": "string",
+          "const": "single"
+        },
+        {
+          "description": "Disaggregated prefill and decode roles.",
+          "type": "string",
+          "const": "prefill_decode"
+        }
+      ]
+    },
+    "SettingValue": {
+      "description": "A framework-specific server setting value carried as structured JSON data\n(never a pre-rendered shell fragment) across the integration boundary.",
+      "anyOf": [
+        {
+          "description": "A JSON boolean.",
+          "type": "boolean"
+        },
+        {
+          "description": "A JSON integer.",
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "description": "A JSON floating-point number.",
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "description": "A JSON string.",
+          "type": "string"
+        },
+        {
+          "description": "A JSON array of setting values.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        },
+        {
+          "description": "A JSON object of named setting values.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          }
+        }
+      ]
+    }
+  }
+}

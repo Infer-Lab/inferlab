@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  RUST_VERSION: "1.89.0"
+
+jobs:
+  # Cross-compilation goes through cargo-zigbuild: zig's libc shims build the
+  # pure-Rust workspace on both musl triples without target-specific runners.
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rust-cross/cargo-zigbuild@sha256:dce4ea213244423439d97a2070031c6ea287fc32f01b0aaa38f8b4d46f52e68c
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: inferlab-x86_64-linux
+          - target: aarch64-unknown-linux-musl
+            asset: inferlab-aarch64-linux
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches the crate version
+        run: |
+          crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          test "${GITHUB_REF_NAME}" = "v${crate_version}"
+      - name: Python packages match the crate version
+        run: |
+          # Lockstep releases stamp one version across the binary and every
+          # workspace-side wheel (ADR-0009); a drifted pyproject would publish
+          # a wheel outside the tested same-version set. The workflow only
+          # gates agreement — it builds no wheels.
+          crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          for pyproject in python/*/pyproject.toml; do
+            py_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "${pyproject}" | head -1)
+            test -n "${py_version}" || { echo "${pyproject}: no version field found"; exit 1; }
+            test "${py_version}" = "${crate_version}" || { echo "${pyproject}: version ${py_version} != crate version ${crate_version}"; exit 1; }
+          done
+      - name: Toolchain + target
+        run: |
+          rustup set profile minimal
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --no-self-update
+          rustup target add --toolchain "${RUST_VERSION}" "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo +${RUST_VERSION} zigbuild --release --locked -p inferlab --target ${{ matrix.target }}
+      - name: Package + checksum
+        run: |
+          cp "target/${{ matrix.target }}/release/inferlab" "${{ matrix.asset }}"
+          chmod +x "${{ matrix.asset }}"
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  # Patch install.sh's version default with the actual tag so curl-piped
+  # installs land on a pinned version.
+  installer:
+    name: installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Patch + checksum
+        run: |
+          cp scripts/install.sh install.sh
+          sed -i "s/INFERLAB_VERSION:-latest/INFERLAB_VERSION:-${GITHUB_REF_NAME}/" install.sh
+          sed -i "s/(default: latest)/(default: ${GITHUB_REF_NAME})/" install.sh
+          # A silent sed miss would ship a latest-defaulting "pinned" installer.
+          grep -q "INFERLAB_VERSION:-${GITHUB_REF_NAME}" install.sh
+          grep -q "(default: ${GITHUB_REF_NAME})" install.sh
+          chmod +x install.sh
+          sha256sum install.sh > install.sh.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer
+          path: |
+            install.sh
+            install.sh.sha256
+            LICENSE
+
+  # The plugin package pinned to the release tag, in the exact layout
+  # `inferlab agent install --from-checkout` validates.
+  plugin:
+    name: plugin tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pack + checksum
+        run: |
+          # Reproducible across filesystems: sorted members, fixed owner and
+          # mtime, gzip header normalized — one script shared with `just
+          # plugin-tarball`, content assertions included.
+          scripts/pack-plugin.sh inferlab-plugin.tar.gz
+          sha256sum inferlab-plugin.tar.gz > inferlab-plugin.tar.gz.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugin
+          path: |
+            inferlab-plugin.tar.gz
+            inferlab-plugin.tar.gz.sha256
+
+  release:
+    name: publish release
+    runs-on: ubuntu-latest
+    needs: [build, installer, plugin]
+    permissions:
+      contents: write
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # LICENSE ships as a first-class asset for human discovery
+          # (RFC-0001:C-LICENSE-RETENTION); the binaries embed the notice
+          # themselves and print it with `inferlab license`.
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            inferlab-*-linux inferlab-*-linux.sha256 \
+            install.sh install.sh.sha256 \
+            inferlab-plugin.tar.gz inferlab-plugin.tar.gz.sha256 \
+            LICENSE

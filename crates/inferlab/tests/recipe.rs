@@ -1,0 +1,2175 @@
+mod support;
+
+use serde_json::Value;
+use std::error::Error;
+use std::ffi::OsString;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+const WORKSPACE: &str = include_str!("fixtures/dsv4-workspace.toml");
+
+struct TestWorkspace {
+    // Declared before `root` so fixture process groups are reaped before the
+    // workspace directory they run in is removed.
+    reaper: support::ServeReaper,
+    root: TempDir,
+    bin: PathBuf,
+    data_home: PathBuf,
+    bench_marker: PathBuf,
+    eval_marker: PathBuf,
+}
+
+impl TestWorkspace {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        let reaper = support::ServeReaper::for_workspace(root.path());
+        let ports = support::reserve_local_ports(1)?;
+        let port = ports.get(0);
+        let inferlab = root.path().join(".inferlab");
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&inferlab)?;
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(root.path().join("vendor/vllm"))?;
+        fs::create_dir_all(root.path().join("vendor/flashinfer"))?;
+        fs::write(inferlab.join("workspace.toml"), WORKSPACE)?;
+        fs::write(root.path().join("vendor/vllm/source.txt"), "baseline\n")?;
+        fs::write(
+            root.path().join("vendor/flashinfer/source.txt"),
+            "baseline\n",
+        )?;
+        fs::write(
+            root.path().join("pixi.toml"),
+            "[workspace]\n\
+             channels = [\"conda-forge\"]\n\
+             platforms = [\"linux-64\"]\n\
+             \n\
+             [environments]\n\
+             vllm = []\n\
+             \n\
+             [pypi-dependencies]\n\
+             inferlab-integration-vllm = \"==0.1.0\"\n",
+        )?;
+        fs::write(
+            root.path().join("pixi.lock"),
+            "version: 6\nenvironments:\n  vllm: {}\n",
+        )?;
+        fs::write(root.path().join(".gitignore"), ".inferlab/local.toml\n")?;
+        fs::write(
+            inferlab.join("local.toml"),
+            format!(
+                "default_placement = \"local\"\n\
+                 \n\
+                 [model_weights.dsv4]\n\
+                 locator = \"/models/dsv4\"\n\
+                 \n\
+                 [machines.local]\n\
+                 host = \"127.0.0.1\"\n\
+                 port = {port}\n\
+                 devices = [0, 1, 2, 3]\n\
+                 \n\
+                 [placements.local]\n\
+                 machines = [\"local\"]\n"
+            ),
+        )?;
+        ports.release();
+        write_executable(&bin.join("pixi"), PIXI)?;
+        write_executable(&bin.join("inferlab-adapter-vllm"), ADAPTER)?;
+        write_executable(&bin.join("fixture-server"), FIXTURE_SERVER)?;
+        write_executable(&bin.join("nsys"), NSYS)?;
+        write_executable(&bin.join("fixture-eval-client"), EVAL_CLIENT)?;
+        write_executable(&bin.join("fixture-bench-client"), BENCH_CLIENT)?;
+        write_executable(&bin.join("nvidia-smi"), NVIDIA_SMI)?;
+        let data_home = root.path().join("data");
+        let mut path = OsString::from(&bin);
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        let install = Command::new(env!("CARGO_BIN_EXE_inferlab"))
+            .current_dir(root.path())
+            .env("PATH", path)
+            .env("XDG_DATA_HOME", &data_home)
+            .args(["toolchain", "install"])
+            .output()?;
+        if !install.status.success() {
+            return Err(format!(
+                "toolchain fixture install failed: {}",
+                String::from_utf8_lossy(&install.stderr)
+            )
+            .into());
+        }
+        git(root.path(), &["init", "-q"])?;
+        git(root.path(), &["config", "user.email", "test@example.com"])?;
+        git(root.path(), &["config", "user.name", "Inferlab Test"])?;
+        git(root.path(), &["add", "."])?;
+        git(root.path(), &["commit", "-qm", "fixture"])?;
+        let bench_marker = root.path().join("bench-ran");
+        let eval_marker = root.path().join("eval-ran");
+        Ok(Self {
+            reaper,
+            root,
+            bin,
+            data_home,
+            bench_marker,
+            eval_marker,
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut path = OsString::from(&self.bin);
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_inferlab"));
+        command
+            .current_dir(self.root.path().join("vendor/vllm"))
+            .env("PATH", path)
+            .env("XDG_DATA_HOME", &self.data_home)
+            .env("FIXTURE_BENCH_MARKER", &self.bench_marker)
+            .env("FIXTURE_EVAL_MARKER", &self.eval_marker)
+            .env(
+                "FIXTURE_NSYS_STATE",
+                self.root.path().join(".inferlab/nsys-state"),
+            );
+        for (key, value) in self.reaper.env() {
+            command.env(key, value);
+        }
+        command
+    }
+
+    fn run(&self) -> Result<Output, Box<dyn Error>> {
+        Ok(self
+            .command()
+            .args(["recipe", "run", "dsv4-qualify"])
+            .output()?)
+    }
+
+    /// Declare one environment check on the serving environment whose script
+    /// exits with the given code ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
+    fn declare_environment_check(&self, exit_code: i32) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(self.root.path().join("tools"))?;
+        fs::write(
+            self.root.path().join("tools/fixture-check.py"),
+            format!("import sys\nprint(\"fixture preflight ran\")\nsys.exit({exit_code})\n"),
+        )?;
+        // Checks run as `python <script>`; the test host may only provide
+        // `python3`.
+        write_executable(&self.bin.join("python"), "#!/bin/sh\nexec python3 \"$@\"\n")?;
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let mut text = fs::read_to_string(&manifest)?;
+        text.push_str(
+            "\n[[environments.vllm.checks]]\n\
+             id = \"fixture-guard\"\n\
+             script = \"tools/fixture-check.py\"\n\
+             repair_hint = \"pixi run fixture-repair\"\n",
+        );
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn load_record(&self, id: &str) -> Result<Value, Box<dyn Error>> {
+        Ok(serde_json::from_slice(&fs::read(
+            self.root
+                .path()
+                .join(".inferlab/records")
+                .join(id)
+                .join("record.json"),
+        )?)?)
+    }
+
+    fn configure_pd(&self, transport: &str) -> Result<(), Box<dyn Error>> {
+        let mut config = WORKSPACE
+            .replacen(
+                "readiness_timeout_seconds = 900",
+                &format!(
+                    "readiness_timeout_seconds = 900\ntopology = \"prefill_decode\"\nrouting_backend = \"builtin\"\nkv_transfer = {transport:?}"
+                ),
+                1,
+            )
+            .replace("reset_prefix_cache = true", "reset_prefix_cache = false");
+        config.push_str(
+            "\n[serve_profiles.vllm-dsv4.roles.prefill]\n\
+             kind = \"prefill\"\n\
+             replicas = 2\n\
+             \n\
+             [serve_profiles.vllm-dsv4.roles.decode]\n\
+             kind = \"decode\"\n\
+             replicas = 2\n",
+        );
+        fs::write(self.root.path().join(".inferlab/workspace.toml"), config)?;
+        let ports = support::reserve_local_ports(9)?;
+        fs::write(
+            self.root.path().join(".inferlab/local.toml"),
+            format!(
+                "default_placement = \"local\"\n\n[model_weights.dsv4]\nlocator = \"/models/dsv4\"\n\n[machines.local]\nhost = \"127.0.0.1\"\nport = {}\nextra_ports = [{}, {}, {}, {}, {}, {}, {}, {}]\ndevices = [0, 1, 2, 3, 4, 5, 6, 7]\n\n[placements.local]\nmachines = [\"local\"]\n",
+                ports.get(0),
+                ports.get(1),
+                ports.get(2),
+                ports.get(3),
+                ports.get(4),
+                ports.get(5),
+                ports.get(6),
+                ports.get(7),
+                ports.get(8)
+            ),
+        )?;
+        ports.release();
+        Ok(())
+    }
+
+    fn configure_readiness_timeout(&self, seconds: u64) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let text = fs::read_to_string(&manifest)?.replacen(
+            "readiness_timeout_seconds = 900",
+            &format!("readiness_timeout_seconds = {seconds}"),
+            1,
+        );
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn configure_capture_deadline(&self, seconds: u64) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let text = fs::read_to_string(&manifest)?.replacen(
+            "readiness_timeout_seconds = 900",
+            &format!(
+                "readiness_timeout_seconds = 900\ncapture_control_deadline_seconds = {seconds}"
+            ),
+            1,
+        );
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn append_manifest(&self, block: &str) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let mut text = fs::read_to_string(&manifest)?;
+        text.push_str(block);
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn configure_smoke_only(&self) -> Result<(), Box<dyn Error>> {
+        let config = WORKSPACE.replace(
+            "evals = [\"smoke\", \"gsm8k\"]\ngate = \"gsm8k\"\nbenches = [\"c8k1k\", \"adaptive-c8k1k\"]",
+            "evals = [\"smoke\"]\ngate = \"smoke\"\nbenches = []",
+        );
+        fs::write(self.root.path().join(".inferlab/workspace.toml"), config)?;
+        Ok(())
+    }
+}
+
+#[test]
+fn recipe_runs_eval_and_bench_then_stops_the_server() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace.run()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    let id = record["id"].as_str().ok_or("missing recipe record id")?;
+    assert_datetime_record_id(id, "recipe")?;
+    assert_eq!(record["server"]["id"], format!("{id}-serve"));
+    assert_eq!(record["status"], "succeeded");
+    assert_eq!(record["evals"].as_array().map(Vec::len), Some(2));
+    assert_eq!(record["benches"].as_array().map(Vec::len), Some(2));
+    assert!(
+        record["evals"]
+            .as_array()
+            .is_some_and(|children| children.iter().all(|child| child["status"] == "succeeded"))
+    );
+    assert!(
+        record["benches"]
+            .as_array()
+            .is_some_and(|children| children.iter().all(|child| child["status"] == "succeeded"))
+    );
+    assert_eq!(record["server"]["status"], "stopped");
+    assert_eq!(record["cleanup"]["verified"], true);
+    assert_eq!(
+        record["resolved"]["measurements"]["evals"][0]["execution"]["kind"],
+        "native_openai_smoke"
+    );
+    assert_eq!(
+        record["resolved"]["measurements"]["evals"][1]["execution"]["toolchain"]["lm_eval_version"],
+        "0.4.12"
+    );
+    let matrix_id = record["benches"][0]["id"]
+        .as_str()
+        .ok_or("missing matrix bench record id")?;
+    let matrix = workspace.load_record(matrix_id)?;
+    assert_eq!(matrix["cases"][0]["prefix_cache_reset"]["succeeded"], true);
+    assert!(
+        matrix["cases"][0]["prefix_cache_reset"]
+            .get("status")
+            .is_none()
+    );
+    let adaptive_id = record["benches"][1]["id"]
+        .as_str()
+        .ok_or("missing adaptive bench record id")?;
+    let adaptive = workspace.load_record(adaptive_id)?;
+    assert_eq!(adaptive["summary"]["target_metric"], "p99_ttft_ms");
+    let probes = adaptive["summary"]["probes"]
+        .as_array()
+        .ok_or("adaptive summary has no probes array")?;
+    assert!(!probes.is_empty(), "the adaptive search recorded probes");
+    // Every probe measured the target metric at a concrete request rate.
+    let mut probed_rates = Vec::with_capacity(probes.len());
+    for probe in probes {
+        assert!(
+            probe["statistic"].as_f64().is_some(),
+            "probe carries a measured target-metric value: {probe}"
+        );
+        probed_rates.push(
+            probe["request_rate"]
+                .as_f64()
+                .ok_or("probe has no request rate")?,
+        );
+    }
+    // The selected rate is one the search actually probed, not an invented one.
+    let selected_rate = adaptive["summary"]["selected_rate"]
+        .as_f64()
+        .ok_or("adaptive summary has no selected rate")?;
+    assert!(
+        probed_rates.contains(&selected_rate),
+        "selected rate {selected_rate} is one of the probed rates {probed_rates:?}"
+    );
+    assert!(workspace.bench_marker.is_file());
+    Ok(())
+}
+
+#[test]
+fn smoke_only_recipe_needs_no_measurement_toolchain() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_smoke_only()?;
+    let missing_data_home = workspace.root.path().join("missing-data");
+
+    let dry_run = workspace
+        .command()
+        .env("XDG_DATA_HOME", &missing_data_home)
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&dry_run.stdout)?;
+    assert_eq!(
+        plan["measurements"]["evals"][0]["execution"]["kind"],
+        "native_openai_smoke"
+    );
+    assert!(
+        plan["measurements"]["evals"][0]["execution"]
+            .get("toolchain")
+            .is_none()
+    );
+
+    let output = workspace
+        .command()
+        .env("XDG_DATA_HOME", &missing_data_home)
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let eval_id = recipe["evals"][0]["id"]
+        .as_str()
+        .ok_or("smoke Eval has no record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["resolved"]["execution"]["kind"], "native_openai_smoke");
+    assert_eq!(eval["cases"][0]["process"], Value::Null);
+    assert_eq!(eval["cases"][0]["stdout"], Value::Null);
+    assert_eq!(eval["cases"][0]["stderr"], Value::Null);
+    assert_eq!(eval["cases"][0]["error"], Value::Null);
+    assert_eq!(eval["cases"][0]["metrics"]["completed"], 1.0);
+    assert_eq!(eval["cases"][0]["metrics"]["http_status"], 200.0);
+    assert!(
+        eval["cases"][0]["metrics"]["elapsed_ms"]
+            .as_f64()
+            .is_some_and(|elapsed| elapsed >= 0.0)
+    );
+    assert_eq!(eval["cases"][0]["metrics"]["choices_count"], 1.0);
+    assert_eq!(
+        eval["cases"][0]["raw_artifacts"][0]["kind"],
+        "openai-response"
+    );
+    let request_path = eval["cases"][0]["request"]
+        .as_str()
+        .ok_or("smoke case has no request path")?;
+    let request: Value =
+        serde_json::from_slice(&fs::read(workspace.root.path().join(request_path))?)?;
+    assert_eq!(request["method"], "POST");
+    assert_eq!(request["body"]["model"], "dsv4");
+    assert_eq!(request["body"]["prompt"], "San Francisco is a city in");
+    assert_eq!(request["body"]["max_tokens"], 16);
+    assert_eq!(request["body"]["temperature"], 0.0);
+    assert_eq!(request["body"]["stream"], false);
+    let response_path = eval["cases"][0]["raw_artifacts"][0]["path"]
+        .as_str()
+        .ok_or("smoke case has no raw response path")?;
+    let response = fs::read(response_path)?;
+    assert_eq!(
+        eval["cases"][0]["metrics"]["response_bytes"],
+        response.len() as f64
+    );
+    let response: Value = serde_json::from_slice(&response)?;
+    assert_eq!(response["choices"][0]["text"], " San Francisco");
+    assert!(!workspace.eval_marker.exists());
+    Ok(())
+}
+
+#[test]
+fn smoke_rejects_an_endpoint_redirect() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_smoke_only()?;
+    let output = workspace
+        .command()
+        .env("XDG_DATA_HOME", workspace.root.path().join("missing-data"))
+        .env("FIXTURE_SMOKE_REDIRECT", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let eval_id = recipe["evals"][0]["id"]
+        .as_str()
+        .ok_or("smoke Eval has no record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["cases"][0]["metrics"]["http_status"], 302.0);
+    let error = eval["cases"][0]["error"]
+        .as_str()
+        .ok_or("redirected smoke has no error")?;
+    assert!(
+        error.contains("returned HTTP 302"),
+        "unexpected smoke error: {error}"
+    );
+    assert_eq!(recipe["server"]["status"], "stopped");
+    assert_eq!(recipe["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
+fn recipe_captures_one_selected_bench_and_verifies_static_ranges() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let bench_id = recipe["benches"][0]["id"]
+        .as_str()
+        .ok_or("captured Bench has no record id")?;
+    let bench = workspace.load_record(bench_id)?;
+    assert_eq!(bench["capture"]["status"], "succeeded");
+    assert_eq!(bench["capture"]["plan"]["control"], "framework-range");
+    assert_eq!(
+        bench["capture"]["windows"].as_array().map(Vec::len),
+        Some(4)
+    );
+    assert!(bench["capture"]["reports"].as_array().is_some_and(
+        |reports| reports.len() == 4 && reports.iter().all(|report| report["verified"] == true)
+    ));
+    let server_id = recipe["server"]["id"]
+        .as_str()
+        .ok_or("recipe has no server record id")?;
+    let server = workspace.load_record(server_id)?;
+    assert_eq!(server["processes"][0]["role_id"], "serve");
+    assert_eq!(server["processes"][0]["profiler"]["executable"], "nsys");
+    // The undeclared serve-profile fact resolves to the clause default
+    // ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+    assert_eq!(
+        server["processes"][0]["profiler"]["control"]["deadline_seconds"],
+        60
+    );
+    assert_eq!(
+        server["processes"][0]["profiler_finalization"]["operation"],
+        "finalize-collection"
+    );
+    assert_eq!(server["processes"][0]["profiler_cleanup"]["verified"], true);
+    assert_eq!(recipe["cleanup"]["verified"], true);
+    // A no-escape server record carries none of the escape fields — exactly
+    // the shape written before they existed — so this capture attaching to
+    // it is the old-record compatibility proof
+    // ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+    assert!(server["processes"][0]["profiler"].get("escapes").is_none());
+    assert!(
+        server["resolved"]["server"]
+            .get("profiler_escapes")
+            .is_none()
+    );
+    Ok(())
+}
+
+/// The declared escapes splice ahead of the managed launch and start tails,
+/// the dedicated trace/sampling/context-switch fields replace their managed
+/// defaults, the env map leads both rendered commands, and the record holds
+/// both the raw declaration and the effective invocations
+/// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn capture_renders_declared_escapes_and_records_raw_and_effective() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+         launch_options = [\"--cuda-graph-trace=node\"]\n\
+         start_options = [\"--nic-metrics=true\"]\n\
+         trace = [\"cuda\", \"nvtx\"]\n\
+         sampling = \"cpu\"\n\
+         context_switch = \"process-tree\"\n\
+         \n\
+         [serve_profiles.vllm-dsv4.profiler.nsys.env]\n\
+         NSYS_FIXTURE = \"a b\"\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+
+    let server = workspace.load_record(
+        recipe["server"]["id"]
+            .as_str()
+            .ok_or("recipe has no server record id")?,
+    )?;
+    let profiler = &server["processes"][0]["profiler"];
+    let session = profiler["session"]
+        .as_str()
+        .ok_or("profiler target has no session")?;
+    assert_eq!(
+        profiler["launch_prefix"],
+        serde_json::json!([
+            "env",
+            "--",
+            "NSYS_FIXTURE=a b",
+            "nsys",
+            "launch",
+            "--cuda-graph-trace=node",
+            "--session-new",
+            session,
+            "--trace=cuda,nvtx",
+            "--wait=all",
+        ])
+    );
+    assert_eq!(
+        profiler["escapes"]["start_options"][0],
+        "--nic-metrics=true"
+    );
+    assert_eq!(profiler["escapes"]["sampling"], "cpu");
+    let raw = &server["resolved"]["server"]["profiler_escapes"]["profile"];
+    assert_eq!(raw["launch_options"][0], "--cuda-graph-trace=node");
+    assert_eq!(raw["trace"], serde_json::json!(["cuda", "nvtx"]));
+    assert_eq!(raw["env"]["NSYS_FIXTURE"], "a b");
+
+    let bench = workspace.load_record(
+        recipe["benches"][0]["id"]
+            .as_str()
+            .ok_or("captured Bench has no record id")?,
+    )?;
+    assert_eq!(bench["capture"]["status"], "succeeded");
+    assert!(bench["capture"]["reports"].as_array().is_some_and(
+        |reports| reports.len() == 4 && reports.iter().all(|report| report["verified"] == true)
+    ));
+    let output_base = bench["capture"]["plan"]["targets"][0]["output_base"]
+        .as_str()
+        .ok_or("capture plan has no output base")?;
+    let start = bench["capture"]["arm"]
+        .as_array()
+        .and_then(|actions| {
+            actions
+                .iter()
+                .find(|action| action["operation"] == "start-range-collection")
+        })
+        .ok_or("capture armed no range collection")?;
+    assert_eq!(
+        start["argv"],
+        serde_json::json!([
+            "env",
+            "--",
+            "NSYS_FIXTURE=a b",
+            "nsys",
+            "start",
+            "--nic-metrics=true",
+            format!("--session={session}"),
+            "--sample=cpu",
+            "--cpuctxsw=process-tree",
+            "--force-overwrite=true",
+            "--export=none",
+            format!("--output={output_base}"),
+            "--capture-range=cudaProfilerApi",
+            "--capture-range-end=repeat:4:async",
+        ])
+    );
+    Ok(())
+}
+
+/// Role escapes merge into profile escapes in the resolved plan: scalars
+/// replace, option lists concatenate with the role's after the profile's,
+/// and env entries merge with the role value winning; the raw declaration
+/// keeps both layers ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn role_escapes_merge_over_profile_escapes_in_the_resolved_plan() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_pd("nixl")?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+         launch_options = [\"--cuda-graph-trace=node\"]\n\
+         sampling = \"cpu\"\n\
+         \n\
+         [serve_profiles.vllm-dsv4.profiler.nsys.env]\n\
+         NSYS_SHARED = \"profile\"\n\
+         NSYS_PROFILE_ONLY = \"1\"\n\
+         \n\
+         [serve_profiles.vllm-dsv4.roles.prefill.profiler.nsys]\n\
+         launch_options = [\"--nvtx-domain-include=prefill\"]\n\
+         sampling = \"process-tree\"\n\
+         \n\
+         [serve_profiles.vllm-dsv4.roles.prefill.profiler.nsys.env]\n\
+         NSYS_SHARED = \"role\"\n",
+    )?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_PD", "nixl")
+        .args([
+            "recipe",
+            "run",
+            "dsv4-qualify",
+            "--capture",
+            "c8k1k",
+            "--dry-run",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout)?;
+    let processes = plan["server"]["processes"]
+        .as_array()
+        .ok_or("plan has no processes")?;
+    let escapes_of = |role: &str| -> Result<&Value, Box<dyn Error>> {
+        Ok(&processes
+            .iter()
+            .find(|process| process["role_id"] == role)
+            .ok_or_else(|| format!("plan has no {role} process"))?["capture_target"]["escapes"])
+    };
+    let prefill = escapes_of("prefill")?;
+    assert_eq!(
+        prefill["launch_options"],
+        serde_json::json!(["--cuda-graph-trace=node", "--nvtx-domain-include=prefill"])
+    );
+    assert_eq!(prefill["sampling"], "process-tree");
+    assert_eq!(
+        prefill["env"],
+        serde_json::json!({ "NSYS_PROFILE_ONLY": "1", "NSYS_SHARED": "role" })
+    );
+    let decode = escapes_of("decode")?;
+    assert_eq!(
+        decode["launch_options"],
+        serde_json::json!(["--cuda-graph-trace=node"])
+    );
+    assert_eq!(decode["sampling"], "cpu");
+    assert_eq!(
+        decode["env"],
+        serde_json::json!({ "NSYS_PROFILE_ONLY": "1", "NSYS_SHARED": "profile" })
+    );
+    let raw = &plan["server"]["profiler_escapes"];
+    assert_eq!(raw["profile"]["sampling"], "cpu");
+    assert_eq!(raw["roles"]["prefill"]["sampling"], "process-tree");
+    Ok(())
+}
+
+/// An escape option naming a managed fact is rejected when the workspace is
+/// loaded, naming the escape field and the offending option
+/// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn a_managed_launch_escape_option_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+         launch_options = [\"--wait=none\"]\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "serve profile \"vllm-dsv4\" nsys launch_options contains managed option \
+             \"--wait=none\"; use the dedicated profiler escape field or the \
+             inferlab-managed value"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// The qualified nsys parses attached short-option values (-cnone is
+/// --capture-range=none), so the load gate rejects that form too
+/// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn an_attached_managed_escape_option_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+         start_options = [\"-cnone\"]\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "serve profile \"vllm-dsv4\" nsys start_options contains managed option \
+             \"-cnone\"; use the dedicated profiler escape field or the inferlab-managed \
+             value"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// The qualified nsys resolves GNU-style abbreviated long options
+/// (--wai=all runs as --wait), so the load gate rejects strict prefixes of
+/// managed names too ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn an_abbreviated_managed_escape_option_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>>
+{
+    let workspace = TestWorkspace::new()?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+         launch_options = [\"--wai=all\"]\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "serve profile \"vllm-dsv4\" nsys launch_options contains managed option \
+             \"--wai=all\"; use the dedicated profiler escape field or the \
+             inferlab-managed value"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A standalone terminator splices ahead of the managed tail and displaces
+/// it into positionals of the wrapped command; the start side of the
+/// qualified nsys even swallows it silently
+/// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn a_standalone_terminator_escape_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+         launch_options = [\"--\"]\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "serve profile \"vllm-dsv4\" nsys launch_options contains standalone \"--\", \
+             which ends option parsing and displaces the inferlab-managed argv tail"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A non-identifier env key would be parsed as an option of the environment
+/// utility instead of applied as an assignment
+/// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn a_non_identifier_escape_env_key_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.profiler.nsys.env]\n\
+         \"--unset\" = \"NSYS_FIXTURE\"\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "serve profile \"vllm-dsv4\" nsys env contains key \"--unset\", which is not \
+             a POSIX identifier; environment entries reach the profiler commands as \
+             assignments"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_managed_start_escape_option_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_pd("nixl")?;
+    workspace.append_manifest(
+        "\n[serve_profiles.vllm-dsv4.roles.prefill.profiler.nsys]\n\
+         start_options = [\"-c=cudaProfilerApi\"]\n",
+    )?;
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "serve profile \"vllm-dsv4\" role \"prefill\" nsys start_options contains \
+             managed option \"-c=cudaProfilerApi\"; use the dedicated profiler escape \
+             field or the inferlab-managed value"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A capture-armed server's readiness wait is unbounded, while the same slow
+/// startup without capture keeps the profile budget
+/// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn capture_armed_readiness_outlasts_the_profile_timeout() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_readiness_timeout(1)?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_READY_DELAY_SECONDS", "3")
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "a capture-armed server must outlast the profile timeout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = workspace
+        .command()
+        .env("FIXTURE_READY_DELAY_SECONDS", "3")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    let server = workspace.load_record(
+        record["server"]["id"]
+            .as_str()
+            .ok_or("recipe has no server record id")?,
+    )?;
+    assert_eq!(server["failure"]["phase"], "readiness");
+    assert!(
+        server["failure"]["message"]
+            .as_str()
+            .is_some_and(|message| message
+                .contains("server did not become ready within 1 seconds")),
+        "an uncaptured run keeps the bounded budget: {}",
+        server["failure"]
+    );
+    Ok(())
+}
+
+/// The readiness probe cadence backs off instead of polling at a fixed
+/// 100ms: a three-second delayed bind records an attempt count consistent
+/// with the doubling schedule (~6) rather than fixed-cadence polling (~30).
+#[test]
+fn readiness_probing_backs_off_for_slow_starts() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_READY_DELAY_SECONDS", "3")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    let server = workspace.load_record(
+        record["server"]["id"]
+            .as_str()
+            .ok_or("recipe has no server record id")?,
+    )?;
+    let attempts = server["processes"][0]["readiness"]["attempts"]
+        .as_u64()
+        .ok_or("readiness evidence has no attempt count")?;
+    assert!(
+        (4..=12).contains(&attempts),
+        "a 3s wait must record a backed-off attempt count, got {attempts}"
+    );
+    Ok(())
+}
+
+/// The unbounded wait still terminates immediately when the server process
+/// group dies; without that exit this test would hang rather than fail.
+#[test]
+fn capture_armed_readiness_fails_immediately_on_process_exit() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_EXIT_BEFORE_READY", "1")
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    let server = workspace.load_record(
+        record["server"]["id"]
+            .as_str()
+            .ok_or("recipe has no server record id")?,
+    )?;
+    assert_eq!(server["failure"]["phase"], "readiness");
+    assert!(
+        server["failure"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exited before readiness")),
+        "process-group exit must fail the unbounded wait: {}",
+        server["failure"]
+    );
+    Ok(())
+}
+
+/// Window-opening control keeps a deadline — the serve-profile fact
+/// `capture_control_deadline_seconds` — because a lost start silently shifts
+/// range identities ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn capture_control_deadline_bounds_slow_window_starts() -> Result<(), Box<dyn Error>> {
+    let slow = TestWorkspace::new()?;
+    slow.configure_capture_deadline(1)?;
+    let output = slow
+        .command()
+        .env("FIXTURE_START_PROFILE_DELAY_SECONDS", "2")
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    let bench = slow.load_record(
+        record["benches"][0]["id"]
+            .as_str()
+            .ok_or("captured Bench has no record id")?,
+    )?;
+    assert_eq!(bench["capture"]["status"], "failed");
+    assert!(
+        bench["capture"]["windows"][0]["start"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("failed to read profiler response")),
+        "a window start slower than the deadline must fail the capture: {}",
+        bench["capture"]
+    );
+
+    let raised = TestWorkspace::new()?;
+    raised.configure_capture_deadline(30)?;
+    let output = raised
+        .command()
+        .env("FIXTURE_START_PROFILE_DELAY_SECONDS", "2")
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "raising the deadline above the response delay must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// A window-closing control failure is evidence, not a verdict: with every
+/// required report verified the capture succeeds and carries the failed stop
+/// actions ([[RFC-0004:C-WORKLOAD-PROFILING]]).
+#[test]
+fn failed_window_stop_is_adjudicated_by_report_coverage() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_STOP_PROFILE_FAIL", "1")
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "verified reports must adjudicate a failed stop: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let bench_id = recipe["benches"][0]["id"]
+        .as_str()
+        .ok_or("captured Bench has no record id")?;
+    let bench = workspace.load_record(bench_id)?;
+    assert_eq!(bench["capture"]["status"], "succeeded");
+    assert_eq!(
+        bench["capture"]["windows"][0]["stop"][0]["succeeded"],
+        false
+    );
+    assert_eq!(bench["capture"]["windows"][0]["stop"][0]["status"], 500);
+    assert!(
+        bench["capture"]["reports"]
+            .as_array()
+            .is_some_and(|reports| reports.iter().all(|report| report["verified"] == true))
+    );
+    Ok(())
+}
+
+/// With a report missing, the same failed stop makes the capture fail
+/// carrying both the coverage failure and the control failure as evidence.
+#[test]
+fn failed_window_stop_with_missing_report_fails_with_both_evidences() -> Result<(), Box<dyn Error>>
+{
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_STOP_PROFILE_FAIL", "1")
+        .env("FIXTURE_STOP_PROFILE_SKIP_REPORT", "1")
+        .args(["recipe", "run", "dsv4-qualify", "--capture", "c8k1k"])
+        .output()?;
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    let bench = workspace.load_record(
+        record["benches"][0]["id"]
+            .as_str()
+            .ok_or("captured Bench has no record id")?,
+    )?;
+    assert_eq!(bench["capture"]["status"], "failed");
+    let error = bench["capture"]["error"]
+        .as_str()
+        .ok_or("failed capture has no error")?
+        .to_owned();
+    assert!(
+        error.contains("missing Nsight Systems report"),
+        "coverage failure must surface: {error}"
+    );
+    assert!(
+        error.contains("a window-closing control action had failed"),
+        "the stop failure must ride along as evidence: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn mooncake_pd_recipe_uses_one_public_endpoint_and_one_lifecycle() -> Result<(), Box<dyn Error>> {
+    run_pd_recipe("mooncake")
+}
+
+#[test]
+fn nixl_pd_recipe_uses_one_public_endpoint_and_one_lifecycle() -> Result<(), Box<dyn Error>> {
+    run_pd_recipe("nixl")
+}
+
+fn run_pd_recipe(transport: &str) -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_pd(transport)?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_PD", transport)
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let server_id = recipe["server"]["id"]
+        .as_str()
+        .ok_or("recipe has no server record id")?;
+    let server = workspace.load_record(server_id)?;
+    let processes = server["processes"]
+        .as_array()
+        .ok_or("server has no process records")?;
+    assert_eq!(server["resolved"]["server"]["topology"], "prefill_decode");
+    assert_eq!(processes.len(), 5);
+    assert_eq!(processes[0]["replica_id"], "prefill-000");
+    assert_eq!(processes[1]["replica_id"], "prefill-001");
+    assert_eq!(processes[2]["replica_id"], "decode-000");
+    assert_eq!(processes[3]["replica_id"], "decode-001");
+    assert_eq!(processes[4]["role_id"], "router");
+
+    // The resolved plan wires the KV transfer for exactly the selected
+    // transport: a mooncake break fails only the mooncake case and a nixl
+    // break fails only the nixl case ([[RFC-0003:C-SERVE-TOPOLOGY]]). The
+    // discriminating facts are the kv_transfer mechanism, the transport-
+    // specific side link, the per-transport process port names, and the proxy
+    // the router launches.
+    let links = server["resolved"]["server"]["links"]
+        .as_array()
+        .ok_or("resolved plan has no links")?;
+    let kv_mechanism = links
+        .iter()
+        .find(|link| link["kind"] == "kv_transfer")
+        .and_then(|link| link["mechanism"].as_str());
+    assert_eq!(
+        kv_mechanism,
+        Some(transport),
+        "the kv_transfer link records the {transport} mechanism: {links:?}"
+    );
+    // The rendered command and port allocation live on the resolved plan's
+    // processes, ordered prefill, decode, then router.
+    let plan_processes = server["resolved"]["server"]["processes"]
+        .as_array()
+        .ok_or("resolved plan has no processes")?;
+    let router_argv = plan_processes[4]["command"]["argv"]
+        .as_array()
+        .ok_or("router process has no argv")?;
+    let prefill_ports = |replica_index: usize| {
+        plan_processes[replica_index]["allocation"]["ports"]
+            .as_object()
+            .map(|ports| ports.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    match transport {
+        "mooncake" => {
+            // Mooncake bootstraps prefill replicas through the router.
+            assert!(
+                links
+                    .iter()
+                    .any(|link| link["kind"] == "bootstrap" && link["target"] == "prefill"),
+                "mooncake declares a bootstrap link: {links:?}"
+            );
+            assert!(
+                !links.iter().any(|link| link["kind"] == "side_channel"),
+                "mooncake does not declare a nixl side-channel link: {links:?}"
+            );
+            assert!(
+                prefill_ports(0).contains(&"bootstrap".to_owned()),
+                "a mooncake prefill replica exposes a bootstrap port: {:?}",
+                prefill_ports(0)
+            );
+            assert!(
+                router_argv
+                    .iter()
+                    .any(|arg| arg.as_str() == Some("vllm-mooncake")),
+                "the router launches the mooncake proxy: {router_argv:?}"
+            );
+        }
+        "nixl" => {
+            // NIXL exchanges KV over a prefill/decode side channel.
+            assert!(
+                links.iter().any(|link| link["kind"] == "side_channel"
+                    && link["source"] == "prefill"
+                    && link["target"] == "decode"),
+                "nixl declares a side-channel link: {links:?}"
+            );
+            assert!(
+                !links.iter().any(|link| link["kind"] == "bootstrap"),
+                "nixl does not declare a mooncake bootstrap link: {links:?}"
+            );
+            assert!(
+                prefill_ports(0).contains(&"side_channel".to_owned()),
+                "a nixl prefill replica exposes a side-channel port: {:?}",
+                prefill_ports(0)
+            );
+            assert!(
+                router_argv
+                    .iter()
+                    .any(|arg| arg.as_str() == Some("vllm-nixl")),
+                "the router launches the nixl proxy: {router_argv:?}"
+            );
+        }
+        other => return Err(format!("unhandled transport {other}").into()),
+    }
+
+    // configure_pd flips reset_prefix_cache off, so the matrix Bench records
+    // the reset as skipped: no per-case prefix-cache reset action ran, unlike
+    // the enabled path where each case carries a succeeded reset.
+    let matrix_id = recipe["benches"][0]["id"]
+        .as_str()
+        .ok_or("recipe has no matrix Bench record id")?;
+    let matrix = workspace.load_record(matrix_id)?;
+    assert_eq!(
+        matrix["resolved"]["definition"]["reset_prefix_cache"],
+        false
+    );
+    assert_eq!(
+        matrix["resolved"]["client"]["prefix_cache_reset"],
+        Value::Null
+    );
+    assert!(
+        matrix["cases"]
+            .as_array()
+            .is_some_and(|cases| !cases.is_empty()
+                && cases
+                    .iter()
+                    .all(|case| case["prefix_cache_reset"] == Value::Null)),
+        "with reset disabled every matrix case skips the prefix-cache reset: {}",
+        matrix["cases"]
+    );
+
+    let public_port = server["resolved"]["server"]["endpoint"]["port"].clone();
+    let eval_id = recipe["evals"][0]["id"]
+        .as_str()
+        .ok_or("recipe has no Eval record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["resolved"]["endpoint"]["port"], public_port);
+    assert!(processes.iter().all(|process| {
+        process["cleanup"]
+            .as_array()
+            .and_then(|cleanup| cleanup.last())
+            .is_some_and(|cleanup| cleanup["verified"] == true)
+    }));
+    assert_eq!(recipe["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
+fn manual_bench_attaches_to_an_explicit_running_server() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let start = workspace
+        .command()
+        .args(["serve", "start", "dsv4-qualify"])
+        .output()?;
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let server: Value = serde_json::from_slice(&start.stdout)?;
+    let server_id = server["id"].as_str().ok_or("server record has no id")?;
+
+    let unavailable_capture = workspace
+        .command()
+        .args([
+            "bench",
+            "c8k1k",
+            "--serve",
+            server_id,
+            "--capture",
+            "--dry-run",
+        ])
+        .output()?;
+    assert!(!unavailable_capture.status.success());
+    assert!(
+        String::from_utf8_lossy(&unavailable_capture.stderr)
+            .contains("was not started with profiling target preparation")
+    );
+
+    let dry_run = workspace
+        .command()
+        .args([
+            "bench",
+            "c8k1k",
+            "--serve",
+            server_id,
+            "--set",
+            "concurrency=[2]",
+            "--dry-run",
+        ])
+        .output()?;
+    assert!(
+        dry_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&dry_run.stdout)?;
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["target"]["server_record_id"], server_id);
+    assert_eq!(
+        plan["bench"]["execution"]["cases"][0]["load_shape"]["concurrency"],
+        2
+    );
+
+    let bench = workspace
+        .command()
+        .env("FIXTURE_BENCH_WAIT", "1")
+        .args(["bench", "c8k1k", "--serve", server_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_path(&workspace.bench_marker, Duration::from_secs(5))?;
+    let busy_stop = workspace
+        .command()
+        .args(["serve", "stop", server_id])
+        .output()?;
+    assert!(!busy_stop.status.success());
+    assert!(String::from_utf8_lossy(&busy_stop.stderr).contains("error[E4002]"));
+
+    let bench = bench.wait_with_output()?;
+    assert!(
+        bench.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bench.stderr)
+    );
+    let bench: Value = serde_json::from_slice(&bench.stdout)?;
+    assert_eq!(bench["status"], "succeeded");
+    assert_eq!(bench["resolved"]["target"]["server_record_id"], server_id);
+    assert_eq!(
+        bench["resolved"]["measurement_workspace"]["source_digest"],
+        server["resolved"]["workspace"]["source_digest"]
+    );
+
+    let stop = workspace
+        .command()
+        .args(["serve", "stop", server_id])
+        .output()?;
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    Ok(())
+}
+
+fn assert_datetime_record_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+    let (timestamp, suffix) = id.split_once("Z-").ok_or("record id has no UTC prefix")?;
+    assert_eq!(timestamp.len(), 23);
+    assert_eq!(
+        timestamp
+            .chars()
+            .enumerate()
+            .filter_map(|(index, value)| (!value.is_ascii_digit()).then_some((index, value)))
+            .collect::<Vec<_>>(),
+        [
+            (4, '-'),
+            (7, '-'),
+            (10, 'T'),
+            (13, '-'),
+            (16, '-'),
+            (19, '.')
+        ]
+    );
+    assert!(suffix.starts_with(&format!("{kind}-")));
+    Ok(())
+}
+
+#[test]
+fn failed_eval_gate_skips_benches_and_still_stops_the_server() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_GATE_SCORE", "0.5")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    assert!(
+        record["benches"]
+            .as_array()
+            .is_some_and(|children| children.iter().all(|child| child["status"] == "skipped"))
+    );
+    let bench_id = record["benches"][0]["id"]
+        .as_str()
+        .ok_or("missing bench record id")?;
+    let bench = workspace.load_record(bench_id)?;
+    assert_eq!(bench["skip_reason"], "eval gate did not succeed");
+    assert_eq!(record["cleanup"]["verified"], true);
+    assert!(!workspace.bench_marker.exists());
+    Ok(())
+}
+
+#[test]
+fn unsupported_eval_result_envelope_version_fails_the_case() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_EVAL_SCHEMA_VERSION", "99")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    let eval_id = record["evals"][1]["id"]
+        .as_str()
+        .ok_or("gsm8k Eval has no record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["cases"][0]["status"], "failed");
+    assert_eq!(
+        eval["cases"][0]["error"],
+        "Eval client returned unsupported result schema version 99"
+    );
+    assert_eq!(record["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
+fn failed_bench_is_recorded_before_server_cleanup() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_BENCH_FAIL", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    assert!(
+        record["benches"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(|child| child["status"] == "failed"))
+    );
+    assert_eq!(record["server"]["status"], "stopped");
+    assert_eq!(record["cleanup"]["verified"], true);
+    assert!(workspace.bench_marker.is_file());
+    Ok(())
+}
+
+#[test]
+fn unsupported_bench_result_envelope_version_fails_the_case() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_BENCH_SCHEMA_VERSION", "99")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    let bench_id = record["benches"][0]["id"]
+        .as_str()
+        .ok_or("matrix bench has no record id")?;
+    let bench = workspace.load_record(bench_id)?;
+    assert_eq!(bench["cases"][0]["status"], "failed");
+    assert_eq!(
+        bench["cases"][0]["error"],
+        "Bench client returned unsupported result schema version 99"
+    );
+    assert_eq!(record["cleanup"]["verified"], true);
+    Ok(())
+}
+
+// A genuinely evolved envelope — new version, unknown fields, none of the v1
+// fields — must fail with the version-naming rejection, not die as a strict
+// v1 parse error: the version gates before the DTO parse.
+#[test]
+fn evolved_eval_result_envelope_is_rejected_by_version() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_EVAL_ENVELOPE_EVOLVED", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    let eval_id = record["evals"][1]["id"]
+        .as_str()
+        .ok_or("gsm8k Eval has no record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["cases"][0]["status"], "failed");
+    assert_eq!(
+        eval["cases"][0]["error"],
+        "Eval client returned unsupported result schema version 2"
+    );
+    assert_eq!(record["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
+fn evolved_bench_result_envelope_is_rejected_by_version() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_BENCH_ENVELOPE_EVOLVED", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    let bench_id = record["benches"][0]["id"]
+        .as_str()
+        .ok_or("matrix bench has no record id")?;
+    let bench = workspace.load_record(bench_id)?;
+    assert_eq!(bench["cases"][0]["status"], "failed");
+    assert_eq!(
+        bench["cases"][0]["error"],
+        "Bench client returned unsupported result schema version 2"
+    );
+    assert_eq!(record["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
+fn server_start_failure_skips_every_selected_measurement() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_SERVER_START_FAIL", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["server"]["status"], "failed");
+    assert_eq!(record["evals"].as_array().map(Vec::len), Some(2));
+    assert_eq!(record["benches"].as_array().map(Vec::len), Some(2));
+    for child in record["evals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(record["benches"].as_array().into_iter().flatten())
+    {
+        assert_eq!(child["status"], "skipped");
+        let child_record = workspace.load_record(
+            child["id"]
+                .as_str()
+                .ok_or("measurement reference has no record id")?,
+        )?;
+        assert_eq!(child_record["skip_reason"], "server did not start");
+    }
+    assert_eq!(record["cleanup"]["verified"], true);
+    assert!(!workspace.eval_marker.exists());
+    assert!(!workspace.bench_marker.exists());
+    Ok(())
+}
+
+#[test]
+fn interruption_records_remaining_measurements_and_cleans_up() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let mut child = workspace
+        .command()
+        .env("FIXTURE_EVAL_WAIT", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_path(&workspace.eval_marker, Duration::from_secs(5))?;
+    let eval_child_pid = fs::read_to_string(&workspace.eval_marker)?
+        .trim()
+        .parse::<u32>()?;
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    assert!(signal.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait()?.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+        return Err("interrupted recipe did not finish cleanup within 10 seconds".into());
+    }
+    let output = child.wait_with_output()?;
+
+    assert!(!output.status.success());
+    let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["interrupted"], true);
+    assert_eq!(record["evals"].as_array().map(Vec::len), Some(2));
+    assert_eq!(record["benches"].as_array().map(Vec::len), Some(2));
+    assert_eq!(record["evals"][0]["status"], "succeeded");
+    assert_eq!(record["evals"][1]["status"], "failed");
+    assert!(
+        record["benches"]
+            .as_array()
+            .is_some_and(|children| children.iter().all(|child| child["status"] == "skipped"))
+    );
+    let interrupted_eval = workspace.load_record(
+        record["evals"][1]["id"]
+            .as_str()
+            .ok_or("interrupted Eval has no record id")?,
+    )?;
+    assert_eq!(interrupted_eval["cases"][0]["process"]["interrupted"], true);
+    assert_eq!(
+        interrupted_eval["cases"][0]["process"]["termination"]["kill_sent"],
+        true
+    );
+    assert_eq!(
+        interrupted_eval["cases"][0]["process"]["termination"]["verified"],
+        true
+    );
+    wait_for_pid_exit(eval_child_pid, Duration::from_secs(5))?;
+    assert_eq!(record["server"]["status"], "stopped");
+    assert_eq!(record["cleanup"]["verified"], true);
+    assert!(!workspace.bench_marker.exists());
+    Ok(())
+}
+
+#[test]
+fn interrupted_bench_preserves_native_evidence_and_cleans_its_group() -> Result<(), Box<dyn Error>>
+{
+    let workspace = TestWorkspace::new()?;
+    let mut child = workspace
+        .command()
+        .env("FIXTURE_BENCH_INTERRUPT_WAIT", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_path(&workspace.bench_marker, Duration::from_secs(5))?;
+    let bench_child_pid = fs::read_to_string(&workspace.bench_marker)?
+        .trim()
+        .parse::<u32>()?;
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    assert!(signal.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait()?.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+        return Err("interrupted recipe did not finish Bench cleanup within 10 seconds".into());
+    }
+    let output = child.wait_with_output()?;
+
+    assert!(!output.status.success());
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let bench = workspace.load_record(
+        recipe["benches"][0]["id"]
+            .as_str()
+            .ok_or("interrupted Bench has no record id")?,
+    )?;
+    assert_eq!(bench["status"], "failed");
+    assert_eq!(bench["cases"][0]["process"]["interrupted"], true);
+    assert_eq!(
+        bench["cases"][0]["process"]["termination"]["kill_sent"],
+        true
+    );
+    assert_eq!(
+        bench["cases"][0]["process"]["termination"]["verified"],
+        true
+    );
+    assert_eq!(bench["cases"][0]["native_command"][0], "fixture-bench");
+    assert_eq!(bench["cases"][0]["native_exit_code"], 143);
+    assert_eq!(bench["cases"][0]["raw_artifacts"][0]["name"], "partial");
+    wait_for_pid_exit(bench_child_pid, Duration::from_secs(5))?;
+    assert_eq!(recipe["server"]["status"], "stopped");
+    assert_eq!(recipe["cleanup"]["verified"], true);
+    Ok(())
+}
+
+fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("{} was not created within {timeout:?}", path.display()).into())
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("client child process {pid} remained alive after cleanup").into())
+}
+
+fn write_executable(path: &Path, content: &str) -> Result<(), Box<dyn Error>> {
+    fs::write(path, content)?;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+fn git(root: &Path, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("git").current_dir(root).args(args).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
+#[test]
+fn local_launch_runs_declared_checks_as_preflight() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.declare_environment_check(0)?;
+    let output = workspace.run()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(recipe["status"], "succeeded");
+    let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
+    let server = workspace.load_record(server_id)?;
+    assert_eq!(server["environment_checks"][0]["id"], "fixture-guard");
+    assert_eq!(
+        server["environment_checks"][0]["realization"],
+        "local-workspace"
+    );
+    assert_eq!(server["environment_checks"][0]["outcome"], "passed");
+    assert!(
+        server["environment_checks"][0]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("fixture preflight ran")),
+        "preflight output is captured evidence"
+    );
+    Ok(())
+}
+
+#[test]
+fn failing_local_check_fails_before_server_launch() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.declare_environment_check(3)?;
+    let output = workspace.run()?;
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        recipe["status"],
+        "failed",
+        "a failed preflight check fails the recipe: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let errors = recipe["errors"].as_array().ok_or("errors")?;
+    assert!(
+        errors.iter().any(|error| {
+            error.as_str().is_some_and(|error| {
+                error.contains("fixture-guard") && error.contains("repair: pixi run fixture-repair")
+            })
+        }),
+        "a local-realization failure presents the declared repair hint: {errors:?}"
+    );
+    let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
+    let server = workspace.load_record(server_id)?;
+    assert_eq!(server["status"], "failed");
+    assert_eq!(server["failure"]["phase"], "preflight");
+    assert_eq!(server["environment_checks"][0]["outcome"], "failed");
+    assert_eq!(
+        server["processes"][0]["handle"],
+        Value::Null,
+        "no process launches after a failed preflight check"
+    );
+    Ok(())
+}
+
+const PIXI: &str = r#"#!/bin/sh
+if [ "$1" = install ] && [ "$2" = --manifest-path ] && [ "$4" = --all ] && [ "$5" = --locked ]; then
+  prefix="$(dirname "$3")"
+  mkdir -p "$prefix/.pixi/envs/eval/bin" "$prefix/.pixi/envs/bench/bin"
+  cat > "$prefix/.pixi/envs/eval/bin/python" <<'PYTHON'
+#!/bin/sh
+if [ "$2" = --handshake ]; then
+  printf '{"runner_version":"0.1.0","lm_eval_version":"0.4.12"}\n'
+  exit 0
+fi
+shift
+exec fixture-eval-client "$@"
+PYTHON
+  cat > "$prefix/.pixi/envs/bench/bin/python" <<'PYTHON'
+#!/bin/sh
+if [ "$2" = --handshake ]; then
+  printf '{"runner_version":"0.1.0","aiperf_version":"0.10.0"}\n'
+  exit 0
+fi
+shift
+exec fixture-bench-client "$@"
+PYTHON
+  chmod +x "$prefix/.pixi/envs/eval/bin/python" "$prefix/.pixi/envs/bench/bin/python"
+  exit 0
+elif [ "$1" = run ] && [ "$2" = --locked ] && [ "$3" = --no-install ] && [ "$4" = --executable ] && [ "$5" = -e ] && [ "$6" = vllm ] && [ "$7" = -- ]; then
+  shift 7
+elif [ "$1" = run ] && [ "$2" = --as-is ] && [ "$3" = --executable ] && [ "$4" = -e ] && [ "$5" = vllm ] && [ "$6" = -- ]; then
+  shift 6
+else
+  printf 'unexpected pixi fixture arguments\n' >&2
+  exit 2
+fi
+exec "$@"
+"#;
+
+const ADAPTER: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+request = json.load(sys.stdin)
+input = request["input"]
+operation = request["operation"]
+if operation == "plan_serve":
+    settings = input["settings"]
+    role = input["roles"][0]
+    declared = role["parallelism"]
+    outer = declared.get("outer") or {}
+    attention = declared.get("attention") or {}
+    tp = outer.get("tensor_parallel_size") or 1
+    pp = outer.get("pipeline_parallel_size") or 1
+    dp = attention.get("data_parallel_size") or 1
+    effective = dict(settings)
+    effective.setdefault("trust_remote_code", False)
+    effective_parallelism = {
+        "outer": {"tensor_parallel_size": tp, "pipeline_parallel_size": pp},
+        "attention": {
+            "tensor_parallel_size": tp,
+            "data_parallel_size": dp,
+            "context_parallel_size": 1,
+        },
+        "experts": {
+            "tensor_parallel_size": tp * dp,
+            "data_parallel_size": 1,
+            "expert_parallel_size": 1,
+            "dense_tensor_parallel_size": 1,
+        },
+    }
+    transport = os.environ.get("FIXTURE_PD")
+    roles = input["roles"] if transport else [role]
+    replicas = []
+    for selected_role in roles:
+        ports = []
+        if transport == "mooncake" and selected_role["kind"] == "prefill":
+            ports = ["bootstrap"]
+        elif transport == "nixl":
+            ports = ["side_channel"]
+        for replica_index in range(selected_role["replica_count"]):
+            replica_id = (
+                "server" if not transport else
+                selected_role["id"] if selected_role["replica_count"] == 1 else
+                f'{selected_role["id"]}-{replica_index:03d}'
+            )
+            replicas.append({
+                "id": replica_id,
+                "role_id": selected_role["id"],
+                "replica_index": replica_index,
+                "accelerator_count": tp * pp * dp,
+                "ports": ports,
+                "primary_ports": ["master"],
+                "primary_readiness": {"kind": "http", "path": "/v1/models"},
+                "worker_readiness": {"kind": "process_alive"},
+                **({
+                    "capture_target": {
+                        "control": {
+                            "start_path": "/start_profile",
+                            "stop_path": "/stop_profile",
+                        }
+                    }
+                } if input["profiling"] else {}),
+            })
+    links = [] if not transport else [
+        {"kind": "request_routing", "source": "router", "targets": ["prefill", "decode"]},
+        {"kind": "kv_transfer", "source": "prefill", "target": "decode", "mechanism": transport},
+    ]
+    if transport == "mooncake":
+        links.append({"kind": "bootstrap", "source": "router", "target": "prefill", "port": "bootstrap"})
+    elif transport == "nixl":
+        links.append({"kind": "side_channel", "source": "prefill", "target": "decode", "port": "side_channel"})
+    output = {
+        "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
+        "effective_settings": effective,
+        "effective_parallelism": effective_parallelism,
+        "roles": [{
+            "id": selected_role["id"],
+            "kind": selected_role["kind"],
+            "replica_count": selected_role["replica_count"],
+            "effective_settings": effective,
+            "effective_parallelism": effective_parallelism,
+        } for selected_role in roles],
+        "replicas": replicas,
+        "links": links,
+        "public_endpoint": (
+            {"kind": "builtin_proxy", "process_id": "router", "role_id": "router", "prefill_role": "prefill", "decode_role": "decode", "readiness": {"kind": "http", "path": "/healthcheck"}}
+            if transport else {"kind": "replica", "replica_id": "server"}
+        ),
+        "endpoint": {
+            "protocol": "http",
+            "api_path": "/v1/completions",
+            "prefix_cache_reset": {"method": "post", "path": "/reset_prefix_cache"},
+        },
+    }
+elif operation == "render_serve":
+    server = "fixture-missing-server" if os.environ.get("FIXTURE_SERVER_START_FAIL") == "1" else "fixture-server"
+    allocations = input["allocations"]
+    output = {
+        "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
+        "processes": [{
+            "id": allocation["process_id"],
+            "process": {
+                "argv": [
+                    server,
+                    allocation["endpoint"]["host"],
+                    str(allocation["endpoint"]["port"]),
+                    *(
+                        [str(allocation["ports"]["bootstrap"]["port"])]
+                        if "bootstrap" in allocation["ports"] else []
+                    ),
+                ],
+                "env": {},
+            },
+        } for allocation in allocations],
+    }
+else:
+    raise ValueError(operation)
+print(json.dumps({"status": "ok", "protocol_version": "3", "result": {"operation": operation, "output": output}}))
+"#;
+
+const FIXTURE_SERVER: &str = r#"#!/usr/bin/env python3
+import http.server
+import json
+import os
+import sys
+import threading
+import time
+
+def register_with_reaper():
+    # Cross-process registry entry for the test-side reaper; the file layout
+    # is the protocol (see tests/support/mod.rs). Only a detached group
+    # leader registers: anything else dies with its parent.
+    registry = os.environ.get("FIXTURE_REAPER_REGISTRY")
+    if not registry or os.getpgid(0) != os.getpid():
+        return
+    pgid = os.getpid()
+    with open(f"/proc/{pgid}/stat") as stat:
+        starttime = stat.read().rsplit(")", 1)[1].split()[19]
+    entry = "\n".join([
+        os.environ["FIXTURE_REAPER_OWNER"],
+        starttime,
+        os.environ["FIXTURE_REAPER_WORKSPACE"],
+    ])
+    path = os.path.join(registry, f"{pgid}.grp")
+    temp = f"{path}.tmp.{pgid}"
+    with open(temp, "w") as handle:
+        handle.write(entry)
+    os.rename(temp, path)
+
+register_with_reaper()
+time.sleep(float(os.environ.get("FIXTURE_READY_DELAY_SECONDS", "0")))
+if os.environ.get("FIXTURE_EXIT_BEFORE_READY"):
+    sys.exit(7)
+host, port, *extra = sys.argv[1:]
+port = int(port)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/redirected":
+            body = json.dumps({"choices": [{"text": "redirected"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/query":
+            body = json.dumps({"0": {"engine_id": f"fixture-{port}"}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200 if self.path in ["/health", "/v1/models"] else 404)
+        self.end_headers()
+    def do_POST(self):
+        if self.path == "/v1/completions":
+            if os.environ.get("FIXTURE_SMOKE_REDIRECT") == "1":
+                self.send_response(302)
+                self.send_header("Location", "/redirected")
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            response = {
+                "id": "fixture-completion",
+                "object": "text_completion",
+                "model": request["model"],
+                "choices": [{"index": 0, "text": " San Francisco", "finish_reason": "stop"}],
+            }
+            if "kv_transfer_params" in request:
+                response["kv_transfer_params"] = request["kv_transfer_params"]
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/start_profile":
+            time.sleep(float(os.environ.get("FIXTURE_START_PROFILE_DELAY_SECONDS", "0")))
+        if self.path == "/stop_profile":
+            if not os.environ.get("FIXTURE_STOP_PROFILE_SKIP_REPORT"):
+                state_path = os.environ["FIXTURE_NSYS_STATE"]
+                output, count, index = open(state_path).read().split("\t")
+                index = int(index) + 1
+                open(f"{output}.{index}.nsys-rep", "w").write("fixture\n")
+                open(state_path, "w").write(f"{output}\t{count}\t{index}")
+            if os.environ.get("FIXTURE_STOP_PROFILE_FAIL"):
+                self.send_response(500)
+                self.end_headers()
+                return
+        self.send_response(200 if self.path in ["/reset_prefix_cache", "/start_profile", "/stop_profile"] else 404)
+        self.end_headers()
+    def log_message(self, format, *args):
+        pass
+if extra:
+    threading.Thread(
+        target=http.server.HTTPServer((host, int(extra[0])), Handler).serve_forever,
+        daemon=True,
+    ).start()
+http.server.HTTPServer((host, port), Handler).serve_forever()
+"#;
+
+const NSYS: &str = r#"#!/bin/sh
+set -eu
+operation="$1"
+shift
+if [ "$operation" = launch ]; then
+  # Escape options splice ahead of the managed tail; tests declare them in
+  # =-form, so any leading option token is skippable and --session-new is
+  # the only separate-value option.
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --session-new) shift 2 ;;
+      -*) shift ;;
+      *) exec "$@" ;;
+    esac
+  done
+elif [ "$operation" = start ]; then
+  output=
+  count=1
+  for argument in "$@"; do
+    case "$argument" in
+      --output=*) output="${argument#--output=}" ;;
+      --capture-range-end=repeat:*) count="${argument#--capture-range-end=repeat:}"; count="${count%%:*}" ;;
+    esac
+  done
+  mkdir -p "$(dirname "$output")"
+  printf '%s\t%s\t0' "$output" "$count" > "$FIXTURE_NSYS_STATE"
+elif [ "$operation" = stop ]; then
+  printf 'Collection stop is not allowed in this state.\n' >&2
+  exit 1
+else
+  exit 2
+fi
+"#;
+
+const EVAL_CLIENT: &str = r#"#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--output", required=True)
+args = parser.parse_args()
+request = json.load(open(args.input))
+if os.environ.get("FIXTURE_EVAL_WAIT") == "1":
+    child = subprocess.Popen([sys.executable, "-c", "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)", os.environ["FIXTURE_EVAL_MARKER"]])
+    time.sleep(60)
+else:
+    open(os.environ["FIXTURE_EVAL_MARKER"], "w").write("ran")
+kind = request["definition"]["kind"]
+metrics = {"completed": 1.0}
+if kind == "lm_eval":
+    metrics = {"exact_match": float(os.environ.get("FIXTURE_GATE_SCORE", "0.95"))}
+schema_version = int(os.environ.get("FIXTURE_EVAL_SCHEMA_VERSION", "1"))
+result = {"schema_version": schema_version, "status": "succeeded", "metrics": metrics, "native_command": ["fixture-eval"], "raw_artifacts": [], "error": None}
+if os.environ.get("FIXTURE_EVAL_ENVELOPE_EVOLVED"):
+    # A future envelope: new version, unknown fields, none of the v1 fields.
+    result = {"schema_version": 2, "frontier_field": {"nested": True}}
+json.dump(result, open(args.output, "w"))
+"#;
+
+const BENCH_CLIENT: &str = r#"#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--output", required=True)
+args = parser.parse_args()
+request = json.load(open(args.input))
+failed = os.environ.get("FIXTURE_BENCH_FAIL") == "1"
+load = request["case"]["load_shape"]
+rate = float(load.get("request_rate", 1.0))
+artifacts = []
+if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1":
+    artifact = os.path.join(os.path.dirname(args.output), "artifacts", "partial.txt")
+    os.makedirs(os.path.dirname(artifact), exist_ok=True)
+    open(artifact, "w").write("partial\n")
+    artifacts = [{"name": "partial", "kind": "fixture", "path": artifact}]
+    failed = True
+result = {
+    "schema_version": int(os.environ.get("FIXTURE_BENCH_SCHEMA_VERSION", "1")),
+    "status": "failed" if failed else "succeeded",
+    "completed_requests": request["case"]["request_count"],
+    "failed_requests": 1 if failed else 0,
+    "normalization_schema": "aiperf-summary-v1",
+    "metrics": {
+        "request_throughput": rate,
+        "output_throughput": rate * 1000.0,
+        "total_token_throughput": rate * 9000.0,
+        "mean_request_latency_ms": rate * 90.0,
+        "p99_request_latency_ms": rate * 110.0,
+        "mean_ttft_ms": rate * 80.0,
+        "p99_ttft_ms": rate * 100.0,
+        "mean_itl_ms": rate * 10.0,
+        "p99_itl_ms": rate * 12.0,
+    },
+    "native_command": ["fixture-bench"],
+    "native_exit_code": 143 if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1" else 0,
+    "raw_artifacts": artifacts,
+    "error": "fixture bench interruption" if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1" else ("fixture bench failure" if failed else None),
+}
+if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1":
+    json.dump(result, open(args.output, "w"))
+    child = subprocess.Popen([sys.executable, "-c", "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+    open(os.environ["FIXTURE_BENCH_MARKER"], "w").write(str(child.pid))
+    time.sleep(60)
+open(os.environ["FIXTURE_BENCH_MARKER"], "w").write("ran")
+if os.environ.get("FIXTURE_BENCH_WAIT") == "1":
+    time.sleep(1)
+if os.environ.get("FIXTURE_BENCH_ENVELOPE_EVOLVED"):
+    # A future envelope: new version, unknown fields, none of the v1 fields.
+    result = {"schema_version": 2, "frontier_field": {"nested": True}}
+json.dump(result, open(args.output, "w"))
+"#;
+
+/// Fixture GPU inventory in nvidia-smi's `csv,noheader,nounits` row shape.
+const NVIDIA_SMI: &str = r#"#!/bin/sh
+ids="0,1,2,3,4,5,6,7"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i) ids="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+IFS=,
+for id in $ids; do
+  printf '%s, Fixture GPU, 97871, GPU-fixture-000%s, 580.65.06\n' "$id" "$id"
+done
+"#;

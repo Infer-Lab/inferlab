@@ -1,0 +1,409 @@
+import tomllib
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+from inferlab_adapter_sdk import (
+    AdapterErrorCode,
+    AdapterOperationError,
+    EndpointProtocol,
+    EndpointRequirement,
+    HttpActionSpec,
+    HttpMethod,
+    IntegrationIdentity,
+    Parallelism,
+    ParallelismAttention,
+    ParallelismExperts,
+    ParallelismOuter,
+    PlanServeInput,
+    PlanServeResult,
+    ProcessSpec,
+    PublicEndpointRequirement,
+    PublicEndpointRequirementReplica,
+    ReadinessProbe,
+    ReadinessProbeHttp,
+    ReadinessProbeProcessAlive,
+    RenderedServeProcess,
+    RenderServeInput,
+    RenderServeResult,
+    ServeReplicaRequirement,
+    ServeRoleInput,
+    ServeRoleKind,
+    ServeRoleResult,
+    ServeTopology,
+    SettingValue,
+    append_option,
+    merge_serve_args,
+    plain_setting,
+)
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+_INFERLAB_OPTION_ARITY: dict[str, int | None] = {
+    "--attention-context-parallel-size": 1,
+    "--context-length": 1,
+    "--data-parallel-size": 1,
+    "--dp-size": 1,
+    "--enable-dp-attention": 0,
+    "--ep-size": 1,
+    "--expert-parallel-size": 1,
+    "--host": 1,
+    "--kv-cache-dtype": 1,
+    "--mem-fraction-static": 1,
+    "--model-path": 1,
+    "--moe-data-parallel-size": 1,
+    "--moe-dense-tp-size": 1,
+    "--pipeline-parallel-size": 1,
+    "--port": 1,
+    "--pp-size": 1,
+    "--served-model-name": 1,
+    "--tensor-parallel-size": 1,
+    "--tp-size": 1,
+    "--trust-remote-code": 0,
+}
+
+_RUNTIME_CACHE_SUBDIRS = {
+    "DG_JIT_CACHE_DIR": "deep_gemm_jit",
+    "FLASHINFER_WORKSPACE_BASE": "flashinfer",
+    "FLASHINFER_CUBIN_DIR": "flashinfer_cubin",
+    "TILELANG_CACHE_DIR": "tilelang",
+    "TILELANG_TMP_DIR": "tilelang/tmp",
+    "TRITON_CACHE_DIR": "triton",
+    "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+    "TORCH_EXTENSIONS_DIR": "torch_extensions",
+}
+
+
+class SglangServeSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    context_length: int | None = Field(default=None, ge=1)
+    kv_cache_dtype: str | None = None
+    mem_fraction_static: float | None = Field(default=None, gt=0.0, le=1.0)
+    trust_remote_code: bool = False
+    extra_args: list[str] | None = None
+    extra_env: dict[str, str] | None = None
+
+
+def _runtime_cache_env(root: str) -> dict[str, str]:
+    cache_root = Path(root)
+    return {
+        name: str(cache_root / subdirectory)
+        for name, subdirectory in _RUNTIME_CACHE_SUBDIRS.items()
+    }
+
+
+def _settings(values: dict[str, SettingValue]) -> SglangServeSettings:
+    try:
+        return SglangServeSettings.model_validate(
+            {key: plain_setting(value) for key, value in values.items()}
+        )
+    except ValidationError as error:
+        raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
+
+
+def _merged_settings(
+    base: dict[str, SettingValue], overrides: dict[str, SettingValue]
+) -> SglangServeSettings:
+    merged = dict(base)
+    merged.update(overrides)
+    return _settings(merged)
+
+
+def _effective_settings(settings: SglangServeSettings) -> dict[str, SettingValue]:
+    return {
+        key: SettingValue(root=value)
+        for key, value in settings.model_dump(exclude_none=True).items()
+    }
+
+
+def _adapter_version() -> str:
+    try:
+        return version("inferlab-integration-sglang")
+    except PackageNotFoundError:
+        # Image-backed lowering executes this module from mounted
+        # release-owned sources with no installed distribution metadata;
+        # the adjacent pyproject is the version authority there.
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        with pyproject.open("rb") as handle:
+            project_version: str = tomllib.load(handle)["project"]["version"]
+        return project_version
+
+
+def _identity() -> IntegrationIdentity:
+    return IntegrationIdentity(
+        adapter_id="inferlab-sglang",
+        adapter_version=_adapter_version(),
+        framework="sglang",
+    )
+
+
+def _effective_parallelism(declared: Parallelism) -> Parallelism:
+    """The v1-proven SGLang algebra: `outer.tensor_parallel_size` is the
+    total world size (`--tensor-parallel-size`), which attention data and
+    context parallelism divide (`--enable-dp-attention`), and which expert
+    and expert-data parallelism divide independently."""
+    outer = declared.outer or ParallelismOuter()
+    attention = declared.attention or ParallelismAttention()
+    experts = declared.experts or ParallelismExperts()
+    outer_tp = outer.tensor_parallel_size or 1
+    outer_pp = outer.pipeline_parallel_size or 1
+    attention_dp = attention.data_parallel_size or 1
+    attention_cp = attention.context_parallel_size or 1
+    attention_divisor = attention_dp * attention_cp
+    if outer_tp % attention_divisor != 0:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            f"SGLang attention.data_parallel_size * attention.context_parallel_size "
+            f"({attention_divisor}) must divide outer.tensor_parallel_size ({outer_tp})",
+        )
+    effective_attention_tp = outer_tp // attention_divisor
+    if (
+        attention.tensor_parallel_size is not None
+        and attention.tensor_parallel_size != effective_attention_tp
+    ):
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "SGLang effective attention.tensor_parallel_size is outer.tensor_parallel_size / "
+            f"attention.data_parallel_size / attention.context_parallel_size "
+            f"({effective_attention_tp})",
+        )
+    expert_ep = experts.expert_parallel_size or 1
+    expert_dp = experts.data_parallel_size or 1
+    expert_divisor = expert_ep * expert_dp
+    if outer_tp % expert_divisor != 0:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            f"SGLang experts.expert_parallel_size * experts.data_parallel_size "
+            f"({expert_divisor}) must divide outer.tensor_parallel_size ({outer_tp})",
+        )
+    effective_expert_tp = outer_tp // expert_divisor
+    if (
+        experts.tensor_parallel_size is not None
+        and experts.tensor_parallel_size != effective_expert_tp
+    ):
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "SGLang effective experts.tensor_parallel_size is outer.tensor_parallel_size / "
+            f"experts.expert_parallel_size / experts.data_parallel_size "
+            f"({effective_expert_tp})",
+        )
+    # The MoE-DP combination limits below mirror the asserts the vendored
+    # SGLang enforces at server start (server_args.py), expressed here so an
+    # impossible shape rejects at planning instead of dying in the server. They
+    # were verified against the SGLang version pinned by the workspace serving
+    # environment (the committed workspace pixi.toml is the pin authority) and
+    # must be re-verified against server_args.py whenever that pin moves.
+    if expert_dp > 1:
+        if outer_pp > 1:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_settings,
+                "SGLang does not support pipeline parallelism with "
+                f"experts.data_parallel_size > 1 (pp={outer_pp}, moe-dp={expert_dp})",
+            )
+        if attention_cp != expert_dp:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_settings,
+                "SGLang requires attention.context_parallel_size to equal "
+                f"experts.data_parallel_size when the latter exceeds 1 "
+                f"(cp={attention_cp}, moe-dp={expert_dp})",
+            )
+        if expert_ep > 1 and expert_divisor != outer_tp:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_settings,
+                "SGLang requires experts.expert_parallel_size * experts.data_parallel_size "
+                f"to equal outer.tensor_parallel_size when both exceed 1 "
+                f"(ep={expert_ep} * moe-dp={expert_dp} != tp={outer_tp})",
+            )
+    return Parallelism(
+        outer=ParallelismOuter(
+            tensor_parallel_size=outer_tp,
+            pipeline_parallel_size=outer_pp,
+        ),
+        attention=ParallelismAttention(
+            tensor_parallel_size=effective_attention_tp,
+            data_parallel_size=attention_dp,
+            context_parallel_size=attention_cp,
+        ),
+        experts=ParallelismExperts(
+            tensor_parallel_size=effective_expert_tp,
+            data_parallel_size=expert_dp,
+            expert_parallel_size=expert_ep,
+            dense_tensor_parallel_size=experts.dense_tensor_parallel_size or 1,
+        ),
+    )
+
+
+def _role_for_kind(input: PlanServeInput, kind: ServeRoleKind) -> ServeRoleInput:
+    matches = [role for role in input.roles if role.kind == kind]
+    if len(matches) != 1:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            f"{input.topology.value} topology requires exactly one {kind.value} role",
+        )
+    return matches[0]
+
+
+def _replica_id(role: ServeRoleInput, replica_index: int) -> str:
+    base = "server" if role.kind == ServeRoleKind.serve else role.id
+    if role.replica_count == 1:
+        return base
+    return f"{base}-{replica_index:03d}"
+
+
+def _accelerator_count(parallelism: Parallelism) -> int:
+    outer = parallelism.outer or ParallelismOuter()
+    return (outer.tensor_parallel_size or 1) * (outer.pipeline_parallel_size or 1)
+
+
+def plan_serve(input: PlanServeInput) -> PlanServeResult:
+    if input.topology != ServeTopology.single:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "the SGLang integration supports the single topology only",
+        )
+    if input.kv_transfer is not None:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "single topology does not use a KV-transfer mechanism",
+        )
+    if input.routing_backend != "builtin":
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            f"the SGLang integration does not support routing backend {input.routing_backend!r}",
+        )
+    if input.profiling:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "the SGLang integration does not support profiling capture yet",
+        )
+    role = _role_for_kind(input, ServeRoleKind.serve)
+    if role.replica_count < 1:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            f"role {role.id!r} replica count must be positive",
+        )
+    settings = _merged_settings(input.settings, role.settings)
+    parallelism = _effective_parallelism(role.parallelism)
+    accelerator_count = _accelerator_count(parallelism)
+    replicas = [
+        ServeReplicaRequirement(
+            id=_replica_id(role, replica_index),
+            role_id=role.id,
+            replica_index=replica_index,
+            accelerator_count=accelerator_count,
+            ports=[],
+            primary_ports=["master"],
+            primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/v1/models")),
+            worker_readiness=ReadinessProbe(root=ReadinessProbeProcessAlive()),
+        )
+        for replica_index in range(role.replica_count)
+    ]
+    role_result = ServeRoleResult(
+        id=role.id,
+        kind=role.kind,
+        replica_count=role.replica_count,
+        effective_settings=_effective_settings(settings),
+        effective_parallelism=parallelism,
+    )
+    return PlanServeResult(
+        integration=_identity(),
+        effective_settings=_effective_settings(_settings(input.settings)),
+        effective_parallelism=_effective_parallelism(input.parallelism),
+        roles=[role_result],
+        replicas=replicas,
+        links=[],
+        public_endpoint=PublicEndpointRequirement(
+            root=PublicEndpointRequirementReplica(replica_id=replicas[0].id)
+        ),
+        endpoint=EndpointRequirement(
+            protocol=EndpointProtocol(),
+            api_path="/v1/completions",
+            prefix_cache_reset=HttpActionSpec(
+                method=HttpMethod(),
+                path="/flush_cache",
+            ),
+        ),
+    )
+
+
+def render_serve(input: RenderServeInput) -> RenderServeResult:
+    if not input.allocations:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request, "serve allocation must not be empty"
+        )
+    roles = {role.id: role for role in input.roles}
+    replica_counts: dict[str, int] = {}
+    for allocation in input.allocations:
+        replica_counts[allocation.replica_id] = replica_counts.get(allocation.replica_id, 0) + 1
+    processes = []
+    for allocation in input.allocations:
+        role = roles.get(allocation.role_id)
+        if role is None:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                f"allocation references unknown role {allocation.role_id!r}",
+            )
+        if replica_counts[allocation.replica_id] > 1:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                "the SGLang integration does not support multi-node serving yet",
+            )
+        settings = _settings(role.effective_settings)
+        outer = role.effective_parallelism.outer or ParallelismOuter()
+        attention = role.effective_parallelism.attention or ParallelismAttention()
+        experts = role.effective_parallelism.experts or ParallelismExperts()
+        argv = [
+            # python3, not python: conda-family realizations carry both,
+            # while Debian-family external serving images ship no bare
+            # `python`.
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            allocation.model_locator,
+        ]
+        inferlab_args = [
+            "--host",
+            allocation.endpoint.host,
+            "--port",
+            str(allocation.endpoint.port),
+            "--served-model-name",
+            input.model.served_name,
+            "--tensor-parallel-size",
+            str(outer.tensor_parallel_size or 1),
+        ]
+        if (outer.pipeline_parallel_size or 1) != 1:
+            inferlab_args.extend(["--pipeline-parallel-size", str(outer.pipeline_parallel_size)])
+        attention_dp = attention.data_parallel_size or 1
+        attention_cp = attention.context_parallel_size or 1
+        if attention_dp != 1:
+            inferlab_args.extend(["--data-parallel-size", str(attention_dp)])
+        if attention_cp != 1:
+            inferlab_args.extend(["--attention-context-parallel-size", str(attention_cp)])
+        if attention_dp != 1 or attention_cp != 1:
+            inferlab_args.append("--enable-dp-attention")
+        if (experts.expert_parallel_size or 1) != 1:
+            inferlab_args.extend(["--expert-parallel-size", str(experts.expert_parallel_size)])
+        if (experts.data_parallel_size or 1) != 1:
+            inferlab_args.extend(["--moe-data-parallel-size", str(experts.data_parallel_size)])
+        if (experts.dense_tensor_parallel_size or 1) != 1:
+            inferlab_args.extend(["--moe-dense-tp-size", str(experts.dense_tensor_parallel_size)])
+        append_option(inferlab_args, "--context-length", settings.context_length)
+        append_option(inferlab_args, "--kv-cache-dtype", settings.kv_cache_dtype)
+        append_option(inferlab_args, "--mem-fraction-static", settings.mem_fraction_static)
+        if settings.trust_remote_code:
+            inferlab_args.append("--trust-remote-code")
+        argv.extend(
+            merge_serve_args(settings.extra_args or [], inferlab_args, _INFERLAB_OPTION_ARITY)
+        )
+        process_env = _runtime_cache_env(allocation.runtime_cache_root)
+        process_env.update(settings.extra_env or {})
+        processes.append(
+            RenderedServeProcess(
+                id=allocation.process_id,
+                process=ProcessSpec(argv=argv, env=process_env),
+            )
+        )
+    return RenderServeResult(integration=_identity(), processes=processes)
+
+
+__all__ = ["SglangServeSettings", "plan_serve", "render_serve"]

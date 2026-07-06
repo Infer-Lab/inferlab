@@ -1,0 +1,24 @@
+---
+source: crates/inferlab/src/workspace.rs
+expression: "source_digest_script(&[PathBuf::from(\".inferlab\")])"
+---
+set -euo pipefail
+untracked=$(mktemp)
+trap 'rm -f "$untracked"' EXIT
+{
+printf 'revision\0'; git rev-parse HEAD
+printf 'submodules\0'; git submodule status --recursive
+printf 'status\0'; git status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none -- '.' ':(top,literal,exclude).inferlab'
+printf 'diff\0'; git diff --binary --submodule=diff HEAD -- '.' ':(top,literal,exclude).inferlab'
+printf 'untracked\0'
+git ls-files --others --exclude-standard -z -- '.' ':(top,literal,exclude).inferlab' > "$untracked"
+while IFS= read -r -d '' path; do
+  printf '%s\0' "$path"
+  if [ -L "$path" ]; then
+    printf 'link\0'; readlink -- "$path"
+  elif [ -f "$path" ]; then
+    printf 'file\0'; sha256sum < "$path"
+  fi
+done < "$untracked"
+git submodule foreach --quiet --recursive 'set -eu; printf "submodule-worktree\0%s\0" "$displaypath"; git status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none; git diff --binary HEAD; untracked=$(mktemp); trap "rm -f \"$untracked\"" EXIT; git ls-files --others --exclude-standard -z > "$untracked"; xargs -0 -r sh -c '\''set -eu; for path in "$@"; do printf "%s\0" "$path"; if [ -L "$path" ]; then printf "link\0"; readlink -- "$path"; elif [ -f "$path" ]; then printf "file\0"; sha256sum < "$path"; fi; done'\'' classify < "$untracked"'
+} | sha256sum | awk '{print $1}'

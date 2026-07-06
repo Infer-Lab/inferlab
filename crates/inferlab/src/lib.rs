@@ -1,0 +1,23 @@
+mod adapter;
+mod agent;
+mod cli;
+mod container;
+mod digest;
+mod environment;
+mod error;
+mod image;
+mod interrupt;
+mod profiler;
+mod recipe;
+mod record;
+mod resolve;
+mod scratchpad;
+mod server;
+mod shell;
+mod ssh;
+mod toolchain;
+mod workload;
+mod workspace;
+
+pub use cli::{Cli, run};
+pub use error::InferlabError;

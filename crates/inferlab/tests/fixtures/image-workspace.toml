@@ -1,0 +1,156 @@
+schema_version = 1
+
+[models.dsv4]
+weight = "dsv4"
+served_name = "dsv4"
+
+[models.dsv4b]
+weight = "dsv4b"
+served_name = "dsv4b"
+
+[serve_profiles.vllm-dsv4]
+integration = "vllm"
+readiness_timeout_seconds = 60
+
+[source_sets.vllm]
+paths = ["vendor/vllm", "vendor/flashinfer"]
+
+[environments.vllm]
+pixi_environment = "vllm"
+
+[[environments.vllm.checks]]
+id = "fixture-guard"
+script = "tools/fixture-check.py"
+repair_hint = "pixi run fixture-repair"
+
+[[environments.vllm.image_postprocess]]
+id = "fixture-finish"
+script = "tools/fixture-finish.py"
+
+[evals.smoke]
+kind = "openai-smoke"
+prompt = "San Francisco is a city in"
+max_tokens = 16
+timeout_seconds = 60
+
+[benches]
+
+[workload_suites.smoke-only]
+evals = ["smoke"]
+gate = "smoke"
+
+[recipes.dsv4-qualify]
+model = "dsv4"
+serve_profile = "vllm-dsv4"
+source_set = "vllm"
+environment = "vllm"
+workload_suite = "smoke-only"
+
+[[recipes.dsv4-qualify.cases]]
+id = "base"
+
+[recipes.dsv4b-qualify]
+model = "dsv4b"
+serve_profile = "vllm-dsv4"
+source_set = "vllm"
+environment = "vllm"
+workload_suite = "smoke-only"
+
+[[recipes.dsv4b-qualify.cases]]
+id = "base"
+
+[images.dsv4-runtime]
+environment = "vllm"
+source_set = "vllm"
+base_image = "example.com/micromamba:1.0"
+platforms = ["linux/amd64", "linux/arm64"]
+packages = ["vendor/vllm", "vendor/flashinfer"]
+
+[[images.dsv4-runtime.validations]]
+recipe = "dsv4-qualify"
+
+[[images.dsv4-runtime.validations]]
+recipe = "dsv4b-qualify"
+
+[images.dsv4-runtime-foreign]
+environment = "vllm"
+source_set = "vllm"
+base_image = "example.com/micromamba:1.0"
+platforms = ["linux/arm64"]
+
+[images.dsv4-runtime-native]
+environment = "vllm"
+source_set = "vllm"
+base_image = "example.com/micromamba:1.0"
+platforms = ["linux/amd64"]
+
+[[images.dsv4-runtime-native.validations]]
+recipe = "dsv4-qualify"
+
+[[images.dsv4-runtime-native.validations]]
+recipe = "dsv4b-qualify"
+
+[images.dsv4-runtime-bare]
+environment = "vllm"
+source_set = "vllm"
+base_image = "example.com/micromamba:1.0"
+platforms = ["linux/amd64"]
+
+[environments.vllm-alt]
+pixi_environment = "vllm"
+
+[source_sets.flashinfer-only]
+paths = ["vendor/flashinfer"]
+
+[benches.probe]
+kind = "serving"
+input_tokens = 128
+output_tokens = 16
+concurrency = [1]
+prompts_per_concurrency = 1
+request_rates = [1.0]
+request_count = 4
+burstiness = 1.0
+reset_prefix_cache = false
+timeout_seconds = 60
+
+[recipes.dsv4-qualify-alt-env]
+model = "dsv4"
+serve_profile = "vllm-dsv4"
+source_set = "vllm"
+environment = "vllm-alt"
+workload_suite = "smoke-only"
+
+[[recipes.dsv4-qualify-alt-env.cases]]
+id = "base"
+
+[recipes.dsv4-qualify-alt-sources]
+model = "dsv4"
+serve_profile = "vllm-dsv4"
+source_set = "flashinfer-only"
+environment = "vllm"
+workload_suite = "smoke-only"
+
+[[recipes.dsv4-qualify-alt-sources.cases]]
+id = "base"
+
+[external_images.fixture-external]
+reference = "example.com/fixture-vllm@sha256:abababababababababababababababababababababababababababababababab"
+integration = "vllm"
+
+[external_images.fixture-foreign-stack]
+reference = "example.com/fixture-sglang@sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+integration = "sglang"
+
+[recipes.dsv4-pair]
+model = "dsv4"
+serve_profile = "vllm-dsv4"
+source_set = "vllm"
+environment = "vllm"
+workload_suite = "smoke-only"
+
+[[recipes.dsv4-pair.cases]]
+id = "pair"
+
+[recipes.dsv4-pair.cases.roles.serve]
+replicas = 2

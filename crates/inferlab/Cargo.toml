@@ -1,0 +1,39 @@
+[package]
+name = "inferlab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reproducible LLM inference experiment harness: versioned workspaces, closed-loop serve/eval/bench recipes, runtime images, and file-first evidence."
+keywords = ["llm", "inference", "benchmarking", "evaluation", "vllm"]
+categories = ["command-line-utilities", "science"]
+include = ["src/**", "resources/**", "LICENSE"]
+readme = "../../README.md"
+
+[dependencies]
+agent-plugin-installer.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+fs2.workspace = true
+inferlab-protocol = { path = "../inferlab-protocol", version = "0.1.0" }
+inferlab-proxy = { path = "../inferlab-proxy", version = "0.1.0" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+toml.workspace = true
+wait-timeout.workspace = true
+yaml_serde.workspace = true
+
+[dev-dependencies]
+fs2.workspace = true
+insta.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

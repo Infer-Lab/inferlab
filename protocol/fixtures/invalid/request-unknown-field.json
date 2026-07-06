@@ -1,0 +1,14 @@
+{
+  "operation": "plan_serve",
+  "protocol_version": "3",
+  "input": {
+    "model": {
+      "locator": "/private/weights/dsv4",
+      "served_name": "dsv4"
+    },
+    "parallelism": {},
+    "settings": {},
+    "node_count": 1,
+    "unexpected": true
+  }
+}

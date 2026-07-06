@@ -1,0 +1,664 @@
+use crate::InferlabError;
+use crate::environment;
+use inferlab_protocol::{
+    AdapterErrorCode, AdapterRequest, AdapterResponse, AdapterResult, PlanServeInput,
+    PlanServeResult, ProtocolVersion, RenderServeInput, RenderServeResult,
+};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::time::Duration;
+
+const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// An image-backed adapter pays container start-up on top of framework
+/// import, so it gets a wider deadline than a host-launched one.
+pub(crate) const IMAGE_ADAPTER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The committed framework-free Pixi environment an external-image launch
+/// lowers from ([[RFC-0006:C-INTEGRATIONS]]).
+const ADAPTER_ENVIRONMENT: &str = "adapter";
+/// The neutral in-container base the external-image adapter packages mount
+/// under, pointed at by PYTHONPATH.
+const ADAPTER_MOUNT_BASE: &str = "/inferlab-adapter";
+
+pub trait AdapterClient {
+    fn plan_serve(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        pixi_environment: &str,
+        input: PlanServeInput,
+    ) -> Result<AdapterLowering<PlanServeResult>, InferlabError>;
+
+    fn render_serve(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        pixi_environment: &str,
+        input: RenderServeInput,
+    ) -> Result<AdapterLowering<RenderServeResult>, InferlabError>;
+}
+
+pub struct AdapterLowering<T> {
+    pub output: T,
+    pub request_sha256: String,
+    pub response_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessAdapterClient;
+
+impl ProcessAdapterClient {
+    fn invoke(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        pixi_environment: &str,
+        request: AdapterRequest,
+    ) -> Result<AdapterInvocation, InferlabError> {
+        environment::ensure_usable(workspace_root, pixi_environment)?;
+        let executable = adapter_executable(integration)?;
+        let launcher = vec![
+            "pixi".to_owned(),
+            "run".to_owned(),
+            "--as-is".to_owned(),
+            "--executable".to_owned(),
+            "-e".to_owned(),
+            pixi_environment.to_owned(),
+            "--".to_owned(),
+            executable,
+        ];
+        invoke_adapter(
+            workspace_root,
+            integration,
+            &launcher,
+            ADAPTER_TIMEOUT,
+            request,
+        )
+    }
+}
+
+impl AdapterClient for ProcessAdapterClient {
+    fn plan_serve(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        pixi_environment: &str,
+        input: PlanServeInput,
+    ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
+        let request = AdapterRequest::PlanServe {
+            protocol_version: ProtocolVersion::V3,
+            input,
+        };
+        let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
+        plan_lowering(integration, invocation)
+    }
+
+    fn render_serve(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        pixi_environment: &str,
+        input: RenderServeInput,
+    ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
+        let request = AdapterRequest::RenderServe {
+            protocol_version: ProtocolVersion::V3,
+            input,
+        };
+        let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
+        render_lowering(integration, invocation)
+    }
+}
+
+/// Runs the integration inside the selected image through its container,
+/// so lowering consumes the serving stack that will actually run and never
+/// touches the locally installed serving environment
+/// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]). A built image bakes the workspace-pinned
+/// adapter packages into its locked closure, so `python -m <module>` resolves
+/// them with no mount; an external image carries no workspace-side packages, so
+/// lowering runs from the workspace's committed framework-free `adapter` Pixi
+/// environment ([[RFC-0006:C-INTEGRATIONS]]) — the adapter version the
+/// workspace pins is the one that lowers. The one-shot stdin/stdout JSON
+/// contract is unchanged.
+#[derive(Clone, Debug)]
+pub struct ImageAdapterClient {
+    pub image_id: String,
+    /// The integration computes on no accelerator, so no device is requested
+    /// by default. A host whose container runtime rejects device-less
+    /// creation (measured: some NVIDIA-runtime sites enumerate every host
+    /// device and fail outright when one is unhealthy) declares one
+    /// workaround device explicitly in local bindings
+    /// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]); it is never guessed in code.
+    pub device: Option<u32>,
+    /// The invocation deadline: container start-up plus framework import.
+    /// Local bindings may widen it for unusually slow hosts.
+    pub timeout: Duration,
+    /// External images fix their own entrypoints, so the adapter command is
+    /// launched through an explicit `--entrypoint` override; built images
+    /// run it through their generated entrypoint contract
+    /// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+    pub explicit_entrypoint: bool,
+}
+
+impl ImageAdapterClient {
+    fn invoke(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        request: AdapterRequest,
+    ) -> Result<AdapterInvocation, InferlabError> {
+        let module = integration_module(integration)?;
+        // The docker client is not the container: a kill on the client
+        // leaves the container running and `--rm` only fires on container
+        // exit. The cidfile is the owned handle that lets a timed-out or
+        // failed invocation remove the container itself
+        // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+        let scratch = tempfile::tempdir().map_err(|source| InferlabError::LaunchAdapter {
+            integration: integration.to_owned(),
+            source,
+        })?;
+        let cidfile = scratch.path().join("cid");
+        let mut launcher = vec![
+            "docker".to_owned(),
+            "run".to_owned(),
+            "--rm".to_owned(),
+            "--interactive".to_owned(),
+            "--cidfile".to_owned(),
+            cidfile.display().to_string(),
+        ];
+        if let Some(device) = self.device {
+            launcher.extend(crate::container::gpu_device_args(&device.to_string()));
+        }
+        if self.explicit_entrypoint {
+            // An external image carries no workspace-side packages, so lowering
+            // runs from the workspace's committed framework-free `adapter` Pixi
+            // environment ([[RFC-0006:C-INTEGRATIONS]]): the adapter version the
+            // workspace pins is the one that lowers. Each package's realized
+            // import directory mounts read-only under one neutral base, and
+            // PYTHONPATH points there so `python -m <module>` imports them.
+            for mount in adapter_environment_mounts(workspace_root, integration)? {
+                launcher.extend([
+                    // The explicit --mount form matches the substitution's
+                    // read-only mount convention (the -v shorthand's `:ro`
+                    // suffix is mangled by at least one site docker proxy).
+                    "--mount".to_owned(),
+                    format!(
+                        "type=bind,source={source},target={ADAPTER_MOUNT_BASE}/{name},readonly",
+                        source = mount.source.display(),
+                        name = mount.import_name,
+                    ),
+                ]);
+            }
+            launcher.extend([
+                "--env".to_owned(),
+                format!("PYTHONPATH={ADAPTER_MOUNT_BASE}"),
+                "--entrypoint".to_owned(),
+                // python3, not python: Debian-family serving images ship no
+                // bare `python` alias, while every conda-family or python-base
+                // image carries python3 (verified against the official
+                // vllm-openai image).
+                "python3".to_owned(),
+                self.image_id.clone(),
+                "-m".to_owned(),
+                module,
+            ]);
+        } else {
+            // A built image bakes the pinned adapter packages into its locked
+            // closure ([[RFC-0003:C-RUNTIME-WORKFLOWS]]), so the generated
+            // entrypoint's `python -m <module>` resolves them with no mount.
+            launcher.extend([
+                self.image_id.clone(),
+                "python".to_owned(),
+                "-m".to_owned(),
+                module,
+            ]);
+        }
+        let outcome = invoke_adapter(
+            workspace_root,
+            integration,
+            &launcher,
+            self.timeout,
+            request,
+        );
+        // Removal applies exactly where a container can outlive the docker
+        // client: a killed client after the deadline, or a wait whose
+        // outcome is unknown. Every other error observed the child exit, so
+        // `--rm` already removed the container — attempting removal there
+        // would warn misleadingly on ordinary structured rejections.
+        if matches!(
+            &outcome,
+            Err(InferlabError::AdapterTimeout { .. } | InferlabError::AdapterIo { .. })
+        ) {
+            remove_adapter_container(&cidfile);
+        }
+        outcome
+    }
+}
+
+/// Observe the framework version inside a declared external image — the only
+/// qualification-adjacent fact available for an image this workspace did not
+/// build ([[RFC-0003:C-RUNTIME-WORKFLOWS]]). An image in which the claimed
+/// framework is not observable is rejected.
+pub(crate) fn probe_external_framework(
+    reference: &str,
+    device: Option<u32>,
+    timeout: Duration,
+    framework: &str,
+) -> Result<String, InferlabError> {
+    if !is_valid_integration_identifier(framework) {
+        return Err(InferlabError::ImageSelection {
+            message: format!("integration reported invalid framework identifier {framework:?}"),
+        });
+    }
+    let scratch = tempfile::tempdir().map_err(|source| InferlabError::ImageSelection {
+        message: format!("framework probe scratch directory failed: {source}"),
+    })?;
+    let cidfile = scratch.path().join("cid");
+    let mut launcher = vec![
+        "docker".to_owned(),
+        "run".to_owned(),
+        "--rm".to_owned(),
+        "--cidfile".to_owned(),
+        cidfile.display().to_string(),
+    ];
+    if let Some(device) = device {
+        launcher.extend(crate::container::gpu_device_args(&device.to_string()));
+    }
+    launcher.extend([
+        "--entrypoint".to_owned(),
+        "python3".to_owned(),
+        reference.to_owned(),
+        "-c".to_owned(),
+        format!("import importlib.metadata as m; print(m.version('{framework}'))"),
+    ]);
+    let probe_failed = |message: String| InferlabError::ImageSelection { message };
+    let (status, stdout, stderr) =
+        match crate::container::run_bounded(&launcher, None, None, timeout) {
+            Ok(crate::container::BoundedWait::Exited {
+                status,
+                stdout,
+                stderr,
+            }) => (status, stdout, stderr),
+            Ok(crate::container::BoundedWait::Deadline { .. }) => {
+                remove_adapter_container(&cidfile);
+                return Err(probe_failed(format!(
+                    "framework probe of {reference} did not finish within {} seconds",
+                    timeout.as_secs()
+                )));
+            }
+            Err(crate::container::BoundedError::Launch(source)) => {
+                return Err(probe_failed(format!(
+                    "framework probe failed to launch: {source}"
+                )));
+            }
+            Err(
+                crate::container::BoundedError::Stdin(source)
+                | crate::container::BoundedError::Wait(source),
+            ) => {
+                remove_adapter_container(&cidfile);
+                return Err(probe_failed(format!("framework probe failed: {source}")));
+            }
+        };
+    if !status.success() {
+        return Err(probe_failed(format!(
+            "external image {reference} does not expose framework {framework:?}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )));
+    }
+    let version = String::from_utf8_lossy(&stdout).trim().to_owned();
+    if version.is_empty() {
+        return Err(probe_failed(format!(
+            "framework probe of {reference} reported no version for {framework:?}"
+        )));
+    }
+    Ok(version)
+}
+
+/// Removal of an adapter container that may have outlived its docker client
+/// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]). An already-removed container is
+/// confirmed gone, not a failure; anything unconfirmed is reported.
+fn remove_adapter_container(cidfile: &Path) {
+    let Ok(cid) = std::fs::read_to_string(cidfile) else {
+        return;
+    };
+    let cid = cid.trim().to_owned();
+    if cid.is_empty() {
+        return;
+    }
+    use crate::container::{Removal, RemovalFailure, remove_container};
+    let detail = match remove_container(None, &cid) {
+        Removal::Confirmed { .. } => return,
+        Removal::Unconfirmed(RemovalFailure::Exit { stderr, .. }) => stderr.trim().to_owned(),
+        Removal::Unconfirmed(RemovalFailure::Deadline) => format!(
+            "docker rm did not finish within {} seconds",
+            crate::container::REMOVAL_TIMEOUT.as_secs()
+        ),
+        Removal::Unconfirmed(RemovalFailure::Launch(error) | RemovalFailure::Wait(error)) => {
+            error.to_string()
+        }
+        Removal::Unconfirmed(RemovalFailure::Ssh(error)) => error,
+    };
+    eprintln!("warning: unconfirmed removal of adapter container {cid}: {detail}");
+}
+
+impl AdapterClient for ImageAdapterClient {
+    fn plan_serve(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        _pixi_environment: &str,
+        input: PlanServeInput,
+    ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
+        let request = AdapterRequest::PlanServe {
+            protocol_version: ProtocolVersion::V3,
+            input,
+        };
+        let invocation = self.invoke(workspace_root, integration, request)?;
+        plan_lowering(integration, invocation)
+    }
+
+    fn render_serve(
+        &self,
+        workspace_root: &Path,
+        integration: &str,
+        _pixi_environment: &str,
+        input: RenderServeInput,
+    ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
+        let request = AdapterRequest::RenderServe {
+            protocol_version: ProtocolVersion::V3,
+            input,
+        };
+        let invocation = self.invoke(workspace_root, integration, request)?;
+        render_lowering(integration, invocation)
+    }
+}
+
+fn plan_lowering(
+    integration: &str,
+    invocation: AdapterInvocation,
+) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
+    let output = match invocation.result {
+        AdapterResult::PlanServe { output } => Ok(*output),
+        _ => wrong_operation(integration),
+    }?;
+    Ok(AdapterLowering {
+        output,
+        request_sha256: invocation.request_sha256,
+        response_sha256: invocation.response_sha256,
+    })
+}
+
+fn render_lowering(
+    integration: &str,
+    invocation: AdapterInvocation,
+) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
+    let output = match invocation.result {
+        AdapterResult::RenderServe { output } => Ok(*output),
+        _ => wrong_operation(integration),
+    }?;
+    Ok(AdapterLowering {
+        output,
+        request_sha256: invocation.request_sha256,
+        response_sha256: invocation.response_sha256,
+    })
+}
+
+struct AdapterInvocation {
+    result: AdapterResult,
+    request_sha256: String,
+    response_sha256: String,
+}
+
+fn invoke_adapter(
+    workspace_root: &Path,
+    integration: &str,
+    launcher: &[String],
+    timeout: Duration,
+    request: AdapterRequest,
+) -> Result<AdapterInvocation, InferlabError> {
+    let payload = serde_json::to_vec(&request)
+        .map_err(|source| InferlabError::SerializeAdapterRequest { source })?;
+    let request_sha256 = format!("{:x}", Sha256::digest(&payload));
+    let adapter_io = |source| InferlabError::AdapterIo {
+        integration: integration.to_owned(),
+        source,
+    };
+    let (status, stdout, stderr) = match crate::container::run_bounded(
+        launcher,
+        Some(workspace_root),
+        Some(&payload),
+        timeout,
+    ) {
+        Ok(crate::container::BoundedWait::Exited {
+            status,
+            stdout,
+            stderr,
+        }) => (status, stdout, stderr),
+        Ok(crate::container::BoundedWait::Deadline { kill }) => {
+            kill.map_err(adapter_io)?;
+            return Err(InferlabError::AdapterTimeout {
+                integration: integration.to_owned(),
+                seconds: timeout.as_secs(),
+            });
+        }
+        Err(crate::container::BoundedError::Launch(source)) => {
+            return Err(InferlabError::LaunchAdapter {
+                integration: integration.to_owned(),
+                source,
+            });
+        }
+        Err(
+            crate::container::BoundedError::Stdin(source)
+            | crate::container::BoundedError::Wait(source),
+        ) => {
+            return Err(adapter_io(source));
+        }
+    };
+    let diagnostics = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if !status.success() {
+        return Err(InferlabError::AdapterExit {
+            integration: integration.to_owned(),
+            status,
+            diagnostics,
+        });
+    }
+    // A cross-version combination is governed solely by the protocol version
+    // ([[RFC-0006:C-INTEGRATIONS]]). The versioned `AdapterResponse` accepts
+    // only `"3"`, so a `"2"` answer would otherwise surface as an opaque
+    // deserialize failure; pre-parse the raw `protocol_version` and fail with
+    // the actionable both-versions-plus-remedy shape instead.
+    if let Some(answered) = raw_protocol_version(&stdout)
+        && answered != PROTOCOL_VERSION
+    {
+        return Err(InferlabError::AdapterProtocolVersion {
+            message: protocol_version_remedy(integration, &answered),
+        });
+    }
+    let response: AdapterResponse =
+        serde_json::from_slice(&stdout).map_err(|source| InferlabError::AdapterProtocol {
+            integration: integration.to_owned(),
+            source,
+            diagnostics: diagnostics.clone(),
+        })?;
+    let response_sha256 = format!("{:x}", Sha256::digest(&stdout));
+    match response {
+        AdapterResponse::Ok { result, .. } => Ok(AdapterInvocation {
+            result: *result,
+            request_sha256,
+            response_sha256,
+        }),
+        // An integration that recognizes the mismatch itself answers with a
+        // structured unsupported-protocol-version error; surface the same
+        // both-versions-plus-remedy shape rather than a bare rejection.
+        AdapterResponse::Error { error, .. }
+            if error.code == AdapterErrorCode::UnsupportedProtocolVersion =>
+        {
+            let detail = if diagnostics.is_empty() {
+                error.message
+            } else {
+                format!("{}; diagnostics: {diagnostics}", error.message)
+            };
+            Err(InferlabError::AdapterProtocolVersion {
+                message: format!(
+                    "{detail}; this inferlab binary speaks protocol version {PROTOCOL_VERSION} \
+                     — bump the workspace adapter pins and relock, or run a release whose binary \
+                     speaks the integration's protocol version"
+                ),
+            })
+        }
+        AdapterResponse::Error { error, .. } => Err(InferlabError::AdapterRejected {
+            integration: integration.to_owned(),
+            code: error.code,
+            // The SDK's structured message often defers to stderr for the
+            // underlying traceback; the captured diagnostics belong in the
+            // operator-facing error, not on the floor.
+            message: if diagnostics.is_empty() {
+                error.message
+            } else {
+                format!("{}; diagnostics: {diagnostics}", error.message)
+            },
+        }),
+    }
+}
+
+/// The protocol version this binary speaks, as its wire string.
+const PROTOCOL_VERSION: &str = "3";
+
+/// The raw `protocol_version` string an adapter answered, read without
+/// committing to the full versioned response shape. Absent when the field is
+/// missing or not a string — those fall through to ordinary shape validation.
+fn raw_protocol_version(stdout: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(stdout)
+        .ok()?
+        .get("protocol_version")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The operator-facing protocol-version mismatch message: both versions and the
+/// remedy ([[RFC-0006:C-INTEGRATIONS]]).
+fn protocol_version_remedy(integration: &str, answered: &str) -> String {
+    format!(
+        "integration {integration} answered with protocol version {answered}; this inferlab \
+         binary speaks protocol version {PROTOCOL_VERSION} — bump the workspace adapter pins and \
+         relock, or run a release whose binary speaks protocol version {answered}"
+    )
+}
+
+fn wrong_operation<T>(integration: &str) -> Result<T, InferlabError> {
+    Err(InferlabError::InvalidConfig {
+        message: format!("integration {integration:?} returned a result for the wrong operation"),
+    })
+}
+
+#[must_use]
+pub fn executable_name(integration: &str) -> String {
+    format!("inferlab-adapter-{integration}")
+}
+
+fn adapter_executable(integration: &str) -> Result<String, InferlabError> {
+    validate_integration_id(integration)?;
+    Ok(executable_name(integration))
+}
+
+/// The integration's Python module, invocable as `python -m` against the
+/// adapter packages the image realization exposes.
+fn integration_module(integration: &str) -> Result<String, InferlabError> {
+    validate_integration_id(integration)?;
+    Ok(format!(
+        "inferlab_integration_{}",
+        integration.replace('-', "_")
+    ))
+}
+
+/// One workspace-side adapter package resolved to its host import directory,
+/// bound to the neutral in-container name it mounts under.
+struct AdapterMount {
+    import_name: String,
+    source: std::path::PathBuf,
+}
+
+/// Resolve the adapter SDK and the integration's import directories by running
+/// the committed `adapter` Pixi environment's own interpreter, so editable and
+/// regular installs resolve uniformly ([[RFC-0006:C-INTEGRATIONS]]). A missing
+/// interpreter or a failed import is a launch error naming the adapter
+/// environment and the package that could not resolve.
+fn adapter_environment_mounts(
+    workspace_root: &Path,
+    integration: &str,
+) -> Result<Vec<AdapterMount>, InferlabError> {
+    environment::ensure_usable(workspace_root, ADAPTER_ENVIRONMENT)?;
+    let module = integration_module(integration)?;
+    let import_names = ["inferlab_adapter_sdk".to_owned(), module];
+    let python = workspace_root
+        .join(".pixi/envs")
+        .join(ADAPTER_ENVIRONMENT)
+        .join("bin/python");
+    // One line per package: its `__path__[0]`, in the requested order. A single
+    // failed import aborts the whole script, so the interpreter's stderr names
+    // the offending package.
+    let script = format!(
+        "import importlib\nfor name in {import_names:?}:\n    \
+         print(importlib.import_module(name).__path__[0])\n"
+    );
+    let launch_error = |source| InferlabError::LaunchAdapter {
+        integration: integration.to_owned(),
+        source,
+    };
+    let output = std::process::Command::new(&python)
+        .current_dir(workspace_root)
+        .args(["-c", &script])
+        .output()
+        .map_err(launch_error)?;
+    if !output.status.success() {
+        return Err(InferlabError::LaunchAdapter {
+            integration: integration.to_owned(),
+            source: std::io::Error::other(format!(
+                "resolving the adapter packages from Pixi environment {ADAPTER_ENVIRONMENT:?} \
+                 failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let directories: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if directories.len() != import_names.len() {
+        return Err(InferlabError::LaunchAdapter {
+            integration: integration.to_owned(),
+            source: std::io::Error::other(format!(
+                "Pixi environment {ADAPTER_ENVIRONMENT:?} did not resolve every adapter package \
+                 {import_names:?}"
+            )),
+        });
+    }
+    Ok(import_names
+        .into_iter()
+        .zip(directories)
+        .map(|(import_name, source)| AdapterMount {
+            import_name,
+            source: std::path::PathBuf::from(source),
+        })
+        .collect())
+}
+
+/// The traversal-safe charset an integration identifier (and the framework
+/// identity an integration reports) must draw from: non-empty, and only
+/// lowercase ASCII, digits, and `-`. Callers render their own rejection.
+fn is_valid_integration_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_integration_id(integration: &str) -> Result<(), InferlabError> {
+    if !is_valid_integration_identifier(integration) {
+        return Err(InferlabError::InvalidConfig {
+            message: format!("invalid integration identifier {integration:?}"),
+        });
+    }
+    Ok(())
+}

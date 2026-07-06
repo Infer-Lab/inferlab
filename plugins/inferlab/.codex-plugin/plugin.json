@@ -1,0 +1,34 @@
+{
+  "name": "inferlab",
+  "version": "0.1.0",
+  "description": "Agent Skill for operating the Inferlab CLI: reproducible LLM inference experiments with file-first evidence.",
+  "author": {
+    "name": "Zihua Wu"
+  },
+  "homepage": "https://github.com/Infer-Lab/inferlab",
+  "repository": "https://github.com/Infer-Lab/inferlab",
+  "license": "MIT",
+  "keywords": [
+    "llm",
+    "inference",
+    "benchmarking",
+    "vllm",
+    "inferlab"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Inferlab",
+    "shortDescription": "Run reproducible LLM inference experiments with the Inferlab CLI.",
+    "longDescription": "A reusable Agent Skill for driving Inferlab: versioned workspaces, serve lifecycles, closed-loop eval/bench recipes, runtime images, and file-first execution records.",
+    "developerName": "Zihua Wu",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Skills"
+    ],
+    "defaultPrompt": [
+      "Start the serving recipe and run a bench against it.",
+      "Run the closed-loop recipe and summarize the record.",
+      "Reproduce this experiment from its record."
+    ]
+  }
+}

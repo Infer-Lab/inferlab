@@ -1,0 +1,37 @@
+[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+datamodel-code-generator = "==0.66.0"
+pydantic = "==2.13.4"
+pytest = "==9.1.1"
+mypy = "==2.1.0"
+ruff = "0.*"
+jsonschema = "==4.26.0"
+types-jsonschema = "==4.26.0.20260518"
+python-build = "1.*"
+hatchling = ">=1.27,<2"
+uv = "0.*"
+
+[pypi-dependencies]
+inferlab-adapter-sdk = { path = "python/inferlab-adapter-sdk", editable = true }
+inferlab-bench-runner = { path = "python/inferlab-bench-runner", editable = true }
+inferlab-eval-runner = { path = "python/inferlab-eval-runner", editable = true }
+inferlab-integration-sglang = { path = "python/inferlab-integration-sglang", editable = true }
+inferlab-integration-vllm = { path = "python/inferlab-integration-vllm", editable = true }
+
+[activation.env]
+PYTHONNOUSERSITE = "1"
+
+[tasks]
+protocol-generate = "scripts/protocol-codegen.sh generate"
+protocol-check = "scripts/protocol-codegen.sh check"
+format-python = "ruff format python crates/inferlab/tests/fixtures/bin"
+format-python-check = "ruff format --check python crates/inferlab/tests/fixtures/bin"
+lint-python = "ruff check python crates/inferlab/tests/fixtures/bin"
+typecheck-python = "mypy python"
+test-python = "pytest"
+build-python = "scripts/build-python-packages.sh"
+verify-python = { depends-on = ["protocol-check", "format-python-check", "lint-python", "typecheck-python", "test-python", "build-python"] }

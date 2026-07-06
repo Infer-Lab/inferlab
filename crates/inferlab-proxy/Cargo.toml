@@ -1,0 +1,27 @@
+[package]
+name = "inferlab-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The built-in serving proxy for Inferlab experiment topologies."
+keywords = ["llm", "inference", "proxy"]
+categories = ["web-programming"]
+include = ["src/**", "LICENSE"]
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

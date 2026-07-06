@@ -1,0 +1,25 @@
+# Workspace-local private bindings
+.inferlab/local.toml
+.inferlab/records/
+
+# Rust
+target/
+
+# Python
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Environments
+.pixi/
+.venv/
+python/**/pixi.lock
+
+# Editor
+*.code-workspace
+

@@ -1,0 +1,63 @@
+{
+  "status": "ok",
+  "protocol_version": "3",
+  "result": {
+    "operation": "render_serve",
+    "output": {
+      "integration": {"adapter_id": "inferlab-vllm", "adapter_version": "0.1.0", "framework": "vllm"},
+      "processes": [
+        {
+          "id": "prefill",
+          "process": {
+            "argv": [
+              "python3", "-m", "vllm.entrypoints.cli.main", "serve", "/models/dsv4",
+              "--host", "node-a.example", "--port", "8000",
+              "--served-model-name", "dsv4", "--tensor-parallel-size", "2",
+              "--trust-remote-code", "--profiler-config", "{\"profiler\":\"cuda\"}",
+              "--kv-transfer-config", "{\"kv_connector\":\"MooncakeConnector\",\"kv_connector_extra_config\":{\"num_workers\":1},\"kv_role\":\"kv_producer\"}"
+            ],
+            "env": {
+              "VLLM_SERVER_DEV_MODE": "1",
+              "VLLM_CACHE_ROOT": "/cache/runtime/node-a/prefill/vllm",
+              "DG_JIT_CACHE_DIR": "/cache/runtime/node-a/prefill/deep_gemm_jit",
+              "FLASHINFER_WORKSPACE_BASE": "/cache/runtime/node-a/prefill/flashinfer",
+              "FLASHINFER_CUBIN_DIR": "/cache/runtime/node-a/prefill/flashinfer_cubin",
+              "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/cache/runtime/node-a/prefill/flashinfer_autotune",
+              "TILELANG_CACHE_DIR": "/cache/runtime/node-a/prefill/tilelang",
+              "TILELANG_TMP_DIR": "/cache/runtime/node-a/prefill/tilelang/tmp",
+              "TRITON_CACHE_DIR": "/cache/runtime/node-a/prefill/triton",
+              "TORCHINDUCTOR_CACHE_DIR": "/cache/runtime/node-a/prefill/torchinductor",
+              "TORCH_EXTENSIONS_DIR": "/cache/runtime/node-a/prefill/torch_extensions",
+              "VLLM_MOONCAKE_BOOTSTRAP_PORT": "29501"
+            }
+          }
+        },
+        {
+          "id": "decode",
+          "process": {
+            "argv": [
+              "python3", "-m", "vllm.entrypoints.cli.main", "serve", "/models/dsv4",
+              "--host", "node-b.example", "--port", "8000",
+              "--served-model-name", "dsv4", "--tensor-parallel-size", "2",
+              "--trust-remote-code", "--profiler-config", "{\"profiler\":\"cuda\"}",
+              "--kv-transfer-config", "{\"kv_connector\":\"MooncakeConnector\",\"kv_connector_extra_config\":{\"num_workers\":1},\"kv_role\":\"kv_consumer\"}"
+            ],
+            "env": {
+              "VLLM_SERVER_DEV_MODE": "1",
+              "VLLM_CACHE_ROOT": "/cache/runtime/node-b/decode/vllm",
+              "DG_JIT_CACHE_DIR": "/cache/runtime/node-b/decode/deep_gemm_jit",
+              "FLASHINFER_WORKSPACE_BASE": "/cache/runtime/node-b/decode/flashinfer",
+              "FLASHINFER_CUBIN_DIR": "/cache/runtime/node-b/decode/flashinfer_cubin",
+              "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/cache/runtime/node-b/decode/flashinfer_autotune",
+              "TILELANG_CACHE_DIR": "/cache/runtime/node-b/decode/tilelang",
+              "TILELANG_TMP_DIR": "/cache/runtime/node-b/decode/tilelang/tmp",
+              "TRITON_CACHE_DIR": "/cache/runtime/node-b/decode/triton",
+              "TORCHINDUCTOR_CACHE_DIR": "/cache/runtime/node-b/decode/torchinductor",
+              "TORCH_EXTENSIONS_DIR": "/cache/runtime/node-b/decode/torch_extensions"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,89 @@
+schema_version = 1
+
+[models.dsv4]
+weight = "dsv4"
+served_name = "dsv4"
+
+[serve_profiles.vllm-dsv4]
+integration = "vllm"
+readiness_timeout_seconds = 900
+
+[serve_profiles.vllm-dsv4.parallelism.outer]
+pipeline_parallel_size = 1
+
+[serve_profiles.vllm-dsv4.settings]
+max_model_len = 65536
+kv_cache_dtype = "fp8"
+gpu_memory_utilization = 0.95
+trust_remote_code = true
+compilation_config = { cudagraph_mode = "FULL_AND_PIECEWISE", custom_ops = ["all"] }
+
+[source_sets.vllm]
+paths = ["vendor/vllm", "vendor/flashinfer"]
+
+[environments.vllm]
+pixi_environment = "vllm"
+
+[evals.smoke]
+kind = "openai-smoke"
+prompt = "San Francisco is a city in"
+max_tokens = 16
+timeout_seconds = 60
+
+[evals.gsm8k]
+kind = "lm-eval"
+task = "gsm8k"
+limit = 64
+metric = "exact_match"
+threshold = 0.90
+timeout_seconds = 900
+
+[benches.c8k1k]
+kind = "serving"
+input_tokens = 8192
+output_tokens = 1024
+concurrency = [1, 4]
+prompts_per_concurrency = 4
+request_rates = [1.0, "inf"]
+request_count = 32
+burstiness = 1.0
+reset_prefix_cache = true
+timeout_seconds = 900
+
+[benches.adaptive-c8k1k]
+kind = "adaptive-serving"
+input_tokens = 8192
+output_tokens = 1024
+initial_request_rates = [1.0, 4.0]
+target_metric = "p99_ttft_ms"
+target_threshold = 1000.0
+max_refinement_steps = 3
+min_rate_resolution = 0.25
+request_count = 32
+burstiness = 1.0
+reset_prefix_cache = true
+timeout_seconds = 900
+
+[workload_suites.qualify]
+evals = ["smoke", "gsm8k"]
+gate = "gsm8k"
+benches = ["c8k1k", "adaptive-c8k1k"]
+
+[recipes.dsv4-qualify]
+model = "dsv4"
+serve_profile = "vllm-dsv4"
+source_set = "vllm"
+environment = "vllm"
+workload_suite = "qualify"
+
+[[recipes.dsv4-qualify.cases]]
+id = "tp2"
+
+[recipes.dsv4-qualify.cases.parallelism.outer]
+tensor_parallel_size = 2
+
+[[recipes.dsv4-qualify.cases]]
+id = "tp4"
+
+[recipes.dsv4-qualify.cases.parallelism.outer]
+tensor_parallel_size = 4

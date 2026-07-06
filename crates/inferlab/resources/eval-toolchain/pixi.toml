@@ -1,0 +1,24 @@
+[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.eval.dependencies]
+python = "3.12.*"
+pydantic = "==2.13.4"
+
+[feature.eval.pypi-dependencies]
+lm-eval = { version = "==0.4.12", extras = ["api"] }
+
+[feature.bench.dependencies]
+python = "3.12.*"
+pydantic = "==2.13.4"
+
+[feature.bench.target.linux-aarch64.dependencies]
+c-compiler = "1.*"
+
+[feature.bench.pypi-dependencies]
+aiperf = "==0.10.0"
+
+[environments]
+eval = ["eval"]
+bench = ["bench"]
