@@ -14,6 +14,28 @@ pub enum InferlabError {
         source: std::io::Error,
     },
 
+    #[error(
+        "failed to read render input {source_path:?} declared by integration {integration:?} at {path}: {source}"
+    )]
+    RenderInputRead {
+        integration: String,
+        source_path: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "render input {source_path:?} declared by integration {integration:?} at {path} is not UTF-8: {source}"
+    )]
+    RenderInputUtf8 {
+        integration: String,
+        source_path: String,
+        path: PathBuf,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+
     #[error("failed to parse {path}: {source}")]
     ParseToml {
         path: PathBuf,
@@ -86,6 +108,9 @@ pub enum InferlabError {
         diagnostics: String,
     },
 
+    #[error("one or more serving environments are not confirmed usable; see the status report")]
+    EnvironmentStatusUnconfirmed,
+
     #[error("the Inferlab measurement toolchain does not support this host platform: {platform}")]
     UnsupportedToolchainPlatform { platform: String },
 
@@ -93,6 +118,18 @@ pub enum InferlabError {
     ToolchainIo {
         operation: &'static str,
         path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "failed to remove held measurement toolchain path {path}: {source}; \
+         held by {holders}; terminate the holding processes and rerun \
+         `inferlab toolchain install`"
+    )]
+    ToolchainHeld {
+        path: PathBuf,
+        holders: String,
         #[source]
         source: std::io::Error,
     },
@@ -214,6 +251,9 @@ pub enum InferlabError {
     #[error("agent plugin operation failed: {message}")]
     Agent { message: String },
 
+    #[error("ad-hoc execution failed: {message}")]
+    AdHocRun { message: String },
+
     #[error("failed to access server record {path}: {source}")]
     RecordIo {
         path: PathBuf,
@@ -262,7 +302,9 @@ impl InferlabError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::WorkspaceNotFound { .. } => "E1001",
-            Self::Read { .. } => "E1002",
+            Self::Read { .. } | Self::RenderInputRead { .. } | Self::RenderInputUtf8 { .. } => {
+                "E1002"
+            }
             Self::ParseToml { .. } => "E1003",
             Self::ParseYaml { .. } | Self::SerializeToml { .. } => "E1003",
             Self::InvalidConfig { .. } => "E1004",
@@ -273,9 +315,11 @@ impl InferlabError {
             | Self::EnvironmentLifecycle { .. }
             | Self::EnvironmentIo { .. }
             | Self::EnvironmentRestore { .. }
-            | Self::PixiEnvironmentUnavailable { .. } => "E1007",
+            | Self::PixiEnvironmentUnavailable { .. }
+            | Self::EnvironmentStatusUnconfirmed => "E1007",
             Self::UnsupportedToolchainPlatform { .. }
             | Self::ToolchainIo { .. }
+            | Self::ToolchainHeld { .. }
             | Self::LaunchToolchain { .. }
             | Self::ToolchainExit { .. }
             | Self::ToolchainVerification { .. }
@@ -302,6 +346,7 @@ impl InferlabError {
             }
             Self::Scratchpad { .. } => "E6001",
             Self::Agent { .. } => "E7001",
+            Self::AdHocRun { .. } => "E8001",
             Self::WriteOutput { .. } | Self::EncodeOutput { .. } => "E9001",
         }
     }

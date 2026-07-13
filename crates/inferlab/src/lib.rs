@@ -1,4 +1,5 @@
 mod adapter;
+mod adhoc;
 mod agent;
 mod cli;
 mod container;

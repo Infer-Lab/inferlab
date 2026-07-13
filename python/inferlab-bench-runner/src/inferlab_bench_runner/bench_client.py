@@ -27,6 +27,10 @@ from inferlab_adapter_sdk._generated import (
 RUNNER_VERSION = "0.1.0"
 NORMALIZATION_SCHEMA = "aiperf-summary-v1"
 ARTIFACT_PREFIX = "inferlab-bench"
+COMPLETIONS_PAYLOAD_TEMPLATE = (
+    '{"prompt": {{ text | tojson }}, "model": {{ model | tojson }}, '
+    '"stream": {{ stream | tojson }}, "max_tokens": {{ max_tokens }}}'
+)
 
 METRIC_PATHS: dict[str, tuple[str, str]] = {
     "request_throughput": ("request_throughput", "avg"),
@@ -72,23 +76,40 @@ def aiperf_config(request: BenchClientRequest) -> JsonObject:
     endpoint = request.endpoint
     definition = request.definition
     url = endpoint_url(endpoint)
+    resolved_endpoint_type = endpoint_type(endpoint.api_path)
+    endpoint_config: JsonObject = {
+        "url": url,
+        "type": resolved_endpoint_type,
+        "streaming": True,
+        "timeout": definition.timeout_seconds,
+        "useServerTokenCount": True,
+        "extra": {
+            "ignore_eos": True,
+            "min_tokens": definition.output_tokens,
+            "temperature": definition.temperature,
+        },
+    }
+    if resolved_endpoint_type == "completions":
+        # AIPerf's native completions endpoint always emits ``prompt`` as a
+        # list, even though every Inferlab Bench credit carries one prompt.
+        # Use its template endpoint to preserve the standard scalar request
+        # shape accepted by OpenAI-compatible servers without batch support.
+        endpoint_config.update(
+            {
+                "type": "template",
+                "useServerTokenCount": False,
+                "template": {
+                    "body": COMPLETIONS_PAYLOAD_TEMPLATE,
+                    "response_field": "text",
+                },
+            }
+        )
     return {
         "schemaVersion": "2.0",
         "randomSeed": definition.seed,
         "benchmark": {
             "model": request.model.served_name,
-            "endpoint": {
-                "url": url,
-                "type": endpoint_type(endpoint.api_path),
-                "streaming": True,
-                "timeout": definition.timeout_seconds,
-                "useServerTokenCount": True,
-                "extra": {
-                    "ignore_eos": True,
-                    "min_tokens": definition.output_tokens,
-                    "temperature": definition.temperature,
-                },
-            },
+            "endpoint": endpoint_config,
             "dataset": {
                 "type": "synthetic",
                 "entries": request.case.request_count,

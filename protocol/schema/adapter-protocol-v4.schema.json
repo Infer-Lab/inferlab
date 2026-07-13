@@ -1,5 +1,5 @@
 {
-  "$id": "https://inferlab.dev/schema/adapter-protocol/v3",
+  "$id": "https://inferlab.dev/schema/adapter-protocol/v4",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AdapterProtocol",
   "description": "The schema root aggregating every wire type. It exists to generate one\ncommitted JSON schema (and the Python SDK models); its optional client\nfields are never all populated in a single message.",
@@ -864,6 +864,27 @@
         }
       ]
     },
+    "LaunchFileDeclaration": {
+      "description": "One immutable text input a rendered process requires before it can launch.",
+      "type": "object",
+      "properties": {
+        "relative_path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "text",
+        "sha256"
+      ]
+    },
     "Parallelism": {
       "description": "Framework-neutral component-aware parallelism ([[RFC-0003:C-SERVE-PARALLELISM]]).\nEvery component is optional so an operator can override one without\nrepeating the rest; omitted components are filled by the integration into a\ncomplete effective shape.",
       "type": "object",
@@ -1087,6 +1108,13 @@
         "public_endpoint": {
           "$ref": "#/$defs/PublicEndpointRequirement"
         },
+        "render_inputs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RenderInputDeclaration"
+          }
+        },
         "replicas": {
           "type": "array",
           "items": {
@@ -1136,12 +1164,12 @@
       ]
     },
     "ProtocolVersion": {
-      "description": "The adapter protocol version an integration speaks. The only accepted value\nis `3` (serialized as the string `\"3\"`); a mismatch is rejected before\nlowering.",
+      "description": "The shared protocol version used by framework integrations and release-owned\nmeasurement clients. The only accepted value is `4` (serialized as the\nstring `\"4\"`); a mismatch is rejected before lowering.",
       "oneOf": [
         {
-          "description": "Protocol version 3.",
+          "description": "Protocol version 4.",
           "type": "string",
-          "const": "3"
+          "const": "4"
         }
       ]
     },
@@ -1245,6 +1273,64 @@
           ]
         },
         {
+          "description": "Ready when the public endpoint succeeds and its HTTP target registry\ncontains every control-plane-derived serving target.",
+          "type": "object",
+          "properties": {
+            "decode_role_value": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "http_target_registry"
+            },
+            "prefill_bootstrap_port": {
+              "type": "string"
+            },
+            "prefill_role_value": {
+              "type": "string"
+            },
+            "readiness_path": {
+              "type": "string"
+            },
+            "registry_path": {
+              "type": "string"
+            },
+            "target_bootstrap_port_field": {
+              "type": "string"
+            },
+            "target_healthy_field": {
+              "type": "string"
+            },
+            "target_role_field": {
+              "type": "string"
+            },
+            "target_scheme": {
+              "$ref": "#/$defs/TargetEndpointScheme"
+            },
+            "target_url_field": {
+              "type": "string"
+            },
+            "targets_field": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "target_scheme",
+            "readiness_path",
+            "registry_path",
+            "targets_field",
+            "target_url_field",
+            "target_role_field",
+            "target_healthy_field",
+            "target_bootstrap_port_field",
+            "prefill_role_value",
+            "decode_role_value",
+            "prefill_bootstrap_port"
+          ]
+        },
+        {
           "description": "Ready as soon as the process is alive.",
           "type": "object",
           "properties": {
@@ -1258,6 +1344,19 @@
             "kind"
           ]
         }
+      ]
+    },
+    "RenderInputDeclaration": {
+      "description": "One workspace-authored UTF-8 source file an integration declares during\nplanning for the control plane to supply during final rendering.",
+      "type": "object",
+      "properties": {
+        "source_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_path"
       ]
     },
     "RenderServeInput": {
@@ -1295,6 +1394,13 @@
         "profiling": {
           "type": "boolean",
           "default": false
+        },
+        "render_inputs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SuppliedRenderInput"
+          }
         },
         "roles": {
           "type": "array",
@@ -1354,6 +1460,12 @@
         "id": {
           "type": "string"
         },
+        "launch_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LaunchFileDeclaration"
+          }
+        },
         "process": {
           "$ref": "#/$defs/ProcessSpec"
         }
@@ -1361,6 +1473,7 @@
       "additionalProperties": false,
       "required": [
         "id",
+        "launch_files",
         "process"
       ]
     },
@@ -1757,6 +1870,42 @@
           "additionalProperties": {
             "$ref": "#/$defs/SettingValue"
           }
+        }
+      ]
+    },
+    "SuppliedRenderInput": {
+      "description": "The original declared path plus the exact UTF-8 contents and digest the\ncontrol plane supplies to an integration during final rendering.",
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "type": "string"
+        },
+        "source_path": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_path",
+        "text",
+        "sha256"
+      ]
+    },
+    "TargetEndpointScheme": {
+      "description": "The application protocol used to identify serving targets in a registry.",
+      "oneOf": [
+        {
+          "description": "HTTP serving endpoint.",
+          "type": "string",
+          "const": "http"
+        },
+        {
+          "description": "gRPC serving endpoint.",
+          "type": "string",
+          "const": "grpc"
         }
       ]
     }

@@ -11,27 +11,38 @@ from inferlab_adapter_sdk import (
     EndpointProtocol,
     EndpointRequirement,
     IntegrationIdentity,
+    LaunchFileDeclaration,
     PlanServeInput,
     PlanServeResult,
     PublicEndpointRequirement,
     PublicEndpointRequirementReplica,
     ReadinessProbe,
     ReadinessProbeHttp,
+    ReadinessProbeHttpTargetRegistry,
     ReadinessProbeProcessAlive,
+    RenderInputDeclaration,
     ServeReplicaRequirement,
     ServeRoleKind,
     ServeRoleResult,
+    SuppliedRenderInput,
+    TargetEndpointScheme,
     handle_request,
     run_adapter,
 )
-from inferlab_adapter_sdk._generated import AdapterResponseError
+from inferlab_adapter_sdk._generated import (
+    AdapterRequestRenderServe,
+    AdapterResponseError,
+    AdapterResponseOk,
+    AdapterResultPlanServe,
+    AdapterResultRenderServe,
+)
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import ValidationError as PydanticValidationError
 
 ROOT = Path(__file__).parents[3]
 FIXTURES = ROOT / "protocol" / "fixtures"
-SCHEMA = ROOT / "protocol" / "schema" / "adapter-protocol-v3.schema.json"
+SCHEMA = ROOT / "protocol" / "schema" / "adapter-protocol-v4.schema.json"
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -76,10 +87,62 @@ def fixture_plan_serve(input: PlanServeInput) -> PlanServeResult:
 
 def test_generated_models_accept_shared_valid_fixtures() -> None:
     AdapterRequest.model_validate(load_json(FIXTURES / "valid" / "plan-serve-request.json"))
-    AdapterResponse.model_validate(load_json(FIXTURES / "valid" / "plan-serve-response.json"))
-    AdapterRequest.model_validate(load_json(FIXTURES / "valid" / "render-serve-request.json"))
+    plan_response = AdapterResponse.model_validate(
+        load_json(FIXTURES / "valid" / "plan-serve-response.json")
+    )
+    render_request = AdapterRequest.model_validate(
+        load_json(FIXTURES / "valid" / "render-serve-request.json")
+    )
     AdapterResponse.model_validate(load_json(FIXTURES / "valid" / "render-serve-response.json"))
     AdapterResponse.model_validate(load_json(FIXTURES / "valid" / "error-response.json"))
+
+    assert isinstance(plan_response.root, AdapterResponseOk)
+    plan_result = plan_response.root.result.root
+    assert isinstance(plan_result, AdapterResultPlanServe)
+    assert plan_result.output.render_inputs == []
+    assert isinstance(render_request.root, AdapterRequestRenderServe)
+    assert render_request.root.input.render_inputs == []
+
+
+def test_generated_models_preserve_rendered_launch_files() -> None:
+    response = AdapterResponse.model_validate(
+        load_json(FIXTURES / "valid" / "render-serve-response-launch-file.json")
+    )
+    assert isinstance(response.root, AdapterResponseOk)
+    result = response.root.result.root
+    assert isinstance(result, AdapterResultRenderServe)
+    launch_file = result.output.processes[0].launch_files[0]
+
+    assert isinstance(launch_file, LaunchFileDeclaration)
+    assert launch_file.relative_path.endswith("/generation.yaml")
+    assert launch_file.text == "generation_config:\n  temperature: 0.0\n"
+    assert launch_file.sha256 == "2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281"
+
+
+def test_generated_models_preserve_render_inputs() -> None:
+    declaration = RenderInputDeclaration.model_validate(
+        load_json(FIXTURES / "valid" / "render-input-declaration.json")
+    )
+    supplied = SuppliedRenderInput.model_validate(
+        load_json(FIXTURES / "valid" / "supplied-render-input.json")
+    )
+
+    assert declaration.source_path == "configs/operator.yaml"
+    assert supplied.source_path == declaration.source_path
+    assert supplied.text == "batch_scheduler:\n  enable_chunked_context: true\n"
+    assert supplied.sha256 == "898caa1654c13bd4b1f2eba75d17c09b8fc3ea1370e5532a5111be220d50baa3"
+
+
+def test_generated_models_preserve_http_target_registry_readiness() -> None:
+    readiness = ReadinessProbe.model_validate(
+        load_json(FIXTURES / "valid" / "http-target-registry-readiness.json")
+    ).root
+
+    assert isinstance(readiness, ReadinessProbeHttpTargetRegistry)
+    assert readiness.target_scheme == TargetEndpointScheme.http
+    assert readiness.readiness_path == "/readiness"
+    assert readiness.registry_path == "/workers"
+    assert readiness.prefill_bootstrap_port == "bootstrap"
 
 
 @pytest.mark.parametrize(
@@ -148,7 +211,7 @@ def test_unsupported_request_protocol_version_is_reported_before_shape(
     error = response.root
     assert isinstance(error, AdapterResponseError)
     assert error.error.code == AdapterErrorCode.unsupported_protocol_version
-    assert "2" in error.error.message and "3" in error.error.message
+    assert "2" in error.error.message and "4" in error.error.message
 
 
 def test_malformed_request_json_stays_invalid_request() -> None:

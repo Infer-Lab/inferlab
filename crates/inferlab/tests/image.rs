@@ -1,5 +1,5 @@
-//! Deterministic runtime-image production coverage ([[RFC-0007:C-IMAGE-BUILD]],
-//! WI-2026-06-30-005): a two-platform by two-model fixture proves
+//! Deterministic runtime-image production coverage ([[RFC-0007:C-IMAGE-BUILD]]):
+//! a two-platform by two-model fixture proves
 //! builder-scoped platform batches (the unproducible platform is skipped with
 //! a reason), coordinate deduplication onto one assembly, and containerized
 //! closed-loop validation with a fixture `docker` builder.
@@ -45,6 +45,12 @@ struct Scenario {
     ssh_fail_cleanup: bool,
     /// `docker rm` exits non-zero on a container it will not remove.
     rm_fail: bool,
+    /// `docker rm` answers "removal is already in progress", as a `--rm`
+    /// container whose exit races the explicit removal does.
+    rm_race: bool,
+    /// The absence poll keeps finding the container (the in-flight removal
+    /// never completes).
+    container_lingers: bool,
 }
 
 struct TestWorkspace {
@@ -92,6 +98,10 @@ impl TestWorkspace {
             "baseline\n",
         )?;
         fs::write(
+            root.path().join("operator-config.yaml"),
+            "INFERLAB_RUNTIME_ONLY_LAUNCH_FILE\nunicode: 雪\n",
+        )?;
+        fs::write(
             root.path().join("pixi.toml"),
             "[workspace]\n\
              channels = [\"conda-forge\"]\n\
@@ -119,14 +129,24 @@ impl TestWorkspace {
             root.path().join("pixi.lock"),
             "version: 6\nenvironments:\n  vllm: {}\n  adapter: {}\n",
         )?;
+        // ensure_usable checks this prefix exists on disk before shelling
+        // out to pixi at all; the adapter environment's own prefix is
+        // populated below.
+        fs::create_dir_all(root.path().join(".pixi/envs/vllm"))?;
         // The realized adapter environment's interpreter: an external-image
-        // launch resolves the workspace-side package import directories by
-        // running it, so the fixture prints one fixture directory per package
+        // launch resolves the workspace-side package import directories and
+        // their distribution metadata by running it, so the fixture prints
+        // two fixture directories per package — module, then `.dist-info` —
         // in the requested order ([[RFC-0006:C-INTEGRATIONS]]).
         let adapter_bin = root.path().join(".pixi/envs/adapter/bin");
         fs::create_dir_all(&adapter_bin)?;
         for package in ["inferlab_adapter_sdk", "inferlab_integration_vllm"] {
             fs::create_dir_all(root.path().join(".pixi/envs/adapter/site").join(package))?;
+            fs::create_dir_all(
+                root.path()
+                    .join(".pixi/envs/adapter/site")
+                    .join(format!("{package}-0.1.0.dist-info")),
+            )?;
         }
         write_executable(
             &adapter_bin.join("python"),
@@ -134,7 +154,8 @@ impl TestWorkspace {
              import os\n\
              root = os.getcwd()\n\
              for name in ('inferlab_adapter_sdk', 'inferlab_integration_vllm'):\n\
-             \x20   print(f'{root}/.pixi/envs/adapter/site/{name}')\n",
+             \x20   print(f'{root}/.pixi/envs/adapter/site/{name}')\n\
+             \x20   print(f'{root}/.pixi/envs/adapter/site/{name}-0.1.0.dist-info')\n",
         )?;
         fs::write(
             root.path().join(".gitignore"),
@@ -852,6 +873,68 @@ fn pass_env_value_declarations_are_rejected() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn external_image_adapter_container_mounts_modules_with_their_metadata()
+-> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let docker_log = workspace.root.path().join("docker-log");
+    let dry = workspace
+        .command_with(&Scenario {
+            docker_log: Some(docker_log.clone()),
+            ..Scenario::default()
+        })
+        .args([
+            "recipe",
+            "run",
+            "dsv4-qualify",
+            "--external-image",
+            "fixture-external",
+            "--set",
+            "server.fixture_mode=\"launch-file\"",
+            "--dry-run",
+        ])
+        .output()?;
+    assert!(
+        dry.status.success(),
+        "external-image dry-run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    // The pinned adapter version is the one that lowers
+    // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]): each package's import directory
+    // and its distribution metadata mount read-only under the one
+    // PYTHONPATH base `importlib.metadata` discovers distributions from.
+    let log = fs::read_to_string(&docker_log)?;
+    let adapter_line = log
+        .lines()
+        .find(|line| line.contains("-m inferlab_integration_vllm"))
+        .ok_or("adapter container invocation")?;
+    for target in [
+        "target=/inferlab-adapter/inferlab_adapter_sdk,readonly",
+        "target=/inferlab-adapter/inferlab_adapter_sdk-0.1.0.dist-info,readonly",
+        "target=/inferlab-adapter/inferlab_integration_vllm,readonly",
+        "target=/inferlab-adapter/inferlab_integration_vllm-0.1.0.dist-info,readonly",
+    ] {
+        assert!(
+            adapter_line.contains(target),
+            "the adapter mount composition carries {target}: {adapter_line}"
+        );
+    }
+    assert!(
+        adapter_line.contains("PYTHONPATH=/inferlab-adapter"),
+        "adapter imports resolve from the mount base: {adapter_line}"
+    );
+    assert!(
+        !adapter_line.contains("operator-config.yaml"),
+        "the declared render input crosses in the JSON request, not as a mount: {adapter_line}"
+    );
+    let plan = stdout_json(&dry)?;
+    assert_eq!(
+        plan["server"]["processes"][0]["launch_files"][0]["text"],
+        "INFERLAB_RUNTIME_ONLY_LAUNCH_FILE\nunicode: 雪\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn container_hardware_facts_are_lowered_as_declared() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     let local_path = workspace.root.path().join(".inferlab/local.toml");
@@ -1066,6 +1149,8 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
             "dsv4-qualify",
             "--image",
             record_id,
+            "--set",
+            "server.fixture_mode=\"launch-file\"",
             "--dry-run",
         ])
         .output()?;
@@ -1088,6 +1173,56 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
         plan["server"]["processes"][0]["command"]["argv"][0],
         "docker"
     );
+    let dry_process = &plan["server"]["processes"][0];
+    let launch_file = &dry_process["launch_files"][0];
+    let resolved_path = launch_file["resolved_path"]
+        .as_str()
+        .ok_or("resolved launch-file path")?;
+    let relative_path = launch_file["relative_path"]
+        .as_str()
+        .ok_or("relative launch-file path")?;
+    let cache_path = dry_process["allocation"]["runtime_cache"]["path"]
+        .as_str()
+        .ok_or("runtime cache path")?;
+    let dry_argv: Vec<String> = serde_json::from_value(dry_process["command"]["argv"].clone())?;
+    assert!(dry_argv.contains(&resolved_path.to_owned()));
+    assert!(
+        dry_argv.contains(&format!("{cache_path}:{cache_path}")),
+        "the existing same-path cache mount covers the launch file: {dry_argv:?}"
+    );
+    assert!(resolved_path.starts_with(&format!("{cache_path}/launch-files/")));
+
+    let sentinel = "INFERLAB_RUNTIME_ONLY_LAUNCH_FILE";
+    assert!(
+        launch_file["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(sentinel))
+    );
+    let context = workspace
+        .root
+        .path()
+        .join(format!(".inferlab/records/{record_id}/context-linux-amd64"));
+    let mut pending = vec![context];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            for forbidden in [sentinel.as_bytes(), relative_path.as_bytes()] {
+                assert!(
+                    !bytes
+                        .windows(forbidden.len())
+                        .any(|window| window == forbidden),
+                    "runtime launch-file data entered portable image input {}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     // Advance the invoking revision past the image's build revision: the
     // launch still works and the drift stays observable in the record.
@@ -1103,7 +1238,15 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
 
     let run = workspace
         .command()
-        .args(["recipe", "run", "dsv4-qualify", "--image", record_id])
+        .args([
+            "recipe",
+            "run",
+            "dsv4-qualify",
+            "--image",
+            record_id,
+            "--set",
+            "server.fixture_mode=\"launch-file\"",
+        ])
         .output()?;
     assert!(
         run.status.success(),
@@ -1116,6 +1259,16 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
     let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
     assert_eq!(server["status"], "stopped");
+    let runtime_launch_file = &server["resolved"]["server"]["processes"][0]["launch_files"][0];
+    let runtime_launch_path = runtime_launch_file["resolved_path"]
+        .as_str()
+        .ok_or("runtime launch-file path")?;
+    assert_eq!(
+        fs::read_to_string(runtime_launch_path)?,
+        runtime_launch_file["text"]
+            .as_str()
+            .ok_or("runtime launch-file text")?
+    );
     let image = &server["resolved"]["server"]["image"];
     assert_eq!(image["record_id"], record_id);
     assert_eq!(image["image_id"], image_id);
@@ -1132,6 +1285,7 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
     )?;
     assert_eq!(argv[0], "docker", "the server launches from the image");
     assert!(argv.contains(&image_id.to_owned()));
+    assert!(argv.contains(&runtime_launch_path.to_owned()));
     assert!(
         server["environment_checks"].is_null(),
         "image-backed launches skip the local preflight; the image realization \
@@ -2349,6 +2503,81 @@ fn docker_exit_removal_reason_is_distinct_from_the_deadline() -> Result<(), Box<
     assert!(
         error.contains("exited with") && !error.contains("deadline"),
         "the structured reason names the docker exit, not a deadline: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn in_progress_removal_confirms_by_observed_disappearance() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    enable_pair_placement(&workspace)?;
+    // A --rm container whose exit races the explicit removal: the daemon
+    // answers "already in progress" and the absence poll then finds the
+    // container gone, which is the confirmation
+    // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+    let run = workspace
+        .command_with(&Scenario {
+            ssh_swallow_handle: true,
+            rm_race: true,
+            ..Scenario::default()
+        })
+        .args([
+            "recipe",
+            "run",
+            "dsv4-pair",
+            "--external-image",
+            "fixture-external",
+        ])
+        .output()?;
+    assert!(!run.status.success());
+    let report = stdout_json(&run)?;
+    let server_id = report["cleanup"]["server_record_id"]
+        .as_str()
+        .ok_or("server record id")?;
+    let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
+    let removal = failed_remote_removal(&server).ok_or("structured removal evidence")?;
+    assert_eq!(
+        removal["confirmed"], true,
+        "an in-flight removal that completes is a confirmed removal: {removal:?}"
+    );
+    assert_eq!(removal["already_absent"], true);
+    Ok(())
+}
+
+#[test]
+fn lingering_in_progress_removal_stays_unconfirmed() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    enable_pair_placement(&workspace)?;
+    // The daemon claims an in-flight removal but the container never
+    // disappears: the poll runs to its deadline and the removal stays
+    // unconfirmed with the daemon's own answer as the reason.
+    let run = workspace
+        .command_with(&Scenario {
+            ssh_swallow_handle: true,
+            rm_race: true,
+            container_lingers: true,
+            ..Scenario::default()
+        })
+        .args([
+            "recipe",
+            "run",
+            "dsv4-pair",
+            "--external-image",
+            "fixture-external",
+        ])
+        .output()?;
+    assert!(!run.status.success());
+    let report = stdout_json(&run)?;
+    let server_id = report["cleanup"]["server_record_id"]
+        .as_str()
+        .ok_or("server record id")?;
+    let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
+    let removal = failed_remote_removal(&server).ok_or("structured removal evidence")?;
+    assert_eq!(removal["confirmed"], false);
+    let error = removal["error"].as_str().ok_or("removal error")?;
+    assert!(
+        error.contains("already in progress"),
+        "the unconfirmed removal carries the daemon's in-progress answer: {error}"
     );
     Ok(())
 }

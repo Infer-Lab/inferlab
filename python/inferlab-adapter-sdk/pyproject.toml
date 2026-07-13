@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inferlab-adapter-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generated protocol models and runtime helpers for Inferlab adapters"
 requires-python = ">=3.12"
 license = "MIT"

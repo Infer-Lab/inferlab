@@ -1,6 +1,6 @@
 use crate::InferlabError;
 use crate::interrupt;
-use crate::record::{RECORD_FILE, RECORDS_DIR, now_unix_ms, record_id_base};
+use crate::record::{RECORD_FILE, RECORDS_DIR, now_unix_ms, utc_timestamp};
 use crate::resolve::ResolvedExecution;
 use crate::server::{self, ServerRecord, ServerStatus};
 use crate::workload::{self, WorkloadStatus};
@@ -305,7 +305,12 @@ impl RecipeRecordSession {
             source,
         })?;
         let started_unix_ms = now_unix_ms()?;
-        let id = allocate_record_dir(&records_dir, started_unix_ms)?;
+        let id = allocate_record_dir(
+            &records_dir,
+            started_unix_ms,
+            &resolved.recipe.id,
+            &resolved.recipe.case.id,
+        )?;
         let record = RecipeRecord {
             schema_version: 1,
             inferlab_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -361,8 +366,16 @@ fn write_record(root: &Path, record: &RecipeRecord) -> Result<(), InferlabError>
     crate::record::write_json(&path, record)
 }
 
-fn allocate_record_dir(records_dir: &Path, started_unix_ms: u64) -> Result<String, InferlabError> {
-    let base = record_id_base("recipe", started_unix_ms)?;
+fn allocate_record_dir(
+    records_dir: &Path,
+    started_unix_ms: u64,
+    recipe_id: &str,
+    case_id: &str,
+) -> Result<String, InferlabError> {
+    let base = format!(
+        "{}-recipe-{recipe_id}-{case_id}",
+        utc_timestamp(started_unix_ms)?
+    );
     for suffix in 0..1000_u32 {
         let id = if suffix == 0 {
             base.clone()
@@ -379,4 +392,22 @@ fn allocate_record_dir(records_dir: &Path, started_unix_ms: u64) -> Result<Strin
     Err(InferlabError::ServerLifecycle {
         message: "failed to allocate a unique recipe record id".to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allocate_record_dir;
+
+    #[test]
+    fn readable_recipe_record_id_adds_numeric_collision_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let records = tempfile::tempdir()?;
+
+        let first = allocate_record_dir(records.path(), 0, "dsv4-qualify", "tp2")?;
+        let second = allocate_record_dir(records.path(), 0, "dsv4-qualify", "tp2")?;
+
+        assert_eq!(first, "1970-01-01T00-00-00.000Z-recipe-dsv4-qualify-tp2");
+        assert_eq!(second, "1970-01-01T00-00-00.000Z-recipe-dsv4-qualify-tp2-1");
+        Ok(())
+    }
 }

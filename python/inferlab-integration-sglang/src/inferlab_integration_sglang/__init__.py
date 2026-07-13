@@ -18,29 +18,42 @@ from inferlab_adapter_sdk import (
     PlanServeResult,
     ProcessSpec,
     PublicEndpointRequirement,
+    PublicEndpointRequirementBuiltinProxy,
     PublicEndpointRequirementReplica,
     ReadinessProbe,
     ReadinessProbeHttp,
+    ReadinessProbeHttpTargetRegistry,
     ReadinessProbeProcessAlive,
     RenderedServeProcess,
     RenderServeInput,
     RenderServeResult,
+    ServeProcessAllocation,
     ServeReplicaRequirement,
     ServeRoleInput,
     ServeRoleKind,
+    ServeRoleLink,
+    ServeRoleLinkBootstrap,
+    ServeRoleLinkKvTransfer,
+    ServeRoleLinkRequestRouting,
     ServeRoleResult,
     ServeTopology,
     SettingValue,
+    TargetEndpointScheme,
     append_option,
     merge_serve_args,
     plain_setting,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+_ROUTER_WORKER_STARTUP_TIMEOUT_SECS = 2_147_483_647
+
 _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--attention-context-parallel-size": 1,
     "--context-length": 1,
     "--data-parallel-size": 1,
+    "--disaggregation-bootstrap-port": 1,
+    "--disaggregation-mode": 1,
+    "--disaggregation-transfer-backend": 1,
     "--dp-size": 1,
     "--enable-dp-attention": 0,
     "--ep-size": 1,
@@ -119,9 +132,10 @@ def _adapter_version() -> str:
     try:
         return version("inferlab-integration-sglang")
     except PackageNotFoundError:
-        # Image-backed lowering executes this module from mounted
-        # release-owned sources with no installed distribution metadata;
-        # the adjacent pyproject is the version authority there.
+        # Raw source-tree execution with no installed distribution
+        # metadata: the adjacent pyproject is the version authority.
+        # External-image lowering mounts each package's dist-info beside
+        # its module, so importlib.metadata resolves there instead.
         pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
         with pyproject.open("rb") as handle:
             project_version: str = tomllib.load(handle)["project"]["version"]
@@ -254,12 +268,52 @@ def _accelerator_count(parallelism: Parallelism) -> int:
     return (outer.tensor_parallel_size or 1) * (outer.pipeline_parallel_size or 1)
 
 
-def plan_serve(input: PlanServeInput) -> PlanServeResult:
-    if input.topology != ServeTopology.single:
+def _plan_role(
+    input: PlanServeInput,
+    role: ServeRoleInput,
+    ports: list[str],
+) -> tuple[ServeRoleResult, list[ServeReplicaRequirement]]:
+    if role.replica_count < 1:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
-            "the SGLang integration supports the single topology only",
+            f"role {role.id!r} replica count must be positive",
         )
+    settings = _merged_settings(input.settings, role.settings)
+    parallelism = _effective_parallelism(role.parallelism)
+    replicas = [
+        ServeReplicaRequirement(
+            id=_replica_id(role, replica_index),
+            role_id=role.id,
+            replica_index=replica_index,
+            accelerator_count=_accelerator_count(parallelism),
+            ports=list(ports),
+            primary_ports=["master"],
+            primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/v1/models")),
+            worker_readiness=ReadinessProbe(root=ReadinessProbeProcessAlive()),
+        )
+        for replica_index in range(role.replica_count)
+    ]
+    return (
+        ServeRoleResult(
+            id=role.id,
+            kind=role.kind,
+            replica_count=role.replica_count,
+            effective_settings=_effective_settings(settings),
+            effective_parallelism=parallelism,
+        ),
+        replicas,
+    )
+
+
+def _endpoint_requirement() -> EndpointRequirement:
+    return EndpointRequirement(
+        protocol=EndpointProtocol(),
+        api_path="/v1/completions",
+        prefix_cache_reset=HttpActionSpec(method=HttpMethod(), path="/flush_cache"),
+    )
+
+
+def _plan_single(input: PlanServeInput) -> PlanServeResult:
     if input.kv_transfer is not None:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
@@ -268,42 +322,10 @@ def plan_serve(input: PlanServeInput) -> PlanServeResult:
     if input.routing_backend != "builtin":
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
-            f"the SGLang integration does not support routing backend {input.routing_backend!r}",
-        )
-    if input.profiling:
-        raise AdapterOperationError(
-            AdapterErrorCode.invalid_settings,
-            "the SGLang integration does not support profiling capture yet",
+            f"SGLang single topology does not support routing backend {input.routing_backend!r}",
         )
     role = _role_for_kind(input, ServeRoleKind.serve)
-    if role.replica_count < 1:
-        raise AdapterOperationError(
-            AdapterErrorCode.invalid_settings,
-            f"role {role.id!r} replica count must be positive",
-        )
-    settings = _merged_settings(input.settings, role.settings)
-    parallelism = _effective_parallelism(role.parallelism)
-    accelerator_count = _accelerator_count(parallelism)
-    replicas = [
-        ServeReplicaRequirement(
-            id=_replica_id(role, replica_index),
-            role_id=role.id,
-            replica_index=replica_index,
-            accelerator_count=accelerator_count,
-            ports=[],
-            primary_ports=["master"],
-            primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/v1/models")),
-            worker_readiness=ReadinessProbe(root=ReadinessProbeProcessAlive()),
-        )
-        for replica_index in range(role.replica_count)
-    ]
-    role_result = ServeRoleResult(
-        id=role.id,
-        kind=role.kind,
-        replica_count=role.replica_count,
-        effective_settings=_effective_settings(settings),
-        effective_parallelism=parallelism,
-    )
+    role_result, replicas = _plan_role(input, role, [])
     return PlanServeResult(
         integration=_identity(),
         effective_settings=_effective_settings(_settings(input.settings)),
@@ -314,14 +336,254 @@ def plan_serve(input: PlanServeInput) -> PlanServeResult:
         public_endpoint=PublicEndpointRequirement(
             root=PublicEndpointRequirementReplica(replica_id=replicas[0].id)
         ),
-        endpoint=EndpointRequirement(
-            protocol=EndpointProtocol(),
-            api_path="/v1/completions",
-            prefix_cache_reset=HttpActionSpec(
-                method=HttpMethod(),
-                path="/flush_cache",
-            ),
+        endpoint=_endpoint_requirement(),
+    )
+
+
+def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
+    transport = input.kv_transfer
+    if transport is None:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "prefill_decode topology requires a KV-transfer mechanism",
+        )
+    if input.routing_backend not in {"builtin", "sglang-router"}:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            f"SGLang does not support routing backend {input.routing_backend!r}",
+        )
+    prefill = _role_for_kind(input, ServeRoleKind.prefill)
+    decode = _role_for_kind(input, ServeRoleKind.decode)
+    prefill_result, prefill_replicas = _plan_role(input, prefill, ["bootstrap"])
+    decode_result, decode_replicas = _plan_role(input, decode, [])
+    roles = [prefill_result, decode_result]
+    replicas = [*prefill_replicas, *decode_replicas]
+    links = [
+        ServeRoleLink(
+            root=ServeRoleLinkRequestRouting(
+                source="router",
+                targets=[prefill.id, decode.id],
+            )
         ),
+        ServeRoleLink(
+            root=ServeRoleLinkKvTransfer(
+                source=prefill.id,
+                target=decode.id,
+                mechanism=transport,
+            )
+        ),
+        ServeRoleLink(
+            root=ServeRoleLinkBootstrap(
+                source="router",
+                target=prefill.id,
+                port="bootstrap",
+            )
+        ),
+    ]
+    if input.routing_backend == "builtin":
+        public_endpoint = PublicEndpointRequirement(
+            root=PublicEndpointRequirementBuiltinProxy(
+                process_id="proxy",
+                role_id="router",
+                prefill_role=prefill.id,
+                decode_role=decode.id,
+                readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/healthcheck")),
+            )
+        )
+    else:
+        roles.append(
+            ServeRoleResult(
+                id="router",
+                kind=ServeRoleKind.router,
+                replica_count=1,
+                effective_settings={},
+                effective_parallelism=Parallelism(),
+            )
+        )
+        replicas.append(
+            ServeReplicaRequirement(
+                id="router",
+                role_id="router",
+                replica_index=0,
+                accelerator_count=0,
+                ports=[],
+                primary_ports=[],
+                primary_readiness=ReadinessProbe(
+                    root=ReadinessProbeHttpTargetRegistry(
+                        target_scheme=TargetEndpointScheme.http,
+                        readiness_path="/readiness",
+                        registry_path="/workers",
+                        targets_field="workers",
+                        target_url_field="url",
+                        target_role_field="worker_type",
+                        target_healthy_field="is_healthy",
+                        target_bootstrap_port_field="bootstrap_port",
+                        prefill_role_value="prefill",
+                        decode_role_value="decode",
+                        prefill_bootstrap_port="bootstrap",
+                    )
+                ),
+                worker_readiness=ReadinessProbe(root=ReadinessProbeProcessAlive()),
+            )
+        )
+        public_endpoint = PublicEndpointRequirement(
+            root=PublicEndpointRequirementReplica(replica_id="router")
+        )
+    return PlanServeResult(
+        integration=_identity(),
+        effective_settings=_effective_settings(_settings(input.settings)),
+        effective_parallelism=_effective_parallelism(input.parallelism),
+        roles=roles,
+        replicas=replicas,
+        links=links,
+        public_endpoint=public_endpoint,
+        endpoint=_endpoint_requirement(),
+    )
+
+
+def plan_serve(input: PlanServeInput) -> PlanServeResult:
+    if input.profiling:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_settings,
+            "the SGLang integration does not support profiling capture yet",
+        )
+    if input.topology == ServeTopology.single:
+        return _plan_single(input)
+    return _plan_prefill_decode(input)
+
+
+def _render_process(
+    input: RenderServeInput,
+    role: ServeRoleResult,
+    allocation: ServeProcessAllocation,
+) -> RenderedServeProcess:
+    settings = _settings(role.effective_settings)
+    outer = role.effective_parallelism.outer or ParallelismOuter()
+    attention = role.effective_parallelism.attention or ParallelismAttention()
+    experts = role.effective_parallelism.experts or ParallelismExperts()
+    argv = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        allocation.model_locator,
+    ]
+    inferlab_args = [
+        "--host",
+        allocation.endpoint.host,
+        "--port",
+        str(allocation.endpoint.port),
+        "--served-model-name",
+        input.model.served_name,
+        "--tensor-parallel-size",
+        str(outer.tensor_parallel_size or 1),
+    ]
+    if (outer.pipeline_parallel_size or 1) != 1:
+        inferlab_args.extend(["--pipeline-parallel-size", str(outer.pipeline_parallel_size)])
+    attention_dp = attention.data_parallel_size or 1
+    attention_cp = attention.context_parallel_size or 1
+    if attention_dp != 1:
+        inferlab_args.extend(["--data-parallel-size", str(attention_dp)])
+    if attention_cp != 1:
+        inferlab_args.extend(["--attention-context-parallel-size", str(attention_cp)])
+    if attention_dp != 1 or attention_cp != 1:
+        inferlab_args.append("--enable-dp-attention")
+    if (experts.expert_parallel_size or 1) != 1:
+        inferlab_args.extend(["--expert-parallel-size", str(experts.expert_parallel_size)])
+    if (experts.data_parallel_size or 1) != 1:
+        inferlab_args.extend(["--moe-data-parallel-size", str(experts.data_parallel_size)])
+    if (experts.dense_tensor_parallel_size or 1) != 1:
+        inferlab_args.extend(["--moe-dense-tp-size", str(experts.dense_tensor_parallel_size)])
+    append_option(inferlab_args, "--context-length", settings.context_length)
+    append_option(inferlab_args, "--kv-cache-dtype", settings.kv_cache_dtype)
+    append_option(inferlab_args, "--mem-fraction-static", settings.mem_fraction_static)
+    if settings.trust_remote_code:
+        inferlab_args.append("--trust-remote-code")
+    if input.topology == ServeTopology.prefill_decode:
+        transport = input.kv_transfer
+        if transport is None:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                "prefill_decode render is missing its KV-transfer mechanism",
+            )
+        if role.kind == ServeRoleKind.prefill:
+            mode = "prefill"
+        elif role.kind == ServeRoleKind.decode:
+            mode = "decode"
+        else:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                f"prefill_decode allocation has unsupported role {role.id!r}",
+            )
+        inferlab_args.extend(
+            [
+                "--disaggregation-mode",
+                mode,
+                "--disaggregation-transfer-backend",
+                transport.value,
+            ]
+        )
+        if role.kind == ServeRoleKind.prefill:
+            bootstrap = allocation.ports.get("bootstrap")
+            if bootstrap is None:
+                raise AdapterOperationError(
+                    AdapterErrorCode.invalid_request,
+                    f"prefill process {allocation.process_id!r} is missing its bootstrap port",
+                )
+            inferlab_args.extend(["--disaggregation-bootstrap-port", str(bootstrap.port)])
+    argv.extend(merge_serve_args(settings.extra_args or [], inferlab_args, _INFERLAB_OPTION_ARITY))
+    process_env = _runtime_cache_env(allocation.runtime_cache_root)
+    process_env.update(settings.extra_env or {})
+    return RenderedServeProcess(
+        id=allocation.process_id,
+        launch_files=[],
+        process=ProcessSpec(argv=argv, env=process_env),
+    )
+
+
+def _render_router(
+    input: RenderServeInput,
+    allocation: ServeProcessAllocation,
+) -> RenderedServeProcess:
+    prefill_roles = {role.id for role in input.roles if role.kind == ServeRoleKind.prefill}
+    decode_roles = {role.id for role in input.roles if role.kind == ServeRoleKind.decode}
+    prefill = [
+        item for item in input.allocations if item.role_id in prefill_roles and item.rank == 0
+    ]
+    decode = [item for item in input.allocations if item.role_id in decode_roles and item.rank == 0]
+    argv = [
+        "python3",
+        "-m",
+        "sglang_router.launch_router",
+        "--host",
+        allocation.endpoint.host,
+        "--port",
+        str(allocation.endpoint.port),
+        "--worker-startup-timeout-secs",
+        str(_ROUTER_WORKER_STARTUP_TIMEOUT_SECS),
+        "--pd-disaggregation",
+    ]
+    for item in prefill:
+        bootstrap = item.ports.get("bootstrap")
+        if bootstrap is None:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                f"prefill replica {item.replica_id!r} is missing its bootstrap port",
+            )
+        argv.extend(
+            [
+                "--prefill",
+                f"http://{item.endpoint.host}:{item.endpoint.port}",
+                str(bootstrap.port),
+            ]
+        )
+    for item in decode:
+        argv.extend(["--decode", f"http://{item.endpoint.host}:{item.endpoint.port}"])
+    argv.extend(["--policy", "round_robin"])
+    return RenderedServeProcess(
+        id=allocation.process_id,
+        launch_files=[],
+        process=ProcessSpec(argv=argv, env={}),
     )
 
 
@@ -342,67 +604,15 @@ def render_serve(input: RenderServeInput) -> RenderServeResult:
                 AdapterErrorCode.invalid_request,
                 f"allocation references unknown role {allocation.role_id!r}",
             )
+        if role.kind == ServeRoleKind.router:
+            processes.append(_render_router(input, allocation))
+            continue
         if replica_counts[allocation.replica_id] > 1:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
                 "the SGLang integration does not support multi-node serving yet",
             )
-        settings = _settings(role.effective_settings)
-        outer = role.effective_parallelism.outer or ParallelismOuter()
-        attention = role.effective_parallelism.attention or ParallelismAttention()
-        experts = role.effective_parallelism.experts or ParallelismExperts()
-        argv = [
-            # python3, not python: conda-family realizations carry both,
-            # while Debian-family external serving images ship no bare
-            # `python`.
-            "python3",
-            "-m",
-            "sglang.launch_server",
-            "--model-path",
-            allocation.model_locator,
-        ]
-        inferlab_args = [
-            "--host",
-            allocation.endpoint.host,
-            "--port",
-            str(allocation.endpoint.port),
-            "--served-model-name",
-            input.model.served_name,
-            "--tensor-parallel-size",
-            str(outer.tensor_parallel_size or 1),
-        ]
-        if (outer.pipeline_parallel_size or 1) != 1:
-            inferlab_args.extend(["--pipeline-parallel-size", str(outer.pipeline_parallel_size)])
-        attention_dp = attention.data_parallel_size or 1
-        attention_cp = attention.context_parallel_size or 1
-        if attention_dp != 1:
-            inferlab_args.extend(["--data-parallel-size", str(attention_dp)])
-        if attention_cp != 1:
-            inferlab_args.extend(["--attention-context-parallel-size", str(attention_cp)])
-        if attention_dp != 1 or attention_cp != 1:
-            inferlab_args.append("--enable-dp-attention")
-        if (experts.expert_parallel_size or 1) != 1:
-            inferlab_args.extend(["--expert-parallel-size", str(experts.expert_parallel_size)])
-        if (experts.data_parallel_size or 1) != 1:
-            inferlab_args.extend(["--moe-data-parallel-size", str(experts.data_parallel_size)])
-        if (experts.dense_tensor_parallel_size or 1) != 1:
-            inferlab_args.extend(["--moe-dense-tp-size", str(experts.dense_tensor_parallel_size)])
-        append_option(inferlab_args, "--context-length", settings.context_length)
-        append_option(inferlab_args, "--kv-cache-dtype", settings.kv_cache_dtype)
-        append_option(inferlab_args, "--mem-fraction-static", settings.mem_fraction_static)
-        if settings.trust_remote_code:
-            inferlab_args.append("--trust-remote-code")
-        argv.extend(
-            merge_serve_args(settings.extra_args or [], inferlab_args, _INFERLAB_OPTION_ARITY)
-        )
-        process_env = _runtime_cache_env(allocation.runtime_cache_root)
-        process_env.update(settings.extra_env or {})
-        processes.append(
-            RenderedServeProcess(
-                id=allocation.process_id,
-                process=ProcessSpec(argv=argv, env=process_env),
-            )
-        )
+        processes.append(_render_process(input, role, allocation))
     return RenderServeResult(integration=_identity(), processes=processes)
 
 

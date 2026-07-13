@@ -12,6 +12,14 @@ use std::process::Command;
 
 const PIXI_MANIFEST: &str = "pixi.toml";
 const PIXI_LOCK: &str = "pixi.lock";
+pub(crate) const PIXI_ENVS_DIR: &str = ".pixi/envs";
+
+/// The on-disk prefix Pixi installs `environment` into — the same
+/// convention `adapter_environment_mounts` already assumes for the adapter
+/// environment's interpreter path.
+pub(crate) fn pixi_environment_prefix(root: &Path, environment: &str) -> PathBuf {
+    root.join(PIXI_ENVS_DIR).join(environment)
+}
 
 /// A declared environment check resolved to its content identity
 /// ([[RFC-0002:C-ENVIRONMENT-CHECKS]]): the script digest keys derived
@@ -210,7 +218,101 @@ pub struct LockResult {
     pub staged_install: bool,
 }
 
+/// The outcome of resolving one environment's usability
+/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]): shared by the launch-time
+/// gate and the standalone `env status` query, so the two can never observe
+/// a different answer for the same environment.
+pub(crate) enum EnvironmentCheck {
+    Confirmed,
+    NeverInstalled,
+    NotUsable(String),
+}
+
+/// The launch-time usability gate ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]):
+/// backed by the content-confirmation record a prior successful check left
+/// behind. Callers that must produce no persisted evidence — ad-hoc
+/// execution ([[RFC-0002:C-ADHOC-EXECUTION]]) — use
+/// [`ensure_usable_without_confirmation`] instead, never this function.
 pub fn ensure_usable(root: &Path, environment: &str) -> Result<(), InferlabError> {
+    match check_environment(root, environment)? {
+        EnvironmentCheck::Confirmed => Ok(()),
+        EnvironmentCheck::NeverInstalled => Err(unavailable(
+            environment,
+            "the environment has not been installed".to_owned(),
+        )),
+        EnvironmentCheck::NotUsable(diagnostics) => Err(unavailable(environment, diagnostics)),
+    }
+}
+
+/// The ad-hoc usability check ([[RFC-0002:C-ADHOC-EXECUTION]]): presence and
+/// a fresh lock-freshness probe only. It never reads or writes the
+/// confirmation marker [`ensure_usable`] shares with `env status`, so
+/// running it neither trusts qualification evidence another workflow
+/// produced nor produces evidence a later launch would trust.
+pub(crate) fn ensure_usable_without_confirmation(
+    root: &Path,
+    environment: &str,
+) -> Result<(), InferlabError> {
+    if !pixi_environment_prefix(root, environment).is_dir() {
+        return Err(unavailable(
+            environment,
+            "the environment has not been installed".to_owned(),
+        ));
+    }
+    match probe_pixi_usable(root, environment)? {
+        None => Ok(()),
+        Some(diagnostics) => Err(unavailable(environment, diagnostics)),
+    }
+}
+
+fn unavailable(environment: &str, diagnostics: String) -> InferlabError {
+    InferlabError::PixiEnvironmentUnavailable {
+        environment: environment.to_owned(),
+        install_command: format!("pixi install --locked --environment {environment}"),
+        diagnostics,
+    }
+}
+
+/// Resolve one environment's usability, backed by the content-confirmation
+/// record a prior successful check left behind
+/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]).
+pub(crate) fn check_environment(
+    root: &Path,
+    environment: &str,
+) -> Result<EnvironmentCheck, InferlabError> {
+    // `pixi run --no-install` does not fail when the target environment was
+    // never installed: it silently executes the probe against the ambient
+    // PATH instead (verified against pixi 0.72.1 on a fresh workspace —
+    // `which python3` inside the probe resolved to the system interpreter,
+    // not any Pixi prefix). Absence is therefore checked on disk first, so
+    // this gate cannot report a never-installed environment as usable.
+    if !pixi_environment_prefix(root, environment).is_dir() {
+        return Ok(EnvironmentCheck::NeverInstalled);
+    }
+    let manifest_sha256 = crate::digest::hash_file(&root.join(PIXI_MANIFEST))?;
+    let lock_sha256 = crate::digest::hash_file(&root.join(PIXI_LOCK))?;
+    if let Some(marker) = read_confirmation_marker(root, environment)
+        && marker.pixi_manifest_sha256 == manifest_sha256
+        && marker.pixi_lock_sha256 == lock_sha256
+    {
+        // Confirmed against exactly this manifest and lock content by a
+        // prior check; a revision change that left that content unchanged
+        // does not invalidate it, so the real probe is skipped.
+        return Ok(EnvironmentCheck::Confirmed);
+    }
+    let Some(diagnostics) = probe_pixi_usable(root, environment)? else {
+        // Best-effort: a cache-write failure never invalidates a probe that
+        // just succeeded, it only costs the next check its fast path.
+        let _ = write_confirmation_marker(root, environment, &manifest_sha256, &lock_sha256);
+        return Ok(EnvironmentCheck::Confirmed);
+    };
+    Ok(EnvironmentCheck::NotUsable(diagnostics))
+}
+
+/// The raw pixi usability probe, with no confirmation-marker involvement:
+/// `None` on success, `Some(diagnostics)` on failure. The one place either
+/// usability path actually shells out to pixi.
+fn probe_pixi_usable(root: &Path, environment: &str) -> Result<Option<String>, InferlabError> {
     let output = Command::new("pixi")
         .current_dir(root)
         .args([
@@ -229,14 +331,122 @@ pub fn ensure_usable(root: &Path, environment: &str) -> Result<(), InferlabError
             source,
         })?;
     if output.status.success() {
-        return Ok(());
+        Ok(None)
+    } else {
+        Ok(Some(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
     }
-    let diagnostics = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(InferlabError::PixiEnvironmentUnavailable {
-        environment: environment.to_owned(),
-        install_command: format!("pixi install --locked --environment {environment}"),
-        diagnostics,
-    })
+}
+
+pub(crate) const CONFIRMATION_CACHE_DIR: &str = ".inferlab/cache/environments";
+const CONFIRMATION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+struct ConfirmationMarker {
+    schema_version: u32,
+    pixi_manifest_sha256: String,
+    pixi_lock_sha256: String,
+}
+
+fn confirmation_marker_path(root: &Path, environment: &str) -> PathBuf {
+    root.join(CONFIRMATION_CACHE_DIR)
+        .join(environment)
+        .join("confirmed.json")
+}
+
+/// A missing, malformed, or wrong-schema-version marker is indistinguishable
+/// from "never confirmed" — the caller falls through to the real probe
+/// exactly as it would for a workspace that has never seen this check.
+fn read_confirmation_marker(root: &Path, environment: &str) -> Option<ConfirmationMarker> {
+    let bytes = fs::read(confirmation_marker_path(root, environment)).ok()?;
+    let marker: ConfirmationMarker = serde_json::from_slice(&bytes).ok()?;
+    (marker.schema_version == CONFIRMATION_SCHEMA_VERSION).then_some(marker)
+}
+
+fn write_confirmation_marker(
+    root: &Path,
+    environment: &str,
+    manifest_sha256: &str,
+    lock_sha256: &str,
+) -> Result<(), InferlabError> {
+    let path = confirmation_marker_path(root, environment);
+    let parent = path
+        .parent()
+        .ok_or_else(|| InferlabError::EnvironmentLifecycle {
+            message: format!("path {} has no parent directory", path.display()),
+        })?;
+    fs::create_dir_all(parent).map_err(|source| InferlabError::EnvironmentIo {
+        path: parent.to_path_buf(),
+        operation: "create environment confirmation cache directory",
+        source,
+    })?;
+    let marker = ConfirmationMarker {
+        schema_version: CONFIRMATION_SCHEMA_VERSION,
+        pixi_manifest_sha256: manifest_sha256.to_owned(),
+        pixi_lock_sha256: lock_sha256.to_owned(),
+    };
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|source| InferlabError::EncodeOutput { source })?;
+    atomic_write(&path, &bytes, None)
+}
+
+/// One declared environment's confirmation state, reported by `env status`
+/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]).
+#[derive(Debug, Serialize)]
+pub struct EnvironmentStatusReport {
+    pub environment: String,
+    pub pixi_environment: String,
+    pub status: EnvironmentStatusKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvironmentStatusKind {
+    Confirmed,
+    NeverInstalled,
+    NotUsable,
+}
+
+/// Report each named environment's confirmation state without installing
+/// packages or updating the manifest or lock
+/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]). `environments` pairs a
+/// workspace environment identifier with the Pixi environment it selects.
+pub fn status(
+    root: &Path,
+    environments: &[(String, String)],
+) -> Result<Vec<EnvironmentStatusReport>, InferlabError> {
+    environments
+        .iter()
+        .map(|(id, pixi_environment)| {
+            let install_command = format!("pixi install --locked --environment {pixi_environment}");
+            let (status, diagnostics, install_command) =
+                match check_environment(root, pixi_environment)? {
+                    EnvironmentCheck::Confirmed => (EnvironmentStatusKind::Confirmed, None, None),
+                    EnvironmentCheck::NeverInstalled => (
+                        EnvironmentStatusKind::NeverInstalled,
+                        None,
+                        Some(install_command),
+                    ),
+                    EnvironmentCheck::NotUsable(diagnostics) => (
+                        EnvironmentStatusKind::NotUsable,
+                        Some(diagnostics),
+                        Some(install_command),
+                    ),
+                };
+            Ok(EnvironmentStatusReport {
+                environment: id.clone(),
+                pixi_environment: pixi_environment.clone(),
+                status,
+                diagnostics,
+                install_command,
+            })
+        })
+        .collect()
 }
 
 pub fn lock_workspace(root: &Path) -> Result<LockResult, InferlabError> {

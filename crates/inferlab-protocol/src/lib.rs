@@ -7,15 +7,17 @@ pub use wire::{
     AdapterResult, BenchCaseInput, BenchClientRequest, BenchClientResult, BenchDefinitionInput,
     BenchLoadInput, CaptureControlRequirement, CaptureTargetRequirement, ClientEndpointInput,
     ClientStatus, EndpointAssignment, EndpointProtocol, EndpointRequirement, EvalClientRequest,
-    EvalClientResult, EvalDefinitionInput, HttpActionSpec, HttpMethod, IntegrationIdentity,
-    KvTransferMechanism, Parallelism, ParallelismAttention, ParallelismExperts, ParallelismOuter,
-    PlanServeInput, PlanServeResult, ProcessSpec, ProtocolVersion, PublicEndpointRequirement,
-    RawArtifact, ReadinessProbe, RenderServeInput, RenderServeResult, RenderedServeProcess,
+    EvalClientResult, EvalDefinitionInput, HttpActionSpec, HttpMethod, HttpTargetRegistryReadiness,
+    IntegrationIdentity, KvTransferMechanism, LaunchFileDeclaration, Parallelism,
+    ParallelismAttention, ParallelismExperts, ParallelismOuter, PlanServeInput, PlanServeResult,
+    ProcessSpec, ProtocolVersion, PublicEndpointRequirement, RawArtifact, ReadinessProbe,
+    RenderInputDeclaration, RenderServeInput, RenderServeResult, RenderedServeProcess,
     ServeModelInput, ServeProcessAllocation, ServeReplicaRequirement, ServeRoleInput,
     ServeRoleKind, ServeRoleLink, ServeRoleResult, ServeTopology, SettingValue,
+    SuppliedRenderInput, TargetEndpointScheme,
 };
 
-pub const PROTOCOL_SCHEMA_ID: &str = "https://inferlab.dev/schema/adapter-protocol/v3";
+pub const PROTOCOL_SCHEMA_ID: &str = "https://inferlab.dev/schema/adapter-protocol/v4";
 
 #[must_use]
 pub fn protocol_schema() -> schemars::Schema {

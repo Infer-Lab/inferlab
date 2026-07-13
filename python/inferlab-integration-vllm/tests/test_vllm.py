@@ -251,7 +251,7 @@ def test_plan_vllm_router_makes_the_external_router_public() -> None:
     assert result.public_endpoint.root.replica_id == "router"
 
 
-def test_vllm_router_targets_replica_entrypoints_not_headless_ranks() -> None:
+def test_vllm_router_targets_replica_entrypoints_and_defers_startup_timeout() -> None:
     payload = load_json(FIXTURES / "valid" / "render-serve-request.json")
     input_payload = cast(dict[str, object], payload["input"])
     input_payload["routing_backend"] = "vllm-router"
@@ -352,3 +352,4 @@ def test_vllm_router_targets_replica_entrypoints_not_headless_ranks() -> None:
         "http://node-b.example:8000",
         "http://node-d.example:8000",
     ]
+    assert argv[argv.index("--worker-startup-timeout-secs") + 1] == "2147483647"

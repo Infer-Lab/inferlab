@@ -1,7 +1,6 @@
-//! Shared HTTP mechanics for the built-in vLLM disaggregated-serving proxies.
+//! Shared HTTP mechanics for the built-in disaggregated-serving proxies.
 //!
-//! Mooncake runs prefill concurrently with streamed decode, while NIXL runs
-//! them sequentially. Their protocol bodies remain in their owning modules.
+//! Proxy-specific protocol bodies remain in their owning modules.
 
 use crate::error::ProxyError as ProxyLifecycleError;
 use async_stream::try_stream;
@@ -30,7 +29,7 @@ pub struct ProxyMeta {
 
 /// Build a multi-threaded Tokio runtime and drive `run_async` to completion.
 ///
-/// Both built-in proxies share this runtime-builder wrapper; the per-proxy
+/// Built-in proxies share this runtime-builder wrapper; the per-proxy
 /// `run` functions call it with their own async entrypoint.
 pub fn run<F, Fut>(run_async: F) -> Result<(), ProxyLifecycleError>
 where
@@ -46,7 +45,7 @@ where
     runtime.block_on(run_async())
 }
 
-/// Healthcheck response body shared by both proxies.
+/// Healthcheck response body shared by the proxies.
 #[derive(Serialize)]
 pub struct ProxyHealthcheckResponse {
     pub ready: bool,
@@ -129,9 +128,7 @@ pub(crate) fn round_robin_index(cursor: &AtomicUsize, len: usize) -> usize {
 /// `extra_headers`, and an optional `Authorization`, returning the response or a
 /// [`ProxyHttpError`] on transport or non-success status. `context` names the
 /// call in error messages (e.g. "decode request"). Owns the transport for every
-/// proxy POST (decode and prefill) in both built-in proxies (Mooncake, NIXL);
-/// every call site passes `Some(request_id)`, and Mooncake's prefill passes an
-/// `X-data-parallel-rank` extra header.
+/// built-in proxy POST. Proxy-specific request ids and headers are optional.
 pub(crate) async fn send_json_post(
     client: reqwest::Client,
     url: String,
@@ -164,7 +161,7 @@ pub(crate) async fn send_json_post(
 }
 
 /// A per-process monotonic request id, `"{pid}-{n}"`, drawn from a proxy-owned
-/// counter. Shared by both vLLM proxies so the id scheme has one home.
+/// counter. Shared by the vLLM proxies so the id scheme has one home.
 pub(crate) fn next_request_id(counter: &AtomicUsize) -> String {
     let value = counter.fetch_add(1, Ordering::SeqCst);
     format!("{}-{value}", std::process::id())
@@ -225,11 +222,10 @@ pub struct ProxyErrorResponse {
     pub error: String,
 }
 
-/// Stream a decode response body to the client while a concurrently-running
-/// prefill task completes. Used by the Mooncake proxy, which runs prefill
-/// concurrently with streamed decode; NIXL forwards prefill then decode
-/// sequentially and does not use this path. If the client drops the response
-/// before prefill finishes,
+/// Stream a decode response body while a concurrently-running prefill task
+/// completes. Used by proxies whose backend protocol starts both roles
+/// together; the vLLM NIXL proxy instead forwards them sequentially. If the
+/// client drops the response before prefill finishes,
 /// the prefill task is aborted (via [`AbortOnDrop`]); once prefill completes the
 /// abort is disarmed, and a prefill failure surfaces as a stream error.
 pub(crate) fn stream_decode_response(
@@ -243,6 +239,28 @@ pub(crate) fn stream_decode_response(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let stream = decode_response_stream(response.bytes_stream(), prefill_task);
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Body::from_stream(stream)).map_err(|error| {
+        ProxyHttpError::internal(format!("failed to build proxy response: {error}"))
+    })
+}
+
+/// Stream one successful upstream response without waiting for another role.
+pub(crate) fn stream_response(
+    response: reqwest::Response,
+) -> Result<Response<Body>, ProxyHttpError> {
+    let status = status_code(response.status())?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|error| stream_error(format!("decode stream failed: {error}"))));
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -544,7 +562,7 @@ mod tests {
     /// propagated by the one-time tie-break, not silently dropped. `now_or_never()`
     /// polls (and thus consumes) that ready item, so an Ok-only match would discard
     /// the error; with a successful prefill the stream would then end cleanly,
-    /// turning a decode failure into a truncated 200 (audit F6, WI-2026-06-26-005).
+    /// turning a decode failure into a truncated 200.
     #[test]
     fn decode_error_ready_at_tiebreak_is_not_swallowed() -> Result<()> {
         let runtime = proxy_test_runtime()?;

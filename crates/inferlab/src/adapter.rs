@@ -86,7 +86,7 @@ impl AdapterClient for ProcessAdapterClient {
         input: PlanServeInput,
     ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
         let request = AdapterRequest::PlanServe {
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
@@ -101,7 +101,7 @@ impl AdapterClient for ProcessAdapterClient {
         input: RenderServeInput,
     ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
         let request = AdapterRequest::RenderServe {
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
@@ -184,7 +184,7 @@ impl ImageAdapterClient {
                     format!(
                         "type=bind,source={source},target={ADAPTER_MOUNT_BASE}/{name},readonly",
                         source = mount.source.display(),
-                        name = mount.import_name,
+                        name = mount.target_name,
                     ),
                 ]);
             }
@@ -349,7 +349,7 @@ impl AdapterClient for ImageAdapterClient {
         input: PlanServeInput,
     ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
         let request = AdapterRequest::PlanServe {
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, request)?;
@@ -364,7 +364,7 @@ impl AdapterClient for ImageAdapterClient {
         input: RenderServeInput,
     ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
         let request = AdapterRequest::RenderServe {
-            protocol_version: ProtocolVersion::V3,
+            protocol_version: ProtocolVersion::V4,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, request)?;
@@ -463,8 +463,9 @@ fn invoke_adapter(
     }
     // A cross-version combination is governed solely by the protocol version
     // ([[RFC-0006:C-INTEGRATIONS]]). The versioned `AdapterResponse` accepts
-    // only `"3"`, so a `"2"` answer would otherwise surface as an opaque
-    // deserialize failure; pre-parse the raw `protocol_version` and fail with
+    // only its current value, so an answer from another version would otherwise
+    // surface as an opaque deserialize failure; pre-parse the raw
+    // `protocol_version` and fail with
     // the actionable both-versions-plus-remedy shape instead.
     if let Some(answered) = raw_protocol_version(&stdout)
         && answered != PROTOCOL_VERSION
@@ -521,7 +522,7 @@ fn invoke_adapter(
 }
 
 /// The protocol version this binary speaks, as its wire string.
-const PROTOCOL_VERSION: &str = "3";
+const PROTOCOL_VERSION: &str = "4";
 
 /// The raw `protocol_version` string an adapter answered, read without
 /// committing to the full versioned response shape. Absent when the field is
@@ -573,32 +574,47 @@ fn integration_module(integration: &str) -> Result<String, InferlabError> {
 /// One workspace-side adapter package resolved to its host import directory,
 /// bound to the neutral in-container name it mounts under.
 struct AdapterMount {
-    import_name: String,
+    target_name: String,
     source: std::path::PathBuf,
 }
 
-/// Resolve the adapter SDK and the integration's import directories by running
-/// the committed `adapter` Pixi environment's own interpreter, so editable and
-/// regular installs resolve uniformly ([[RFC-0006:C-INTEGRATIONS]]). A missing
-/// interpreter or a failed import is a launch error naming the adapter
-/// environment and the package that could not resolve.
+/// Resolve the adapter SDK and the integration's import directories — and
+/// each package's `.dist-info` metadata directory — by running the committed
+/// `adapter` Pixi environment's own interpreter, so editable and regular
+/// installs resolve uniformly ([[RFC-0006:C-INTEGRATIONS]]). The metadata
+/// directory mounts beside the module under the same PYTHONPATH base: the
+/// integration reports its wheel version through `importlib.metadata`, which
+/// only discovers distributions adjacent to a `sys.path` entry. A missing
+/// interpreter, a failed import, or missing distribution metadata is a launch
+/// error; a failed import or metadata lookup names the adapter environment
+/// and the package that could not resolve.
 fn adapter_environment_mounts(
     workspace_root: &Path,
     integration: &str,
 ) -> Result<Vec<AdapterMount>, InferlabError> {
     environment::ensure_usable(workspace_root, ADAPTER_ENVIRONMENT)?;
     let module = integration_module(integration)?;
-    let import_names = ["inferlab_adapter_sdk".to_owned(), module];
-    let python = workspace_root
-        .join(".pixi/envs")
-        .join(ADAPTER_ENVIRONMENT)
+    let packages = [
+        (
+            "inferlab_adapter_sdk".to_owned(),
+            "inferlab-adapter-sdk".to_owned(),
+        ),
+        (module, format!("inferlab-integration-{integration}")),
+    ];
+    let import_names: Vec<String> = packages.iter().map(|(import, _)| import.clone()).collect();
+    let python = environment::pixi_environment_prefix(workspace_root, ADAPTER_ENVIRONMENT)
         .join("bin/python");
-    // One line per package: its `__path__[0]`, in the requested order. A single
-    // failed import aborts the whole script, so the interpreter's stderr names
-    // the offending package.
+    // Two lines per package, in the requested order: its `__path__[0]`, then
+    // its `.dist-info` directory. `PathDistribution._path` is the only spelling
+    // of that directory importlib exposes; the adapter environment pins the
+    // interpreter, so the private attribute is stable here. A single failed
+    // import or metadata lookup aborts the whole script, so the interpreter's
+    // stderr names the offending package.
     let script = format!(
-        "import importlib\nfor name in {import_names:?}:\n    \
-         print(importlib.import_module(name).__path__[0])\n"
+        "import importlib, importlib.metadata\n\
+         for import_name, dist_name in {packages:?}:\n    \
+         print(importlib.import_module(import_name).__path__[0])\n    \
+         print(importlib.metadata.distribution(dist_name)._path)\n"
     );
     let launch_error = |source| InferlabError::LaunchAdapter {
         integration: integration.to_owned(),
@@ -625,23 +641,42 @@ fn adapter_environment_mounts(
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
-    if directories.len() != import_names.len() {
+    if directories.len() != 2 * import_names.len() {
         return Err(InferlabError::LaunchAdapter {
             integration: integration.to_owned(),
             source: std::io::Error::other(format!(
-                "Pixi environment {ADAPTER_ENVIRONMENT:?} did not resolve every adapter package \
-                 {import_names:?}"
+                "Pixi environment {ADAPTER_ENVIRONMENT:?} resolved an unexpected number of \
+                 directories for the adapter packages {import_names:?} (expected a module and \
+                 a metadata directory per package)"
             )),
         });
     }
-    Ok(import_names
-        .into_iter()
-        .zip(directories)
-        .map(|(import_name, source)| AdapterMount {
-            import_name,
-            source: std::path::PathBuf::from(source),
-        })
-        .collect())
+    let mut mounts = Vec::with_capacity(directories.len());
+    for (index, (import_name, dist_name)) in packages.iter().enumerate() {
+        let module_dir = directories[2 * index];
+        let info_dir = std::path::PathBuf::from(directories[2 * index + 1]);
+        let info_name = info_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| name.ends_with(".dist-info"))
+            .ok_or_else(|| InferlabError::LaunchAdapter {
+                integration: integration.to_owned(),
+                source: std::io::Error::other(format!(
+                    "Pixi environment {ADAPTER_ENVIRONMENT:?} resolved {dist_name:?} metadata \
+                     to {info_dir:?}, which is not a .dist-info directory"
+                )),
+            })?
+            .to_owned();
+        mounts.push(AdapterMount {
+            target_name: import_name.clone(),
+            source: std::path::PathBuf::from(module_dir),
+        });
+        mounts.push(AdapterMount {
+            target_name: info_name,
+            source: info_dir,
+        });
+    }
+    Ok(mounts)
 }
 
 /// The traversal-safe charset an integration identifier (and the framework

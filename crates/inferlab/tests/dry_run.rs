@@ -32,6 +32,10 @@ impl TestWorkspace {
             "baseline\n",
         )?;
         fs::write(
+            root.path().join("operator-config.yaml"),
+            "fixture: dry-run\nunicode: 雪\n",
+        )?;
+        fs::write(
             root.path().join("pixi.toml"),
             "[workspace]\n\
              channels = [\"conda-forge\"]\n\
@@ -47,6 +51,9 @@ impl TestWorkspace {
             root.path().join("pixi.lock"),
             "version: 6\nenvironments:\n  vllm: {}\n",
         )?;
+        // ensure_usable checks this prefix exists on disk before shelling
+        // out to pixi at all.
+        fs::create_dir_all(root.path().join(".pixi/envs/vllm"))?;
         fs::write(root.path().join(".gitignore"), ".inferlab/local.toml\n")?;
 
         let private_weight = root
@@ -116,6 +123,7 @@ impl TestWorkspace {
         fs::write(
             path,
             r#"#!/usr/bin/env python3
+import hashlib
 import json
 import sys
 
@@ -194,6 +202,11 @@ if operation == "plan_serve":
             "api_path": "/v1/completions",
             "prefix_cache_reset": {"method": "post", "path": "/reset_prefix_cache"},
         },
+        "render_inputs": (
+            [{"source_path": "operator-config.yaml"}]
+            if input["settings"].get("fixture_mode") == "launch-file"
+            else []
+        ),
     }
 elif operation == "render_serve":
     parallelism = input["roles"][0]["effective_parallelism"]
@@ -225,8 +238,21 @@ elif operation == "render_serve":
             ])
             if index:
                 argv.append("--headless")
+        launch_files = []
+        if input["settings"].get("fixture_mode") == "launch-file":
+            text = input["render_inputs"][0]["text"]
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            relative_path = f"launch-files/{digest}/fixture.yaml"
+            resolved_path = f"{cache_root}/{relative_path}"
+            argv.extend(["--generation-config", resolved_path])
+            launch_files.append({
+                "relative_path": relative_path,
+                "text": text,
+                "sha256": digest,
+            })
         processes.append({
             "id": allocation["process_id"],
+            "launch_files": launch_files,
             "process": {
                 "argv": argv,
                 "env": {
@@ -247,7 +273,7 @@ else:
     raise ValueError(f"unexpected operation {operation}")
 print(json.dumps({
     "status": "ok",
-    "protocol_version": "3",
+    "protocol_version": "4",
     "result": {
         "operation": operation,
         "output": output,
@@ -538,6 +564,7 @@ elif operation == "render_serve":
         "processes": [
             {
                 "id": allocation["process_id"],
+                "launch_files": [],
                 "process": {"argv": ["fixture-server", allocation["process_id"]], "env": {}},
             }
             for allocation in input["allocations"]
@@ -546,7 +573,7 @@ elif operation == "render_serve":
 else:
     raise ValueError(operation)
 
-print(json.dumps({"status": "ok", "protocol_version": "3", "result": {"operation": operation, "output": output}}))
+print(json.dumps({"status": "ok", "protocol_version": "4", "result": {"operation": operation, "output": output}}))
 "#;
 
 const NETWORK_IP: &str = r#"#!/bin/sh
@@ -797,6 +824,44 @@ fn serve_and_recipe_dry_run_share_the_default_case() -> Result<(), Box<dyn Error
     );
     assert!(serve.to_string().contains(&workspace.private_weight));
     assert!(recipe.to_string().contains(&workspace.private_weight));
+    assert!(!workspace.root.path().join(".inferlab/records").exists());
+    Ok(())
+}
+
+#[test]
+fn dry_run_records_launch_files_without_materializing_them() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let plan = workspace.run_json(&[
+        "serve",
+        "start",
+        "dsv4-qualify",
+        "--set",
+        "server.fixture_mode=\"launch-file\"",
+        "--dry-run",
+    ])?;
+    let process = &plan["server"]["processes"][0];
+    let launch_file = &process["launch_files"][0];
+    let resolved_path = launch_file["resolved_path"]
+        .as_str()
+        .ok_or("missing resolved launch-file path")?;
+
+    assert_eq!(launch_file["text"], "fixture: dry-run\nunicode: 雪\n");
+    assert!(
+        launch_file["relative_path"].as_str().is_some_and(
+            |path| path.starts_with("launch-files/") && path.ends_with("/fixture.yaml")
+        )
+    );
+    assert!(
+        launch_file["sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64)
+    );
+    assert!(
+        process["command"]["argv"]
+            .as_array()
+            .is_some_and(|argv| argv.iter().any(|value| value == resolved_path))
+    );
+    assert!(!Path::new(resolved_path).exists());
     assert!(!workspace.root.path().join(".inferlab/records").exists());
     Ok(())
 }
@@ -1102,6 +1167,12 @@ fn static_npmd_on_one_machine_allocates_disjoint_replicas_and_a_public_proxy()
         serde_json::json!(["prefill-000", "prefill-001", "decode-000", "decode-001"])
     );
     assert_eq!(processes[4]["allocation"]["devices"], serde_json::json!([]));
+    assert_eq!(processes[4]["command"]["env"]["CUDA_VISIBLE_DEVICES"], "");
+    assert!(
+        processes[4]["command"]["explicit_env"]
+            .as_array()
+            .is_some_and(|names| names.contains(&serde_json::json!("CUDA_VISIBLE_DEVICES")))
+    );
     assert_eq!(processes[4]["endpoint"]["port"], 8000);
     assert_eq!(processes[4]["command"]["argv"][1], "__internal");
     let proxy_argv = processes[4]["command"]["argv"]
@@ -1139,6 +1210,309 @@ fn static_npmd_on_one_machine_allocates_disjoint_replicas_and_a_public_proxy()
     assert_eq!(plan["measurements"]["evals"][0]["endpoint"]["port"], 8000);
     assert_eq!(plan["server"]["links"][1]["kind"], "kv_transfer");
     assert!(!workspace.root.path().join(".inferlab/records").exists());
+    Ok(())
+}
+
+#[test]
+fn sglang_builtin_proxy_dry_run_preserves_prefill_bootstrap_triples() -> Result<(), Box<dyn Error>>
+{
+    let workspace = TestWorkspace::new()?;
+    let adapter = PD_ADAPTER
+        .replace("\"framework\": \"vllm\"", "\"framework\": \"sglang\"")
+        .replace(
+            "\"mechanism\": \"mooncake\"",
+            "\"mechanism\": input[\"kv_transfer\"]",
+        );
+    write_executable(
+        &workspace.adapter_bin.join("inferlab-adapter-sglang"),
+        &adapter,
+    )?;
+    let manifest_path = workspace.root.path().join("pixi.toml");
+    let manifest = fs::read_to_string(&manifest_path)?.replace(
+        "inferlab-integration-vllm = \"==0.1.0\"",
+        "inferlab-integration-vllm = \"==0.1.0\"\n\
+         inferlab-integration-sglang = \"==0.1.0\"",
+    );
+    fs::write(manifest_path, manifest)?;
+    let mut config = WORKSPACE
+        .replacen("integration = \"vllm\"", "integration = \"sglang\"", 1)
+        .replacen(
+            "readiness_timeout_seconds = 900",
+            "readiness_timeout_seconds = 900\n\
+             topology = \"prefill_decode\"\n\
+             routing_backend = \"builtin\"\n\
+             kv_transfer = \"mooncake\"",
+            1,
+        )
+        .replace("reset_prefix_cache = true", "reset_prefix_cache = false");
+    config.push_str(
+        "\n[serve_profiles.vllm-dsv4.roles.prefill]\n\
+         kind = \"prefill\"\n\
+         \n\
+         [serve_profiles.vllm-dsv4.roles.decode]\n\
+         kind = \"decode\"\n",
+    );
+    fs::write(
+        workspace.root.path().join(".inferlab/workspace.toml"),
+        config,
+    )?;
+    fs::write(
+        workspace.root.path().join(".inferlab/local.toml"),
+        format!(
+            "default_placement = \"local\"\n\
+             \n\
+             [model_weights.dsv4]\n\
+             locator = {:?}\n\
+             \n\
+             [machines.local]\n\
+             host = \"127.0.0.1\"\n\
+             port = 8100\n\
+             extra_ports = [8101, 8102, 8103, 8200, 8201, 8000]\n\
+             devices = [0, 1, 2, 3, 4, 5, 6, 7]\n\
+             \n\
+             [placements.local]\n\
+             machines = [\"local\"]\n",
+            workspace.private_weight
+        ),
+    )?;
+
+    for transport in ["mooncake", "nixl"] {
+        let transport_override = format!("server.kv_transfer={transport:?}");
+        let plan = workspace.run_json(&[
+            "recipe",
+            "run",
+            "dsv4-qualify",
+            "--set",
+            "server.roles.prefill.replicas=2",
+            "--set",
+            "server.roles.decode.replicas=2",
+            "--set",
+            &transport_override,
+            "--dry-run",
+        ])?;
+        let processes = plan["server"]["processes"]
+            .as_array()
+            .ok_or("missing process plans")?;
+        let proxy = processes
+            .iter()
+            .find(|process| process["role_id"] == "router")
+            .ok_or("missing proxy process")?;
+        let proxy_argv = proxy["command"]["argv"]
+            .as_array()
+            .ok_or("missing proxy argv")?;
+        assert_eq!(proxy_argv[3], "sglang");
+
+        let actual = proxy_argv
+            .windows(4)
+            .filter(|window| window[0] == "--prefill")
+            .map(|window| {
+                window[1..]
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = processes
+            .iter()
+            .filter(|process| process["role_id"] == "prefill" && process["rank"] == 0)
+            .map(|process| {
+                vec![
+                    format!(
+                        "http://{}:{}",
+                        process["endpoint"]["host"].as_str().unwrap_or_default(),
+                        process["endpoint"]["port"].as_u64().unwrap_or_default()
+                    ),
+                    process["allocation"]["ports"]["bootstrap"]["host"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    process["allocation"]["ports"]["bootstrap"]["port"]
+                        .as_u64()
+                        .unwrap_or_default()
+                        .to_string(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "transport {transport}");
+    }
+    Ok(())
+}
+
+#[test]
+fn trtllm_builtin_proxy_dry_run_uses_rank_zero_worker_urls_without_auxiliary_ports()
+-> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let adapter = PD_ADAPTER
+        .replace("\"framework\": \"vllm\"", "\"framework\": \"tensorrt-llm\"")
+        .replace(
+            "ports = [\"bootstrap\"] if role[\"kind\"] == \"prefill\" else []",
+            "ports = []",
+        )
+        .replace("\"mechanism\": \"mooncake\"", "\"mechanism\": \"nixl\"")
+        .replace(
+            "            {\"kind\": \"bootstrap\", \"source\": \"router\", \"target\": \"prefill\", \"port\": \"bootstrap\"},\n",
+            "",
+        );
+    write_executable(
+        &workspace.adapter_bin.join("inferlab-adapter-tensorrt-llm"),
+        &adapter,
+    )?;
+    let manifest_path = workspace.root.path().join("pixi.toml");
+    let manifest = fs::read_to_string(&manifest_path)?.replace(
+        "inferlab-integration-vllm = \"==0.1.0\"",
+        "inferlab-integration-vllm = \"==0.1.0\"\n\
+         inferlab-integration-tensorrt-llm = \"==0.1.0\"",
+    );
+    fs::write(manifest_path, manifest)?;
+    let mut config = WORKSPACE
+        .replacen(
+            "integration = \"vllm\"",
+            "integration = \"tensorrt-llm\"",
+            1,
+        )
+        .replacen(
+            "readiness_timeout_seconds = 900",
+            "readiness_timeout_seconds = 900\n\
+             topology = \"prefill_decode\"\n\
+             routing_backend = \"builtin\"\n\
+             kv_transfer = \"nixl\"",
+            1,
+        )
+        .replace("reset_prefix_cache = true", "reset_prefix_cache = false");
+    config.push_str(
+        "\n[serve_profiles.vllm-dsv4.roles.prefill]\n\
+         kind = \"prefill\"\n\
+         \n\
+         [serve_profiles.vllm-dsv4.roles.decode]\n\
+         kind = \"decode\"\n",
+    );
+    fs::write(
+        workspace.root.path().join(".inferlab/workspace.toml"),
+        config,
+    )?;
+    fs::write(
+        workspace.root.path().join(".inferlab/local.toml"),
+        format!(
+            "default_placement = \"local\"\n\
+             \n\
+             [model_weights.dsv4]\n\
+             locator = {:?}\n\
+             \n\
+             [machines.local]\n\
+             host = \"127.0.0.1\"\n\
+             port = 8100\n\
+             extra_ports = [8101, 8102, 8103, 8104, 8105, 8106, 8107, 8108, 8109, 8110, 8111, 8000]\n\
+             devices = [0, 1, 2, 3, 4, 5, 6, 7]\n\
+             \n\
+             [placements.local]\n\
+             machines = [\"local\"]\n\
+             \n\
+             [placements.local.roles.prefill]\n\
+             ranks = [\n\
+               {{ replica = 0, machine = \"local\", gpus = [0] }},\n\
+               {{ replica = 0, machine = \"local\", gpus = [1] }},\n\
+               {{ replica = 1, machine = \"local\", gpus = [2] }},\n\
+               {{ replica = 1, machine = \"local\", gpus = [3] }},\n\
+             ]\n\
+             \n\
+             [placements.local.roles.decode]\n\
+             ranks = [\n\
+               {{ replica = 0, machine = \"local\", gpus = [4] }},\n\
+               {{ replica = 0, machine = \"local\", gpus = [5] }},\n\
+               {{ replica = 1, machine = \"local\", gpus = [6] }},\n\
+               {{ replica = 1, machine = \"local\", gpus = [7] }},\n\
+             ]\n",
+            workspace.private_weight
+        ),
+    )?;
+
+    let plan = workspace.run_json(&[
+        "recipe",
+        "run",
+        "dsv4-qualify",
+        "--set",
+        "server.roles.prefill.replicas=2",
+        "--set",
+        "server.roles.decode.replicas=2",
+        "--dry-run",
+    ])?;
+    let processes = plan["server"]["processes"]
+        .as_array()
+        .ok_or("missing process plans")?;
+    let proxy = processes
+        .iter()
+        .find(|process| process["id"] == "proxy")
+        .ok_or("missing TensorRT-LLM proxy")?;
+    let proxy_argv = proxy["command"]["argv"]
+        .as_array()
+        .ok_or("missing proxy argv")?;
+
+    assert_eq!(plan["server"]["routing"]["backend"], "builtin");
+    assert_eq!(plan["server"]["routing"]["policy"], "round-robin");
+    assert_eq!(
+        plan["server"]["routing"]["implementation"],
+        serde_json::json!({
+            "owner": "inferlab",
+            "id": "inferlab-trtllm-proxy",
+            "version": 1
+        })
+    );
+    assert_eq!(plan["server"]["endpoint"]["port"], 8000);
+    assert_eq!(proxy["endpoint"], plan["server"]["endpoint"]);
+    assert_eq!(proxy_argv[3], "trtllm");
+
+    for role in ["prefill", "decode"] {
+        let flag = format!("--{role}");
+        let actual = proxy_argv
+            .windows(2)
+            .filter(|window| window[0].as_str() == Some(&flag))
+            .filter_map(|window| window[1].as_str())
+            .collect::<Vec<_>>();
+        let expected = processes
+            .iter()
+            .filter(|process| process["role_id"] == role && process["rank"] == 0)
+            .map(|process| {
+                format!(
+                    "http://{}:{}",
+                    process["endpoint"]["host"].as_str().unwrap_or_default(),
+                    process["endpoint"]["port"].as_u64().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual, expected);
+        assert!(
+            processes
+                .iter()
+                .any(|process| process["role_id"] == role && process["rank"] == 1)
+        );
+    }
+    assert_eq!(
+        processes
+            .iter()
+            .filter(|process| process["role_id"] == "router")
+            .count(),
+        1
+    );
+    assert!(processes.iter().all(|process| {
+        !process["command"]["argv"]
+            .as_array()
+            .is_some_and(|argv| argv.iter().any(|arg| arg == "disaggregated"))
+    }));
+    assert!(processes.iter().all(|process| {
+        let ports = &process["allocation"]["ports"];
+        ports.get("bootstrap").is_none() && ports.get("side_channel").is_none()
+    }));
+    assert_eq!(
+        plan["server"]["links"]
+            .as_array()
+            .map(|links| links.iter().map(|link| &link["kind"]).collect::<Vec<_>>()),
+        Some(vec![
+            &serde_json::json!("request_routing"),
+            &serde_json::json!("kv_transfer")
+        ])
+    );
     Ok(())
 }
 
@@ -2638,10 +3012,10 @@ import sys
 json.load(sys.stdin)
 print(json.dumps({
     "status": "error",
-    "protocol_version": "3",
+    "protocol_version": "4",
     "error": {
         "code": "unsupported_protocol_version",
-        "message": "received protocol version 2; this integration supports protocol version 3",
+        "message": "received protocol version 2; this integration supports protocol version 4",
     },
 }))
 "#;
@@ -2663,7 +3037,7 @@ fn protocol_version_mismatch_names_both_versions_and_the_remedy() -> Result<(), 
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("protocol version 2") && stderr.contains("protocol version 3"),
+        stderr.contains("protocol version 2") && stderr.contains("protocol version 4"),
         "the mismatch names both versions: {stderr}"
     );
     assert!(
@@ -2685,7 +3059,7 @@ fn protocol_version_mismatch_names_both_versions_and_the_remedy() -> Result<(), 
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("protocol version 2") && stderr.contains("protocol version 3"),
+        stderr.contains("protocol version 2") && stderr.contains("protocol version 4"),
         "the structured rejection names both versions: {stderr}"
     );
     assert!(

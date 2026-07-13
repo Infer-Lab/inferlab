@@ -1,17 +1,24 @@
 //! `inferlab agent` — install, update, uninstall, and diagnose the operator
 //! plugin package for supported agent runtimes
-//! ([[RFC-0008:C-AGENT-PLUGIN]], rationale in [[ADR-0007]]). Distribution
-//! tooling only: this module reads no workspace, bindings, or records, and
-//! the native CLI orchestration lives in the `agent-plugin-installer` crate.
+//! ([[RFC-0008:C-AGENT-PLUGIN]], rationale in [[ADR-0007]]). Install
+//! defaults to the plugin package embedded in this binary at compile time,
+//! at the same version as the binary; `--from-checkout` overrides the
+//! source with an explicit local checkout or unpacked release tarball.
+//! Distribution tooling only: this module reads no workspace, bindings, or
+//! records, and the native CLI orchestration lives in the
+//! `agent-plugin-installer` crate.
 
+pub use agent_plugin_installer::AgentSelector;
 use agent_plugin_installer::{
-    AgentPluginError, AgentPluginOperation, AgentRuntime, DoctorStatus, InstallRequest,
-    OperationError, PluginCommandOutcome, PluginRef, UninstallRequest, UpdateRequest,
-    check_operation, doctor as doctor_runtime, install as install_runtime,
-    uninstall as uninstall_runtime, update as update_runtime,
+    AgentRuntime, BatchFailure, BatchResult, BatchRuntimeOutcome, BatchStatus, DoctorStatus,
+    FailurePolicy, InstallRequest, PluginRef, UninstallRequest, UpdateRequest, doctor_many,
+    install_many, uninstall_many, update_many,
 };
+use flate2::read::GzDecoder;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use tar::Archive;
+use tempfile::TempDir;
 
 const PLUGIN: PluginRef<'static> = PluginRef {
     selector: "inferlab@inferlab",
@@ -19,22 +26,13 @@ const PLUGIN: PluginRef<'static> = PluginRef {
 };
 const MARKETPLACE: &str = "inferlab";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentSelector {
-    Claude,
-    Codex,
-    All,
-}
-
-impl AgentSelector {
-    fn runtimes(self) -> Vec<AgentRuntime> {
-        match self {
-            Self::Claude => vec![AgentRuntime::Claude],
-            Self::Codex => vec![AgentRuntime::Codex],
-            Self::All => AgentRuntime::supported().to_vec(),
-        }
-    }
-}
+/// The plugin package this binary carries, packed reproducibly by
+/// `build.rs` from `resources/plugin/` (mirroring the repo-root package:
+/// `LICENSE`, `.claude-plugin/`, `.agents/`, `plugins/inferlab/`). Installed
+/// by default; `--from-checkout` overrides the source entirely and never
+/// touches this payload ([[RFC-0008:C-AGENT-PLUGIN]]).
+const EMBEDDED_PLUGIN_TAR_GZ: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/inferlab-plugin.tar.gz"));
 
 #[derive(Debug, Serialize)]
 pub struct AgentReport {
@@ -71,136 +69,155 @@ pub struct AgentRow {
 }
 
 pub fn doctor(selector: AgentSelector) -> AgentReport {
-    let rows = selector
-        .runtimes()
+    let rows = doctor_many(selector)
         .into_iter()
-        .map(|runtime| {
-            let outcome = doctor_runtime(runtime);
-            AgentRow {
-                agent: runtime.id(),
-                operation: "doctor",
-                status: match outcome.status {
-                    DoctorStatus::Ready => "ready",
-                    DoctorStatus::Missing => "missing",
-                    DoctorStatus::Failed => "failed",
-                },
-                cli: runtime.cli(),
-                commands: outcome.commands,
-                message: outcome.message,
-            }
+        .map(|outcome| AgentRow {
+            agent: outcome.runtime.id(),
+            operation: "doctor",
+            status: match outcome.status {
+                DoctorStatus::Ready => "ready",
+                DoctorStatus::Missing => "missing",
+                DoctorStatus::Failed => "failed",
+            },
+            cli: outcome.runtime.cli(),
+            commands: outcome.commands,
+            message: outcome.message,
         })
         .collect();
     AgentReport { rows }
 }
 
-pub fn install(selector: AgentSelector, checkout: &Path) -> AgentReport {
+/// Installs the plugin package. `checkout` overrides the source with a
+/// local checkout or unpacked release tarball, operating on it identically
+/// to before; when omitted, the package embedded in this binary is
+/// extracted to a temporary directory first and that directory takes the
+/// checkout's place for the rest of this call
+/// ([[RFC-0008:C-AGENT-PLUGIN]]).
+pub fn install(selector: AgentSelector, checkout: Option<&Path>) -> AgentReport {
     let runtimes = selector.runtimes();
-    let mut rows: Vec<Option<AgentRow>> = runtimes.iter().map(|_| None).collect();
 
-    // Package validation for every runtime precedes any native command; a
-    // single broken runtime blocks the whole operation, and the untouched
-    // runtimes report as skipped ([[RFC-0008:C-AGENT-PLUGIN]]).
-    for (index, runtime) in runtimes.iter().enumerate() {
-        if let Err(message) = validate_package(*runtime, checkout) {
-            rows[index] = Some(make_row(
-                *runtime,
-                "install",
-                "failed",
-                Vec::new(),
-                Some(message),
-            ));
-        }
-    }
-    if rows.iter().any(Option::is_some) {
-        return finish("install", &runtimes, rows, &[]);
+    // `_embedded` keeps the extracted temporary directory alive for the
+    // rest of this call: dropping it early would delete the files
+    // `package_gate` and `InstallRequest::local` still need to read from
+    // `source`.
+    let (_embedded, source): (Option<TempDir>, PathBuf) = match checkout {
+        Some(dir) => (None, dir.to_path_buf()),
+        None => match extract_embedded_package() {
+            Ok(dir) => {
+                let path = dir.path().to_path_buf();
+                (Some(dir), path)
+            }
+            Err(message) => {
+                return AgentReport {
+                    rows: runtimes
+                        .iter()
+                        .copied()
+                        .map(|runtime| failed_gate_row(runtime, "install", message.clone()))
+                        .collect(),
+                };
+            }
+        },
+    };
+    let source = source.as_path();
+
+    if let Some(report) = package_gate(runtimes, source) {
+        return report;
     }
 
-    let probes = run_probes(
-        &runtimes,
-        AgentPluginOperation::Install,
-        "install",
-        &mut rows,
-    );
-    if rows.iter().any(Option::is_some) {
-        return finish("install", &runtimes, rows, &probes);
-    }
-
-    let checkout = match checkout.canonicalize() {
+    let source = match source.canonicalize() {
         Ok(path) => path,
         Err(error) => {
-            let message = format!(
-                "cannot canonicalize checkout {}: {error}",
-                checkout.display()
-            );
-            for (index, runtime) in runtimes.iter().enumerate() {
-                rows[index] = Some(make_row(
-                    *runtime,
-                    "install",
-                    "failed",
-                    probes[index].clone(),
-                    Some(message.clone()),
-                ));
-            }
-            return finish("install", &runtimes, rows, &probes);
+            let message = format!("cannot canonicalize checkout {}: {error}", source.display());
+            return AgentReport {
+                rows: runtimes
+                    .iter()
+                    .copied()
+                    .map(|runtime| failed_gate_row(runtime, "install", message.clone()))
+                    .collect(),
+            };
         }
     };
 
-    for (index, runtime) in runtimes.iter().enumerate() {
-        rows[index] = Some(
-            match install_runtime(*runtime, InstallRequest::local(&checkout, PLUGIN)) {
-                Ok(outcome) => completed_row(outcome, "install", "installed", &probes[index]),
-                // Native commands already ran; the report keeps every
-                // per-runtime outcome and the remaining runtimes still get
-                // their attempt before the operation fails loudly.
-                Err(error) => failed_row(*runtime, "install", error, &probes[index]),
-            },
-        );
-    }
-    finish("install", &runtimes, rows, &probes)
+    from_batch(
+        install_many(
+            selector,
+            |_| InstallRequest::local(&source, PLUGIN),
+            FailurePolicy::Continue,
+        ),
+        "install",
+        "installed",
+    )
+}
+
+/// Extracts the binary-embedded plugin package into a fresh temporary
+/// directory and returns it. A missing temporary directory or a corrupted
+/// archive is exactly the "corrupted, or otherwise unreadable" payload
+/// scenario [[RFC-0008:C-AGENT-PLUGIN]] requires the operation to fail
+/// loudly before any native CLI runs; `package_gate` still names the exact
+/// missing member if extraction succeeds but leaves one absent.
+fn extract_embedded_package() -> Result<TempDir, String> {
+    let dir = tempfile::tempdir().map_err(|error| {
+        format!("embedded plugin package: cannot create a temporary directory: {error}")
+    })?;
+    let decoder = GzDecoder::new(EMBEDDED_PLUGIN_TAR_GZ);
+    Archive::new(decoder).unpack(dir.path()).map_err(|error| {
+        format!("embedded plugin package: cannot extract the binary-embedded payload: {error}")
+    })?;
+    Ok(dir)
 }
 
 pub fn update(selector: AgentSelector) -> AgentReport {
-    let runtimes = selector.runtimes();
-    let mut rows: Vec<Option<AgentRow>> = runtimes.iter().map(|_| None).collect();
-    let probes = run_probes(&runtimes, AgentPluginOperation::Update, "update", &mut rows);
-    if rows.iter().any(Option::is_some) {
-        return finish("update", &runtimes, rows, &probes);
-    }
-    for (index, runtime) in runtimes.iter().enumerate() {
-        rows[index] = Some(
-            match update_runtime(
-                *runtime,
-                UpdateRequest::new(PLUGIN).with_marketplace_name(MARKETPLACE),
-            ) {
-                Ok(outcome) => completed_row(outcome, "update", "updated", &probes[index]),
-                Err(error) => failed_row(*runtime, "update", error, &probes[index]),
-            },
-        );
-    }
-    finish("update", &runtimes, rows, &probes)
+    from_batch(
+        update_many(
+            selector,
+            |_| UpdateRequest::new(PLUGIN).with_marketplace_name(MARKETPLACE),
+            FailurePolicy::Continue,
+        ),
+        "update",
+        "updated",
+    )
 }
 
 pub fn uninstall(selector: AgentSelector) -> AgentReport {
-    let runtimes = selector.runtimes();
-    let mut rows: Vec<Option<AgentRow>> = runtimes.iter().map(|_| None).collect();
-    let probes = run_probes(
-        &runtimes,
-        AgentPluginOperation::Uninstall,
+    from_batch(
+        uninstall_many(
+            selector,
+            |_| UninstallRequest::new(PLUGIN),
+            FailurePolicy::Continue,
+        ),
         "uninstall",
-        &mut rows,
-    );
-    if rows.iter().any(Option::is_some) {
-        return finish("uninstall", &runtimes, rows, &probes);
+        "uninstalled",
+    )
+}
+
+/// Inferlab validates its shipped package before the shared installer may
+/// invoke a native CLI. One invalid runtime blocks all selected runtimes.
+fn package_gate(runtimes: &[AgentRuntime], checkout: &Path) -> Option<AgentReport> {
+    let failures = runtimes
+        .iter()
+        .copied()
+        .map(|runtime| validate_package(runtime, checkout).err())
+        .collect::<Vec<_>>();
+    if failures.iter().all(Option::is_none) {
+        return None;
     }
-    for (index, runtime) in runtimes.iter().enumerate() {
-        rows[index] = Some(
-            match uninstall_runtime(*runtime, UninstallRequest::new(PLUGIN)) {
-                Ok(outcome) => completed_row(outcome, "uninstall", "uninstalled", &probes[index]),
-                Err(error) => failed_row(*runtime, "uninstall", error, &probes[index]),
-            },
-        );
-    }
-    finish("uninstall", &runtimes, rows, &probes)
+
+    let rows = runtimes
+        .iter()
+        .copied()
+        .zip(failures)
+        .map(|(runtime, failure)| match failure {
+            Some(message) => failed_gate_row(runtime, "install", message),
+            None => make_row(
+                runtime,
+                "install",
+                "skipped",
+                Vec::new(),
+                Some("mutations not attempted: a preceding gate failed".to_owned()),
+            ),
+        })
+        .collect();
+    Some(AgentReport { rows })
 }
 
 /// The package paths one runtime needs before its native CLI may run; a
@@ -241,109 +258,61 @@ fn validate_package(runtime: AgentRuntime, checkout: &Path) -> Result<(), String
     Ok(())
 }
 
-/// Readiness probes per runtime, in runtime order. Probe commands are report
-/// evidence like any other native command; a not-ready runtime becomes a
-/// failed row carrying the probes it ran ([[RFC-0008:C-AGENT-PLUGIN]]).
-fn run_probes(
-    runtimes: &[AgentRuntime],
-    operation: AgentPluginOperation,
-    operation_name: &'static str,
-    rows: &mut [Option<AgentRow>],
-) -> Vec<Vec<String>> {
-    let mut probes = Vec::with_capacity(runtimes.len());
-    for (index, runtime) in runtimes.iter().enumerate() {
-        let outcome = check_operation(*runtime, operation);
-        if outcome.status != DoctorStatus::Ready {
-            let message = format!(
-                "{} CLI ({}) is not ready: {}",
-                runtime.id(),
-                runtime.cli(),
-                outcome
-                    .message
-                    .unwrap_or_else(|| "run `inferlab agent doctor` for details".to_owned())
-            );
-            rows[index] = Some(make_row(
-                *runtime,
-                operation_name,
-                "failed",
-                outcome.commands.clone(),
-                Some(message),
-            ));
-        }
-        probes.push(outcome.commands);
-    }
-    probes
-}
-
-/// Fill runtimes a preceding gate blocked with skipped rows and assemble
-/// the single per-operation report ([[RFC-0008:C-AGENT-PLUGIN]]).
-fn finish(
+/// Map the shared installer's complete batch result into Inferlab's stable
+/// JSON envelope. Mutation-time CLI absence remains a failed operation here;
+/// `missing` is reserved for the explicit doctor command.
+fn from_batch(
+    result: BatchResult,
     operation: &'static str,
-    runtimes: &[AgentRuntime],
-    rows: Vec<Option<AgentRow>>,
-    probes: &[Vec<String>],
+    success_status: &'static str,
 ) -> AgentReport {
-    let rows = rows
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => error.into_report(),
+    };
+    let rows = report
+        .outcomes
         .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            row.unwrap_or_else(|| {
-                make_row(
-                    runtimes[index],
-                    operation,
-                    "skipped",
-                    probes.get(index).cloned().unwrap_or_default(),
-                    Some("mutations not attempted: a preceding gate failed".to_owned()),
-                )
-            })
-        })
+        .map(|outcome| batch_row(outcome, operation, success_status))
         .collect();
     AgentReport { rows }
 }
 
-/// A native operation completed: its row carries the probes and then every
-/// mutating command, in execution order.
-fn completed_row(
-    outcome: PluginCommandOutcome,
+fn batch_row(
+    outcome: BatchRuntimeOutcome,
     operation: &'static str,
-    status: &'static str,
-    probes: &[String],
+    success_status: &'static str,
 ) -> AgentRow {
-    let mut commands = probes.to_vec();
-    commands.extend(outcome.commands);
-    AgentRow {
-        agent: outcome.runtime.id(),
-        operation,
+    let BatchRuntimeOutcome {
+        runtime,
         status,
-        cli: outcome.runtime.cli(),
         commands,
-        message: None,
-    }
+        failure,
+        skip_reason,
+        ..
+    } = outcome;
+    let row_status = match status {
+        BatchStatus::Succeeded => success_status,
+        BatchStatus::Skipped => "skipped",
+        BatchStatus::Missing | BatchStatus::Failed => "failed",
+        _ => "failed",
+    };
+    let message = match failure {
+        Some(BatchFailure::Validation(error)) => Some(error.to_string()),
+        Some(BatchFailure::Preflight { message }) => Some(format!(
+            "{} CLI ({}) is not ready: {message}",
+            runtime.id(),
+            runtime.cli()
+        )),
+        Some(BatchFailure::Operation(error)) => Some(error.to_string()),
+        Some(failure) => Some(failure.to_string()),
+        None => skip_reason.map(|_| "mutations not attempted: a preceding gate failed".to_owned()),
+    };
+    make_row(runtime, operation, row_status, commands, message)
 }
 
-/// A native operation failed: the row carries every native command the
-/// operation ran — probes, then the completed prefix the operation error
-/// carries whatever stopped it, then the failing command only when it
-/// actually spawned — so a partially applied state stays auditable, and
-/// the caller still exits loudly.
-fn failed_row(
-    runtime: AgentRuntime,
-    operation: &'static str,
-    failure: OperationError,
-    probes: &[String],
-) -> AgentRow {
-    let mut commands = probes.to_vec();
-    commands.extend(failure.completed.iter().cloned());
-    if let AgentPluginError::CliFailed { command, .. } = &failure.error {
-        commands.push(command.clone());
-    }
-    make_row(
-        runtime,
-        operation,
-        "failed",
-        commands,
-        Some(failure.to_string()),
-    )
+fn failed_gate_row(runtime: AgentRuntime, operation: &'static str, message: String) -> AgentRow {
+    make_row(runtime, operation, "failed", Vec::new(), Some(message))
 }
 
 fn make_row(

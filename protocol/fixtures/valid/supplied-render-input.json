@@ -1,0 +1,5 @@
+{
+  "source_path": "configs/operator.yaml",
+  "text": "batch_scheduler:\n  enable_chunked_context: true\n",
+  "sha256": "898caa1654c13bd4b1f2eba75d17c09b8fc3ea1370e5532a5111be220d50baa3"
+}

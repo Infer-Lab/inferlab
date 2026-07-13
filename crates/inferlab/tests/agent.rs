@@ -113,6 +113,48 @@ fn install_validates_the_shipped_package_and_drives_both_clis() -> Result<(), Bo
 }
 
 #[test]
+fn install_with_no_from_checkout_uses_the_embedded_package_and_drives_both_clis()
+-> Result<(), Box<dyn Error>> {
+    let harness = AgentHarness::new(true)?;
+    // No `--from-checkout`: the binary-embedded default package must be
+    // extracted and validated on its own, with no repository checkout in
+    // reach ([[RFC-0008:C-AGENT-PLUGIN]]).
+    let output = harness.run(&["agent", "install", "--agent", "all"])?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let rows = report["rows"].as_array().ok_or("rows")?;
+    assert_eq!(rows.len(), 2);
+    let logged = harness.logged()?;
+    for row in rows {
+        assert_eq!(row["operation"], "install");
+        assert_eq!(row["status"], "installed");
+        let cli = row["cli"].as_str().ok_or("cli")?;
+        let reported: Vec<String> = row["commands"]
+            .as_array()
+            .ok_or("commands")?
+            .iter()
+            .map(|c| c.as_str().unwrap_or_default().to_owned())
+            .collect();
+        let observed: Vec<String> = logged
+            .lines()
+            .filter(|line| line.starts_with(cli))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(reported, observed, "{cli} report vs fixture log");
+        assert!(
+            reported.iter().any(|c| c.contains("--help")),
+            "{reported:?}"
+        );
+    }
+    assert!(logged.contains("inferlab"), "{logged}");
+    Ok(())
+}
+
+#[test]
 fn install_fails_loudly_before_any_cli_on_a_broken_package() -> Result<(), Box<dyn Error>> {
     let harness = AgentHarness::new(true)?;
     let broken = tempfile::tempdir()?;
@@ -151,7 +193,7 @@ fn install_fails_loudly_before_any_cli_on_a_broken_package() -> Result<(), Box<d
 }
 
 #[test]
-fn native_failure_still_emits_the_report_then_fails_loudly() -> Result<(), Box<dyn Error>> {
+fn native_failure_continues_other_runtimes_then_fails_loudly() -> Result<(), Box<dyn Error>> {
     let harness = AgentHarness::new(true)?;
     // Codex accepts probes and the marketplace registration but fails the
     // plugin add: the report must keep the completed claude row and a codex
@@ -201,6 +243,17 @@ fn native_failure_still_emits_the_report_then_fails_loudly() -> Result<(), Box<d
     assert!(
         rendered.contains("plugin add inferlab@inferlab"),
         "{rendered}"
+    );
+    let logged = harness.logged()?;
+    let codex_failure = logged
+        .find("codex plugin add inferlab@inferlab")
+        .ok_or("codex failure command")?;
+    let claude_after_failure = logged
+        .rfind("claude plugin marketplace add")
+        .ok_or("claude mutation after codex failure")?;
+    assert!(
+        codex_failure < claude_after_failure,
+        "the second runtime must still run after the first fails: {logged}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("codex install failed"), "{stderr}");

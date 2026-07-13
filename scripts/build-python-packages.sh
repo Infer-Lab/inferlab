@@ -9,13 +9,12 @@ trap 'rm -rf "${temporary}"' EXIT
 rm -rf "${dist}"
 mkdir -p "${dist}"
 
-for package in \
-  inferlab-adapter-sdk \
-  inferlab-bench-runner \
-  inferlab-eval-runner \
-  inferlab-integration-sglang \
-  inferlab-integration-vllm
-do
+all_inventory="$("${root}/scripts/python-package-inventory.sh" all)"
+workspace_inventory="$("${root}/scripts/python-package-inventory.sh" workspace-side)"
+mapfile -t packages <<< "${all_inventory}"
+mapfile -t workspace_packages <<< "${workspace_inventory}"
+
+for package in "${packages[@]}"; do
   python -m build --no-isolation --outdir "${dist}" "${root}/python/${package}"
 done
 
@@ -25,11 +24,15 @@ uv pip install \
   --no-deps \
   --reinstall \
   "${dist}"/*.whl
-"${temporary}/venv/bin/python" -c \
-  'import inferlab_adapter_sdk, inferlab_bench_runner, inferlab_eval_runner, inferlab_integration_sglang, inferlab_integration_vllm'
+for package in "${packages[@]}"; do
+  "${temporary}/venv/bin/python" -c \
+    'import importlib, sys; importlib.import_module(sys.argv[1])' \
+    "${package//-/_}"
+done
 
-for adapter in inferlab-adapter-sglang inferlab-adapter-vllm
-do
+for package in "${workspace_packages[@]}"; do
+  [[ "${package}" == inferlab-integration-* ]] || continue
+  adapter="inferlab-adapter-${package#inferlab-integration-}"
   for operation in plan-serve render-serve
   do
     "${temporary}/venv/bin/${adapter}" \
@@ -45,24 +48,39 @@ done
 # matches the repository's, and
 # every built wheel and sdist actually carries it — an SPDX expression alone
 # does not satisfy MIT's notice-retention condition.
-for package in \
-  inferlab-adapter-sdk \
-  inferlab-bench-runner \
-  inferlab-eval-runner \
-  inferlab-integration-sglang \
-  inferlab-integration-vllm
-do
+for package in "${packages[@]}"; do
   cmp -s "${root}/LICENSE" "${root}/python/${package}/LICENSE" \
     || { echo "python/${package}/LICENSE drifted from the repository LICENSE" >&2; exit 1; }
 done
 for artifact in "${dist}"/*.whl "${dist}"/*.tar.gz; do
-  python - "${artifact}" <<'PY'
-import sys, tarfile, zipfile
-path = sys.argv[1]
-if path.endswith(".whl"):
-    names = zipfile.ZipFile(path).namelist()
+  python - "${artifact}" "${root}/LICENSE" <<'PY'
+import pathlib
+import sys
+import tarfile
+import zipfile
+
+path = pathlib.Path(sys.argv[1])
+expected = pathlib.Path(sys.argv[2]).read_bytes()
+if path.suffix == ".whl":
+    with zipfile.ZipFile(path) as archive:
+        licenses = [
+            (name, archive.read(name))
+            for name in archive.namelist()
+            if pathlib.PurePosixPath(name).name == "LICENSE"
+        ]
 else:
-    names = tarfile.open(path).getnames()
-assert any(n.endswith("LICENSE") for n in names), f"{path}: no LICENSE inside"
+    with tarfile.open(path) as archive:
+        licenses = []
+        for member in archive.getmembers():
+            if not member.isfile() or pathlib.PurePosixPath(member.name).name != "LICENSE":
+                continue
+            source = archive.extractfile(member)
+            if source is not None:
+                licenses.append((member.name, source.read()))
+if not licenses:
+    raise SystemExit(f"{path}: no LICENSE inside")
+for name, contents in licenses:
+    if contents != expected:
+        raise SystemExit(f"{path}: {name} differs from the repository LICENSE")
 PY
 done

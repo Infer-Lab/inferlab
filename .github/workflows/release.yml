@@ -37,11 +37,15 @@ jobs:
           # a wheel outside the tested same-version set. The workflow only
           # gates agreement — it builds no wheels.
           crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          for pyproject in python/*/pyproject.toml; do
+          inventory_file=$(mktemp)
+          scripts/python-package-inventory.sh all > "${inventory_file}"
+          while IFS= read -r package; do
+            pyproject="python/${package}/pyproject.toml"
             py_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "${pyproject}" | head -1)
             test -n "${py_version}" || { echo "${pyproject}: no version field found"; exit 1; }
             test "${py_version}" = "${crate_version}" || { echo "${pyproject}: version ${py_version} != crate version ${crate_version}"; exit 1; }
-          done
+          done < "${inventory_file}"
+          rm -f "${inventory_file}"
       - name: Toolchain + target
         run: |
           rustup set profile minimal

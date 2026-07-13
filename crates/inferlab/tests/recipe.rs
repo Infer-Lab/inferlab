@@ -6,10 +6,10 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 
 const WORKSPACE: &str = include_str!("fixtures/dsv4-workspace.toml");
 
@@ -58,6 +58,9 @@ impl TestWorkspace {
             root.path().join("pixi.lock"),
             "version: 6\nenvironments:\n  vllm: {}\n",
         )?;
+        // ensure_usable checks this prefix exists on disk before shelling
+        // out to pixi at all.
+        fs::create_dir_all(root.path().join(".pixi/envs/vllm"))?;
         fs::write(root.path().join(".gitignore"), ".inferlab/local.toml\n")?;
         fs::write(
             inferlab.join("local.toml"),
@@ -273,11 +276,18 @@ fn recipe_runs_eval_and_bench_then_stops_the_server() -> Result<(), Box<dyn Erro
     );
     let record: Value = serde_json::from_slice(&output.stdout)?;
     let id = record["id"].as_str().ok_or("missing recipe record id")?;
-    assert_datetime_record_id(id, "recipe")?;
+    assert_datetime_record_id(id, "recipe-dsv4-qualify-tp2")?;
     assert_eq!(record["server"]["id"], format!("{id}-serve"));
     assert_eq!(record["status"], "succeeded");
     assert_eq!(record["evals"].as_array().map(Vec::len), Some(2));
     assert_eq!(record["benches"].as_array().map(Vec::len), Some(2));
+    assert_eq!(record["evals"][0]["id"], format!("{id}-eval-000-smoke"));
+    assert_eq!(record["evals"][1]["id"], format!("{id}-eval-001-gsm8k"));
+    assert_eq!(record["benches"][0]["id"], format!("{id}-bench-000-c8k1k"));
+    assert_eq!(
+        record["benches"][1]["id"],
+        format!("{id}-bench-001-adaptive-c8k1k")
+    );
     assert!(
         record["evals"]
             .as_array()
@@ -1336,7 +1346,7 @@ fn manual_bench_attaches_to_an_explicit_running_server() -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn assert_datetime_record_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+fn assert_datetime_record_id(id: &str, expected_suffix: &str) -> Result<(), Box<dyn Error>> {
     let (timestamp, suffix) = id.split_once("Z-").ok_or("record id has no UTC prefix")?;
     assert_eq!(timestamp.len(), 23);
     assert_eq!(
@@ -1354,7 +1364,7 @@ fn assert_datetime_record_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>>
             (19, '.')
         ]
     );
-    assert!(suffix.starts_with(&format!("{kind}-")));
+    assert_eq!(suffix, expected_suffix);
     Ok(())
 }
 
@@ -1430,6 +1440,30 @@ fn failed_bench_is_recorded_before_server_cleanup() -> Result<(), Box<dyn Error>
     assert_eq!(record["server"]["status"], "stopped");
     assert_eq!(record["cleanup"]["verified"], true);
     assert!(workspace.bench_marker.is_file());
+    Ok(())
+}
+
+#[test]
+fn partial_prefix_cache_reset_fails_the_bench_with_http_evidence() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_RESET_STATUS", "206")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(recipe["status"], "failed");
+    let bench_id = recipe["benches"][0]["id"]
+        .as_str()
+        .ok_or("matrix bench has no record id")?;
+    let bench = workspace.load_record(bench_id)?;
+    assert_eq!(bench["cases"][0]["status"], "failed");
+    assert_eq!(bench["cases"][0]["prefix_cache_reset"]["succeeded"], false);
+    assert_eq!(bench["cases"][0]["prefix_cache_reset"]["http_status"], 206);
+    assert_eq!(bench["cases"][0]["error"], "prefix-cache reset failed");
+    assert_eq!(recipe["cleanup"]["verified"], true);
     Ok(())
 }
 
@@ -1549,12 +1583,14 @@ fn server_start_failure_skips_every_selected_measurement() -> Result<(), Box<dyn
 #[test]
 fn interruption_records_remaining_measurements_and_cleans_up() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
+    let stdout = NamedTempFile::new()?;
+    let stderr = NamedTempFile::new()?;
     let mut child = workspace
         .command()
         .env("FIXTURE_EVAL_WAIT", "1")
         .args(["recipe", "run", "dsv4-qualify"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout.reopen()?)
+        .stderr(stderr.reopen()?)
         .spawn()?;
     wait_for_path(&workspace.eval_marker, Duration::from_secs(5))?;
     let eval_child_pid = fs::read_to_string(&workspace.eval_marker)?
@@ -1572,7 +1608,7 @@ fn interruption_records_remaining_measurements_and_cleans_up() -> Result<(), Box
         child.kill()?;
         return Err("interrupted recipe did not finish cleanup within 10 seconds".into());
     }
-    let output = child.wait_with_output()?;
+    let output = read_spooled_output(child, &stdout, &stderr)?;
 
     assert!(!output.status.success());
     let record: Value = serde_json::from_slice(&output.stdout)?;
@@ -1612,12 +1648,14 @@ fn interruption_records_remaining_measurements_and_cleans_up() -> Result<(), Box
 fn interrupted_bench_preserves_native_evidence_and_cleans_its_group() -> Result<(), Box<dyn Error>>
 {
     let workspace = TestWorkspace::new()?;
+    let stdout = NamedTempFile::new()?;
+    let stderr = NamedTempFile::new()?;
     let mut child = workspace
         .command()
         .env("FIXTURE_BENCH_INTERRUPT_WAIT", "1")
         .args(["recipe", "run", "dsv4-qualify"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout.reopen()?)
+        .stderr(stderr.reopen()?)
         .spawn()?;
     wait_for_path(&workspace.bench_marker, Duration::from_secs(5))?;
     let bench_child_pid = fs::read_to_string(&workspace.bench_marker)?
@@ -1635,7 +1673,7 @@ fn interrupted_bench_preserves_native_evidence_and_cleans_its_group() -> Result<
         child.kill()?;
         return Err("interrupted recipe did not finish Bench cleanup within 10 seconds".into());
     }
-    let output = child.wait_with_output()?;
+    let output = read_spooled_output(child, &stdout, &stderr)?;
 
     assert!(!output.status.success());
     let recipe: Value = serde_json::from_slice(&output.stdout)?;
@@ -1661,6 +1699,19 @@ fn interrupted_bench_preserves_native_evidence_and_cleans_its_group() -> Result<
     assert_eq!(recipe["server"]["status"], "stopped");
     assert_eq!(recipe["cleanup"]["verified"], true);
     Ok(())
+}
+
+fn read_spooled_output(
+    mut child: Child,
+    stdout: &NamedTempFile,
+    stderr: &NamedTempFile,
+) -> Result<Output, Box<dyn Error>> {
+    let status = child.wait()?;
+    Ok(Output {
+        status,
+        stdout: fs::read(stdout.path())?,
+        stderr: fs::read(stderr.path())?,
+    })
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
@@ -1913,6 +1964,7 @@ elif operation == "render_serve":
         "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
         "processes": [{
             "id": allocation["process_id"],
+            "launch_files": [],
             "process": {
                 "argv": [
                     server,
@@ -1929,7 +1981,7 @@ elif operation == "render_serve":
     }
 else:
     raise ValueError(operation)
-print(json.dumps({"status": "ok", "protocol_version": "3", "result": {"operation": operation, "output": output}}))
+print(json.dumps({"status": "ok", "protocol_version": "4", "result": {"operation": operation, "output": output}}))
 "#;
 
 const FIXTURE_SERVER: &str = r#"#!/usr/bin/env python3
@@ -2024,7 +2076,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
                 return
-        self.send_response(200 if self.path in ["/reset_prefix_cache", "/start_profile", "/stop_profile"] else 404)
+        status = 200 if self.path in ["/reset_prefix_cache", "/start_profile", "/stop_profile"] else 404
+        if self.path == "/reset_prefix_cache":
+            status = int(os.environ.get("FIXTURE_RESET_STATUS", "200"))
+        self.send_response(status)
         self.end_headers()
     def log_message(self, format, *args):
         pass

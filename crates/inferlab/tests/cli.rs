@@ -14,7 +14,15 @@ fn help_is_a_runnable_minimal_surface() -> Result<(), Box<dyn Error>> {
     // Pin the visible subcommand surface derived from `Command` in
     // `crates/inferlab/src/cli.rs`: every non-hidden top-level subcommand must
     // be advertised, so a rename or a dropped command fails this test.
-    for subcommand in ["env", "toolchain", "serve", "recipe", "bench", "image"] {
+    for subcommand in [
+        "env",
+        "toolchain",
+        "serve",
+        "recipe",
+        "bench",
+        "run",
+        "image",
+    ] {
         assert!(
             stdout
                 .lines()

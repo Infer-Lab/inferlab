@@ -88,7 +88,21 @@ elif args[0] == "rm":
         # deadline.
         sys.stderr.write("Error response from daemon: cannot remove running container\n")
         sys.exit(1)
+    if fault.get("rm_race"):
+        # A --rm container whose exit races the explicit removal: the daemon
+        # owns an in-flight removal it refuses to double-remove.
+        sys.stderr.write(
+            f"Error response from daemon: removal of container {args[-1]} is already in progress\n"
+        )
+        sys.exit(1)
     # logged above; the fixture has nothing to remove
+elif args[:2] == ["container", "inspect"]:
+    # The removal-confirmation absence poll.
+    if fault.get("container_lingers"):
+        print("sha256:fixturelingeringcontainer")
+        sys.exit(0)
+    sys.stderr.write("Error: No such container: " + args[-1] + "\n")
+    sys.exit(1)
 elif args[0] == "run":
     image_index = next(
         index for index, arg in enumerate(args) if arg.startswith("sha256:") or "@sha256:" in arg

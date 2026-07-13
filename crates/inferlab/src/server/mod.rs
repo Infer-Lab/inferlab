@@ -341,6 +341,7 @@ fn start_with_runtime<R: ProcessRuntime>(
         let handle = match runtime.spawn(ProcessSpec {
             launch: &process.launch,
             command: &prepared.command,
+            launch_files: &process.launch_files,
             cache_root: &process.allocation.runtime_cache.path,
             stdout: &stdout,
             stderr: &stderr,
@@ -930,6 +931,7 @@ mod tests {
                     pass_env: Vec::new(),
                     cwd: std::env::temp_dir(),
                 },
+                launch_files: Vec::new(),
                 readiness: ReadinessPlan::ProcessAlive,
                 endpoint: EndpointPlan {
                     host: "127.0.0.1".to_owned(),
@@ -1016,7 +1018,7 @@ mod tests {
                     adapter_version: "1".to_owned(),
                     framework: "fixture".to_owned(),
                     executable: "fixture".to_owned(),
-                    protocol_version: ProtocolVersion::V3,
+                    protocol_version: ProtocolVersion::V4,
                     plan_request_sha256: "request".to_owned(),
                     plan_response_sha256: "response".to_owned(),
                     render_request_sha256: "request".to_owned(),

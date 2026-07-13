@@ -16,7 +16,7 @@ from inferlab_bench_runner.bench_client import (
 def request(tmp_path: Path, load_shape: dict[str, object]) -> BenchClientRequest:
     return BenchClientRequest.model_validate(
         {
-            "protocol_version": "3",
+            "protocol_version": "4",
             "endpoint": {
                 "protocol": "http",
                 "host": "127.0.0.1",
@@ -47,11 +47,18 @@ def test_config_maps_one_concurrency_case_to_headless_aiperf(tmp_path: Path) -> 
 
     assert benchmark["endpoint"] == {
         "url": "http://127.0.0.1:8000/v1/completions",
-        "type": "completions",
+        "type": "template",
         "streaming": True,
         "timeout": 120,
-        "useServerTokenCount": True,
+        "useServerTokenCount": False,
         "extra": {"ignore_eos": True, "min_tokens": 1000, "temperature": 0.0},
+        "template": {
+            "body": (
+                '{"prompt": {{ text | tojson }}, "model": {{ model | tojson }}, '
+                '"stream": {{ stream | tojson }}, "max_tokens": {{ max_tokens }}}'
+            ),
+            "response_field": "text",
+        },
     }
     assert dataset["prompts"] == {"isl": 8000, "osl": 1000}
     assert benchmark["profiling"] == {
@@ -61,6 +68,25 @@ def test_config_maps_one_concurrency_case_to_headless_aiperf(tmp_path: Path) -> 
     }
     assert tokenizer["name"] == "/models/dsv4"
     assert runtime["ui"] == "none"
+
+
+def test_config_keeps_chat_requests_on_the_native_aiperf_endpoint(tmp_path: Path) -> None:
+    base = request(tmp_path, {"kind": "concurrency_limited", "concurrency": 1})
+    chat_request = base.model_copy(
+        update={"endpoint": base.endpoint.model_copy(update={"api_path": "/v1/chat/completions"})}
+    )
+
+    config = aiperf_config(chat_request)
+    benchmark = cast(dict[str, object], config["benchmark"])
+
+    assert benchmark["endpoint"] == {
+        "url": "http://127.0.0.1:8000/v1/chat/completions",
+        "type": "chat",
+        "streaming": True,
+        "timeout": 120,
+        "useServerTokenCount": True,
+        "extra": {"ignore_eos": True, "min_tokens": 1000, "temperature": 0.0},
+    }
 
 
 def test_config_maps_vllm_burstiness_to_gamma_smoothness(tmp_path: Path) -> None:

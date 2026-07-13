@@ -24,7 +24,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +39,10 @@ pub fn run_eval(
     plan: &EvalPlan,
     server_record_id: &str,
 ) -> Result<WorkloadRecord, InferlabError> {
+    // Earlier runs' unclean exits leave recorded client groups behind;
+    // terminate identity-matching survivors before this run launches its
+    // own clients ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+    sweep_stale_client_groups(root);
     let resolved =
         serde_json::to_value(plan).map_err(|source| InferlabError::RecordEncode { source })?;
     let mut session =
@@ -179,7 +183,7 @@ fn run_eval_operation(
         EvalExecutionPlan::NativeOpenAiSmoke => run_openai_smoke(plan, session, paths),
         EvalExecutionPlan::LmEval { command, .. } => {
             let request = EvalClientRequest {
-                protocol_version: ProtocolVersion::V3,
+                protocol_version: ProtocolVersion::V4,
                 endpoint: plan.endpoint.clone(),
                 model: plan.model.clone(),
                 definition: super::eval_input(&plan.definition),
@@ -203,6 +207,10 @@ pub fn run_bench(
     server_access: WorkloadServerAccess<'_>,
     record_evidence: &impl Serialize,
 ) -> Result<WorkloadRecord, InferlabError> {
+    // Earlier runs' unclean exits leave recorded client groups behind;
+    // terminate identity-matching survivors before this run launches its
+    // own clients ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+    sweep_stale_client_groups(root);
     let resolved = serde_json::to_value(record_evidence)
         .map_err(|source| InferlabError::RecordEncode { source })?;
     let mut session =
@@ -464,7 +472,7 @@ fn run_bench_case(
         return Ok(failed_case(case, paths, reset, "prefix-cache reset failed"));
     }
     let request = BenchClientRequest {
-        protocol_version: ProtocolVersion::V3,
+        protocol_version: ProtocolVersion::V4,
         endpoint: plan.client.endpoint.clone(),
         model: plan.client.model.clone(),
         definition: plan.client.effective_definition.clone(),
@@ -916,70 +924,97 @@ fn run_client(
             });
         }
     };
+    // The durable process-group handle precedes the client's first
+    // experiment effect so an unclean exit stays recoverable
+    // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+    let handle_path = request_path.with_file_name(CLIENT_HANDLE_FILE);
+    if let Err(message) = record_client_group_handle(&child, &handle_path) {
+        let termination = terminate_client_group(&mut child);
+        return Ok(ClientRun {
+            process: Some(ClientProcessEvidence {
+                exit_code: None,
+                timed_out: false,
+                interrupted: false,
+                termination: Some(termination),
+            }),
+            error: Some(message),
+        });
+    }
     let deadline =
         Instant::now() + Duration::from_secs(timeout_seconds).saturating_add(CLIENT_RESULT_GRACE);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let termination = cleanup_remaining_client_group(&mut child);
-                let cleanup_error = termination.as_ref().and_then(|evidence| {
-                    (!evidence.verified).then(|| {
-                        evidence.error.clone().unwrap_or_else(|| {
-                            "client process-group cleanup was not verified".to_owned()
+    let mut wait_for_client = || -> Result<ClientRun, InferlabError> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let termination = cleanup_remaining_client_group(&mut child);
+                    let cleanup_error = termination.as_ref().and_then(|evidence| {
+                        (!evidence.verified).then(|| {
+                            evidence.error.clone().unwrap_or_else(|| {
+                                "client process-group cleanup was not verified".to_owned()
+                            })
                         })
-                    })
-                });
-                return Ok(ClientRun {
-                    process: Some(ClientProcessEvidence {
-                        exit_code: status.code(),
-                        timed_out: false,
-                        interrupted: false,
-                        termination,
-                    }),
-                    error: (!status.success())
-                        .then(|| format!("client exited with status {status}"))
-                        .or(cleanup_error),
-                });
-            }
-            Ok(None) if interrupt::received() => {
-                let termination = terminate_client_group(&mut child);
-                return Ok(ClientRun {
-                    process: Some(ClientProcessEvidence {
-                        exit_code: None,
-                        timed_out: false,
-                        interrupted: true,
-                        termination: Some(termination),
-                    }),
-                    error: Some("client interrupted".to_owned()),
-                });
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let termination = terminate_client_group(&mut child);
-                return Ok(ClientRun {
-                    process: Some(ClientProcessEvidence {
-                        exit_code: None,
-                        timed_out: true,
-                        interrupted: false,
-                        termination: Some(termination),
-                    }),
-                    error: Some(format!("client timed out after {timeout_seconds} seconds")),
-                });
-            }
-            Ok(None) => thread::sleep(CLIENT_POLL_INTERVAL),
-            Err(error) => {
-                let termination = terminate_client_group(&mut child);
-                return Ok(ClientRun {
-                    process: Some(ClientProcessEvidence {
-                        exit_code: None,
-                        timed_out: false,
-                        interrupted: false,
-                        termination: Some(termination),
-                    }),
-                    error: Some(format!("failed to wait for client: {error}")),
-                });
+                    });
+                    return Ok(ClientRun {
+                        process: Some(ClientProcessEvidence {
+                            exit_code: status.code(),
+                            timed_out: false,
+                            interrupted: false,
+                            termination,
+                        }),
+                        error: (!status.success())
+                            .then(|| format!("client exited with status {status}"))
+                            .or(cleanup_error),
+                    });
+                }
+                Ok(None) if interrupt::received() => {
+                    let termination = terminate_client_group(&mut child);
+                    return Ok(ClientRun {
+                        process: Some(ClientProcessEvidence {
+                            exit_code: None,
+                            timed_out: false,
+                            interrupted: true,
+                            termination: Some(termination),
+                        }),
+                        error: Some("client interrupted".to_owned()),
+                    });
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let termination = terminate_client_group(&mut child);
+                    return Ok(ClientRun {
+                        process: Some(ClientProcessEvidence {
+                            exit_code: None,
+                            timed_out: true,
+                            interrupted: false,
+                            termination: Some(termination),
+                        }),
+                        error: Some(format!("client timed out after {timeout_seconds} seconds")),
+                    });
+                }
+                Ok(None) => thread::sleep(CLIENT_POLL_INTERVAL),
+                Err(error) => {
+                    let termination = terminate_client_group(&mut child);
+                    return Ok(ClientRun {
+                        process: Some(ClientProcessEvidence {
+                            exit_code: None,
+                            timed_out: false,
+                            interrupted: false,
+                            termination: Some(termination),
+                        }),
+                        error: Some(format!("failed to wait for client: {error}")),
+                    });
+                }
             }
         }
+    };
+    let run = wait_for_client()?;
+    let termination_verified = run
+        .process
+        .as_ref()
+        .is_some_and(|process| process.termination.as_ref().is_none_or(|t| t.verified));
+    if termination_verified {
+        let _ = fs::remove_file(&handle_path);
     }
+    Ok(run)
 }
 
 fn cleanup_remaining_client_group(child: &mut Child) -> Option<ClientTerminationEvidence> {
@@ -1154,7 +1189,7 @@ fn reset_prefix_cache(
     let url = format!("http://{}:{}{}", endpoint.host, endpoint.port, action.path);
     let result = post_empty(&endpoint.host, endpoint.port, &action.path);
     match result {
-        Ok(status) if (200..300).contains(&status) => PrefixCacheResetEvidence {
+        Ok(status) if is_successful_cache_reset_status(status) => PrefixCacheResetEvidence {
             method: action.method,
             url,
             succeeded: true,
@@ -1176,6 +1211,10 @@ fn reset_prefix_cache(
             error: Some(error),
         },
     }
+}
+
+fn is_successful_cache_reset_status(status: u16) -> bool {
+    (200..300).contains(&status) && status != 206
 }
 
 fn post_empty(host: &str, port: u16, path: &str) -> Result<u16, String> {
@@ -1205,9 +1244,273 @@ fn post_empty(host: &str, port: u16, path: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("invalid HTTP status line {status_line:?}"))
 }
 
+pub(crate) const CLIENT_HANDLE_FILE: &str = "client-handle.json";
+const SWEEP_WALK_DEPTH: usize = 6;
+
+/// Durable client process-group handle, recorded at launch so a later run
+/// can terminate survivors of an unclean exit by leader start-time
+/// identity ([[RFC-0003:C-RUNTIME-WORKFLOWS]]). The owner identity makes
+/// "unclean exit" observable: a live handle belongs to a live concurrent
+/// run exactly while the owning Inferlab process's identity still matches.
+/// Unknown fields are tolerated so an older binary's sweep can still read
+/// a newer handle instead of clearing it unparsed.
+#[derive(Debug, Deserialize, Serialize)]
+struct ClientGroupHandle {
+    leader_pid: u32,
+    process_group: u32,
+    leader_start_time_ticks: u64,
+    owner_pid: u32,
+    owner_start_time_ticks: u64,
+}
+
+fn record_client_group_handle(child: &Child, path: &Path) -> Result<(), String> {
+    let leader_pid = child.id();
+    let leader_start_time_ticks =
+        server::runtime::process_start_time(leader_pid)?.ok_or_else(|| {
+            format!("client process {leader_pid} exited before its identity could be recorded")
+        })?;
+    let owner_pid = std::process::id();
+    let owner_start_time_ticks = server::runtime::process_start_time(owner_pid)?
+        .ok_or_else(|| "the owning process's identity could not be recorded".to_owned())?;
+    let handle = ClientGroupHandle {
+        leader_pid,
+        process_group: leader_pid,
+        leader_start_time_ticks,
+        owner_pid,
+        owner_start_time_ticks,
+    };
+    write_json(path, &handle)
+        .map_err(|error| format!("failed to record the client process-group handle: {error}"))
+}
+
+fn process_identity_matches(pid: u32, ticks: u64) -> bool {
+    server::runtime::process_start_time(pid)
+        .ok()
+        .flatten()
+        .is_some_and(|current| current == ticks)
+}
+
+/// Terminate identity-matching client process groups recorded by earlier
+/// runs that exited uncleanly, then clear their handles. A handle whose
+/// leader start-time no longer matches is cleared without signalling
+/// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+pub(crate) fn sweep_stale_client_groups(root: &Path) {
+    let mut handles = Vec::new();
+    collect_client_handles(&root.join(crate::record::RECORDS_DIR), 0, &mut handles);
+    for path in handles {
+        let handle = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ClientGroupHandle>(&bytes).ok());
+        if let Some(handle) = handle {
+            // A live owner means a live concurrent run, not an unclean
+            // exit: its clients are not this run's to touch.
+            if process_identity_matches(handle.owner_pid, handle.owner_start_time_ticks) {
+                continue;
+            }
+            if process_identity_matches(handle.leader_pid, handle.leader_start_time_ticks) {
+                let group = format!("-{}", handle.process_group);
+                let _ = send_group_signal("-TERM", &group);
+                let mut gone = wait_group_gone(&group, CLIENT_TERM_GRACE);
+                if !gone
+                    && process_identity_matches(handle.leader_pid, handle.leader_start_time_ticks)
+                {
+                    let _ = send_group_signal("-KILL", &group);
+                    gone = wait_group_gone(&group, CLIENT_TERM_GRACE);
+                }
+                if !gone {
+                    // Keep the handle: the next run must still be able to
+                    // discharge the termination it could not verify.
+                    continue;
+                }
+            }
+        }
+        let _ = fs::remove_file(&path);
+    }
+}
+
+fn collect_client_handles(dir: &Path, depth: usize, into: &mut Vec<PathBuf>) {
+    if depth > SWEEP_WALK_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_client_handles(&path, depth + 1, into);
+        } else if entry.file_name() == CLIENT_HANDLE_FILE {
+            into.push(path);
+        }
+    }
+}
+
+fn wait_group_gone(group: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match process_group_alive(group) {
+            Ok(false) => return true,
+            Err(_) => return false,
+            Ok(true) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(CLIENT_POLL_INTERVAL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_openai_completion_body;
+    use super::{
+        CLIENT_HANDLE_FILE, ClientGroupHandle, process_group_alive, sweep_stale_client_groups,
+    };
+    use crate::record::RECORDS_DIR;
+    use crate::server::runtime::process_start_time;
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    fn sweep_fixture(tag: &str) -> Result<(PathBuf, PathBuf), String> {
+        let root =
+            std::env::temp_dir().join(format!("inferlab-sweep-{tag}-{}", std::process::id()));
+        let case_dir = root.join(RECORDS_DIR).join("run").join("cases").join("c0");
+        fs::create_dir_all(&case_dir).map_err(|error| error.to_string())?;
+        Ok((root, case_dir.join(CLIENT_HANDLE_FILE)))
+    }
+
+    fn spawn_survivor() -> Result<std::process::Child, String> {
+        Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| error.to_string())
+    }
+
+    fn write_handle(path: &PathBuf, pid: u32, ticks: u64, owner: (u32, u64)) -> Result<(), String> {
+        let handle = ClientGroupHandle {
+            leader_pid: pid,
+            process_group: pid,
+            leader_start_time_ticks: ticks,
+            owner_pid: owner.0,
+            owner_start_time_ticks: owner.1,
+        };
+        let bytes = serde_json::to_vec(&handle).map_err(|error| error.to_string())?;
+        fs::write(path, bytes).map_err(|error| error.to_string())
+    }
+
+    /// An owner identity that can never match a live process.
+    const DEAD_OWNER: (u32, u64) = (u32::MAX, 1);
+
+    fn own_identity() -> Result<(u32, u64), String> {
+        let pid = std::process::id();
+        let ticks = process_start_time(pid)?.ok_or("own identity unreadable")?;
+        Ok((pid, ticks))
+    }
+
+    #[test]
+    fn termination_covers_the_whole_process_group() -> Result<(), String> {
+        // A client whose group contains its own descendants: the leader
+        // spawns a grandchild and both share the group created at launch.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 60 & exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let pid = child.id();
+        let evidence = super::terminate_client_group(&mut child);
+        let alive = process_group_alive(&format!("-{pid}"))?;
+        let _ = child.wait();
+        if !evidence.verified {
+            return Err("group termination was not verified".to_owned());
+        }
+        if alive {
+            return Err("descendants survived group termination".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_skips_live_owners_clients() -> Result<(), String> {
+        let (root, handle_path) = sweep_fixture("owner")?;
+        let mut child = spawn_survivor()?;
+        let pid = child.id();
+        let ticks = process_start_time(pid)?.ok_or("survivor exited before recording")?;
+        write_handle(&handle_path, pid, ticks, own_identity()?)?;
+        sweep_stale_client_groups(&root);
+        let alive = process_group_alive(&format!("-{pid}"))?;
+        let handle_kept = handle_path.exists();
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+        if !alive {
+            return Err("sweep terminated a live concurrent run's client".to_owned());
+        }
+        if !handle_kept {
+            return Err("sweep cleared a live concurrent run's handle".to_owned());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_terminates_identity_matching_survivors() -> Result<(), String> {
+        let (root, handle_path) = sweep_fixture("live")?;
+        let mut child = spawn_survivor()?;
+        let pid = child.id();
+        let ticks = process_start_time(pid)?.ok_or("survivor exited before recording")?;
+        write_handle(&handle_path, pid, ticks, DEAD_OWNER)?;
+        // Reap concurrently: the survivor is this test's child, and the sweep
+        // verifies group death, which a zombie would postpone. Real
+        // survivors of an unclean exit are reparented to init and reaped.
+        let waiter = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        sweep_stale_client_groups(&root);
+        waiter
+            .join()
+            .map_err(|_| "waiter thread panicked".to_owned())?;
+        if process_group_alive(&format!("-{pid}"))? {
+            return Err("identity-matching survivor group is still alive".to_owned());
+        }
+        if handle_path.exists() {
+            return Err("swept handle file was not cleared".to_owned());
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_never_signals_identity_drift() -> Result<(), String> {
+        let (root, handle_path) = sweep_fixture("drift")?;
+        let mut child = spawn_survivor()?;
+        let pid = child.id();
+        let ticks = process_start_time(pid)?.ok_or("survivor exited before recording")?;
+        write_handle(&handle_path, pid, ticks + 1, DEAD_OWNER)?;
+        sweep_stale_client_groups(&root);
+        let alive = process_group_alive(&format!("-{pid}"))?;
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+        let _ = child.wait();
+        if !alive {
+            return Err("sweep signalled a group whose identity drifted".to_owned());
+        }
+        if handle_path.exists() {
+            return Err("drifted handle file was not cleared".to_owned());
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
 
     #[test]
     fn openai_smoke_requires_a_nonempty_choices_array_with_text() {

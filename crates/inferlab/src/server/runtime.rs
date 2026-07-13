@@ -1,7 +1,8 @@
 use super::record::{GpuHardwareEvidence, MachineHardwareEvidence};
 use crate::interrupt;
 use crate::resolve::{
-    CommandPlan, EndpointPlan, LaunchPlan, ProcessPlan, ReadinessPlan, RemoteWorkspacePlan,
+    CommandPlan, EndpointPlan, LaunchFilePlan, LaunchPlan, ProcessPlan, ReadinessPlan,
+    RemoteWorkspacePlan, TargetRegistryExpectedTarget,
 };
 use crate::shell::{shell_quote, shell_quote_path};
 use crate::ssh::{ssh_argv, ssh_command};
@@ -9,11 +10,13 @@ use crate::workspace::{
     WorkspaceSnapshot, git_status_flags, source_digest_script, source_pathspecs,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -229,12 +232,29 @@ pub struct ProcessStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetRegistryMatchEvidence {
+    pub url: String,
+    pub role: String,
+    pub healthy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReadinessEvidence {
     Http {
         url: String,
         attempts: u32,
         ready_unix_ms: u64,
+    },
+    HttpTargetRegistry {
+        readiness_url: String,
+        registry_url: String,
+        attempts: u32,
+        ready_unix_ms: u64,
+        matched_targets: Vec<TargetRegistryMatchEvidence>,
     },
     ProcessAlive {
         ready_unix_ms: u64,
@@ -257,6 +277,7 @@ pub struct ReadinessFailure {
 pub(super) struct ProcessSpec<'a> {
     pub launch: &'a LaunchPlan,
     pub command: &'a CommandPlan,
+    pub launch_files: &'a [LaunchFilePlan],
     pub cache_root: &'a Path,
     pub stdout: &'a Path,
     pub stderr: &'a Path,
@@ -379,6 +400,32 @@ impl ProcessRuntime for SystemProcessRuntime {
                 timeout_seconds,
                 ..
             } => wait_http_ready(self, handle, endpoint, path, *timeout_seconds),
+            ReadinessPlan::HttpTargetRegistry {
+                readiness_path,
+                registry_path,
+                targets_field,
+                target_url_field,
+                target_role_field,
+                target_healthy_field,
+                target_bootstrap_port_field,
+                expected_targets,
+                timeout_seconds,
+                ..
+            } => wait_http_target_registry_ready(
+                || self.status(handle),
+                endpoint,
+                HttpTargetRegistryProbe {
+                    readiness_path,
+                    registry_path,
+                    targets_field,
+                    target_url_field,
+                    target_role_field,
+                    target_healthy_field,
+                    target_bootstrap_port_field,
+                    expected_targets,
+                },
+                *timeout_seconds,
+            ),
         }
     }
 
@@ -449,10 +496,12 @@ pub(super) fn preflight_targets(
         let source_digest = source_digest_script(&workspace.source_exclusions);
         let source_pathspecs = source_pathspecs(&workspace.source_exclusions);
         let script = format!(
-            "set -eu; cd {root}; pixi=$(type -P pixi); revision=$(git rev-parse HEAD); dirty=0; test -z \"$(git status {status_flags} -- {source_pathspecs})\" || dirty=1; source_digest=$({source_digest}); manifest=$(sha256sum pixi.toml | awk '{{print $1}}'); lock=$(sha256sum pixi.lock | awk '{{print $1}}'); set +e; \"$pixi\" run --locked --no-install --executable -e {environment} -- true; pixi_status=$?; set -e; printf 'INFERLAB_PREFLIGHT\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$revision\" \"$dirty\" \"$source_digest\" \"$manifest\" \"$lock\" \"$pixi\" \"$PATH\" \"$HOME\" \"$pixi_status\"; exit \"$pixi_status\"",
+            "set -eu; cd {root}; pixi=$(type -P pixi); revision=$(git rev-parse HEAD); dirty=0; test -z \"$(git status {status_flags} -- {source_pathspecs})\" || dirty=1; source_digest=$({source_digest}); manifest=$(sha256sum pixi.toml | awk '{{print $1}}'); lock=$(sha256sum pixi.lock | awk '{{print $1}}'); marker={confirmation_cache_dir}/{environment}/confirmed; set +e; if test -d {pixi_envs_dir}/{environment} && test -f \"$marker\" && [ \"$(sed -n 1p \"$marker\" 2>/dev/null)\" = \"$manifest\" ] && [ \"$(sed -n 2p \"$marker\" 2>/dev/null)\" = \"$lock\" ]; then pixi_status=0; else test -d {pixi_envs_dir}/{environment} && \"$pixi\" run --locked --no-install --executable -e {environment} -- true; pixi_status=$?; if [ \"$pixi_status\" = 0 ]; then mkdir -p \"$(dirname \"$marker\")\" && printf '%s\\n%s\\n' \"$manifest\" \"$lock\" > \"$marker.tmp.$$\" && mv \"$marker.tmp.$$\" \"$marker\"; fi; fi; set -e; printf 'INFERLAB_PREFLIGHT\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$revision\" \"$dirty\" \"$source_digest\" \"$manifest\" \"$lock\" \"$pixi\" \"$PATH\" \"$HOME\" \"$pixi_status\"; exit \"$pixi_status\"",
             root = shell_quote_path(&root),
             status_flags = git_status_flags(),
             environment = shell_quote(pixi_environment),
+            pixi_envs_dir = crate::environment::PIXI_ENVS_DIR,
+            confirmation_cache_dir = crate::environment::CONFIRMATION_CACHE_DIR,
         );
         let output = ssh_output(&target, &script)?;
         let stdout = String::from_utf8(output.stdout).map_err(|error| {
@@ -759,6 +808,7 @@ fn spawn_local(spec: ProcessSpec<'_>) -> Result<HostProcessHandle, LaunchFailure
             spec.cache_root.display()
         ))
     })?;
+    materialize_local_launch_files(spec.launch_files).map_err(fail)?;
     let (program, args) = spec
         .command
         .argv
@@ -826,6 +876,104 @@ fn spawn_local(spec: ProcessSpec<'_>) -> Result<HostProcessHandle, LaunchFailure
     })
 }
 
+fn materialize_local_launch_files(launch_files: &[LaunchFilePlan]) -> Result<(), String> {
+    for launch_file in launch_files {
+        publish_local_launch_file(launch_file)?;
+    }
+    Ok(())
+}
+
+fn publish_local_launch_file(launch_file: &LaunchFilePlan) -> Result<(), String> {
+    let target = &launch_file.resolved_path;
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "launch file target {} has no parent directory",
+            target.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create launch file directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".inferlab-launch.")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to stage launch file {}: {error}", target.display()))?;
+    staged
+        .write_all(launch_file.text.as_bytes())
+        .and_then(|()| staged.flush())
+        .map_err(|error| {
+            format!(
+                "failed to write staged launch file {}: {error}",
+                target.display()
+            )
+        })?;
+    staged
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o444))
+        .and_then(|()| staged.as_file().sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to finalize staged launch file {}: {error}",
+                target.display()
+            )
+        })?;
+
+    match staged.persist_noclobber(target) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_existing_launch_file(target, &launch_file.sha256)
+        }
+        Err(error) => Err(format!(
+            "failed to publish launch file {}: {}",
+            target.display(),
+            error.error
+        )),
+    }
+}
+
+fn verify_existing_launch_file(target: &Path, expected_sha256: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(target).map_err(|error| {
+        format!(
+            "failed to inspect existing launch file {}: {error}",
+            target.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "existing launch file target {} is not a regular file",
+            target.display()
+        ));
+    }
+    let actual_sha256 = file_sha256(target)?;
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "existing launch file {} does not match declared digest {expected_sha256}; found {actual_sha256}",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("failed to read launch file {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read launch file {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 /// A one-line human summary of a structured removal outcome for the launch
 /// failure message; the structured evidence itself rides
 /// [`LaunchFailure::container_removal`].
@@ -848,6 +996,8 @@ fn spawn_ssh(target: &str, spec: ProcessSpec<'_>) -> Result<SshProcessHandle, La
     let remote_stderr = spec.remote_dir.join("stderr.log");
     let remote_handle = spec.remote_dir.join("launch.handle");
     let command = render_env_command(spec.command).map_err(LaunchFailure::before_launch)?;
+    materialize_ssh_launch_files(target, spec.launch_files)
+        .map_err(LaunchFailure::before_launch)?;
     let script = format!(
         "set -eu; mkdir -p {dir} {cache}; cd {cwd}; nohup setsid {command} >{stdout} 2>{stderr} </dev/null & pid=$!; cleanup_pending=1; cleanup_launch() {{ if [ \"$cleanup_pending\" = 1 ]; then kill -KILL -- -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true; fi; }}; trap cleanup_launch EXIT; ticks=$(awk '{{print $22}}' /proc/$pid/stat); printf '%s %s\\n' \"$pid\" \"$ticks\" > {handle}; printf 'INFERLAB_HANDLE\\t%s\\t%s\\n' \"$pid\" \"$ticks\"; cleanup_pending=0; trap - EXIT",
         dir = shell_quote_path(spec.remote_dir),
@@ -889,6 +1039,71 @@ fn spawn_ssh(target: &str, spec: ProcessSpec<'_>) -> Result<SshProcessHandle, La
         spec.container.map(str::to_owned),
     )
     .map_err(|message| failed_ssh_handle_delivery(target, &remote_handle, spec.container, message))
+}
+
+fn materialize_ssh_launch_files(
+    target: &str,
+    launch_files: &[LaunchFilePlan],
+) -> Result<(), String> {
+    for launch_file in launch_files {
+        let script = remote_launch_file_script(launch_file)?;
+        let output = ssh_output_with_input(target, &script, launch_file.text.as_bytes())?;
+        if !output.status.success() {
+            return Err(format!(
+                "failed to materialize launch file {} on {target:?}: SSH exited with {}: {}",
+                launch_file.resolved_path.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remote_launch_file_script(launch_file: &LaunchFilePlan) -> Result<String, String> {
+    let target = &launch_file.resolved_path;
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "launch file target {} has no parent directory",
+            target.display()
+        )
+    })?;
+    Ok(format!(
+        "# INFERLAB_LAUNCH_FILE\nset -eu\numask 077\nparent={parent}\ntarget={target}\ndigest={digest}\nmkdir -p -- \"$parent\"\nstage=$(mktemp \"$parent/.inferlab-launch.XXXXXX\")\ntrap 'rm -f -- \"$stage\"' EXIT\ncat > \"$stage\"\nactual=$(sha256sum -- \"$stage\" | awk '{{print $1}}')\nif [ \"$actual\" != \"$digest\" ]; then printf 'staged launch file digest mismatch for %s: expected %s, found %s\\n' \"$target\" \"$digest\" \"$actual\" >&2; exit 1; fi\nchmod 0444 -- \"$stage\"\nif ln -T -- \"$stage\" \"$target\" 2>/dev/null; then exit 0; fi\nif [ ! -f \"$target\" ] || [ -L \"$target\" ]; then printf 'existing launch file target %s is not a regular file\\n' \"$target\" >&2; exit 1; fi\nactual=$(sha256sum -- \"$target\" | awk '{{print $1}}')\nif [ \"$actual\" != \"$digest\" ]; then printf 'existing launch file %s does not match declared digest %s; found %s\\n' \"$target\" \"$digest\" \"$actual\" >&2; exit 1; fi",
+        parent = shell_quote_path(parent),
+        target = shell_quote_path(target),
+        digest = shell_quote(&launch_file.sha256),
+    ))
+}
+
+fn ssh_output_with_input(target: &str, script: &str, input: &[u8]) -> Result<Output, String> {
+    let argv = ssh_argv(target, script);
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command_output_with_input(command, input)
+        .map_err(|error| format!("failed to launch SSH for {target:?}: {error}"))
+}
+
+fn command_output_with_input(mut command: Command, input: &[u8]) -> io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("child stdin was not piped"))?;
+    thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        let write_result = writer
+            .join()
+            .map_err(|_| io::Error::other("child stdin writer panicked"))?;
+        let output = output?;
+        write_result?;
+        Ok(output)
+    })
 }
 
 fn parse_ssh_handle(
@@ -1093,6 +1308,169 @@ fn wait_http_ready<R: ProcessRuntime>(
     }
 }
 
+struct HttpTargetRegistryProbe<'a> {
+    readiness_path: &'a str,
+    registry_path: &'a str,
+    targets_field: &'a str,
+    target_url_field: &'a str,
+    target_role_field: &'a str,
+    target_healthy_field: &'a str,
+    target_bootstrap_port_field: &'a str,
+    expected_targets: &'a [TargetRegistryExpectedTarget],
+}
+
+fn wait_http_target_registry_ready(
+    status: impl Fn() -> ProcessStatus,
+    endpoint: &EndpointPlan,
+    probe: HttpTargetRegistryProbe<'_>,
+    timeout_seconds: Option<u64>,
+) -> Result<ReadinessEvidence, ReadinessFailure> {
+    let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    let readiness_url = format!(
+        "http://{}:{}{}",
+        endpoint.host, endpoint.port, probe.readiness_path
+    );
+    let registry_url = format!(
+        "http://{}:{}{}",
+        endpoint.host, endpoint.port, probe.registry_path
+    );
+    let mut attempts = 0_u32;
+    let mut probe_interval = POLL_INTERVAL;
+    loop {
+        if interrupt::received() {
+            return Err(ReadinessFailure {
+                kind: ReadinessFailureKind::Interrupted,
+                message: "server startup was interrupted".to_owned(),
+            });
+        }
+        ensure_alive(status())?;
+        attempts = attempts.saturating_add(1);
+        let last_error = match probe_http(&endpoint.host, endpoint.port, probe.readiness_path) {
+            Ok(()) => match probe_target_registry(&endpoint.host, endpoint.port, &probe) {
+                Ok(matched_targets) => {
+                    return Ok(ReadinessEvidence::HttpTargetRegistry {
+                        readiness_url,
+                        registry_url,
+                        attempts,
+                        ready_unix_ms: unix_time_millis()?,
+                        matched_targets,
+                    });
+                }
+                Err(error) => error,
+            },
+            Err(error) => format!("public readiness probe failed: {error}"),
+        };
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            let timeout_seconds = timeout_seconds.unwrap_or_default();
+            return Err(ReadinessFailure {
+                kind: ReadinessFailureKind::Timeout,
+                message: format!(
+                    "server did not become ready within {timeout_seconds} seconds; last probe error: {last_error}"
+                ),
+            });
+        }
+        let mut sleep = probe_interval;
+        if let Some(deadline) = deadline {
+            sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        thread::sleep(sleep);
+        probe_interval = (probe_interval * 2).min(MAX_PROBE_INTERVAL);
+    }
+}
+
+fn probe_target_registry(
+    host: &str,
+    port: u16,
+    probe: &HttpTargetRegistryProbe<'_>,
+) -> Result<Vec<TargetRegistryMatchEvidence>, String> {
+    let response = probe_http_json(host, port, probe.registry_path, "target registry")?;
+    let targets = response
+        .get(probe.targets_field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "target registry response has no array field {:?}",
+                probe.targets_field
+            )
+        })?;
+    let mut evidence = Vec::with_capacity(probe.expected_targets.len());
+    for expected in probe.expected_targets {
+        let matches: Vec<&serde_json::Map<String, serde_json::Value>> = targets
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .filter(|target| {
+                target
+                    .get(probe.target_url_field)
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected.url.as_str())
+                    && target
+                        .get(probe.target_role_field)
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected.role.as_str())
+            })
+            .collect();
+        let target = match matches.as_slice() {
+            [] => {
+                return Err(format!(
+                    "target registry has no {:?} target at {:?}",
+                    expected.role, expected.url
+                ));
+            }
+            [target] => *target,
+            _ => {
+                return Err(format!(
+                    "target registry has multiple {:?} targets at {:?}",
+                    expected.role, expected.url
+                ));
+            }
+        };
+        let healthy = target
+            .get(probe.target_healthy_field)
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "target registry entry for {:?} at {:?} has no boolean {:?} field",
+                    expected.role, expected.url, probe.target_healthy_field
+                )
+            })?;
+        if !healthy {
+            return Err(format!(
+                "target registry entry for {:?} at {:?} is not healthy",
+                expected.role, expected.url
+            ));
+        }
+        let bootstrap_port = match target.get(probe.target_bootstrap_port_field) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                let port = value.as_u64().and_then(|port| u16::try_from(port).ok());
+                Some(port.ok_or_else(|| {
+                    format!(
+                        "target registry entry for {:?} at {:?} has invalid {:?}",
+                        expected.role, expected.url, probe.target_bootstrap_port_field
+                    )
+                })?)
+            }
+        };
+        if let Some(expected_port) = expected.bootstrap_port
+            && bootstrap_port != Some(expected_port)
+        {
+            return Err(format!(
+                "target registry entry for {:?} at {:?} has bootstrap port {bootstrap_port:?}, expected {expected_port}",
+                expected.role, expected.url
+            ));
+        }
+        evidence.push(TargetRegistryMatchEvidence {
+            url: expected.url.clone(),
+            role: expected.role.clone(),
+            healthy,
+            bootstrap_port,
+        });
+    }
+    Ok(evidence)
+}
+
 fn probe_http(host: &str, port: u16, path: &str) -> Result<(), String> {
     let address = (host, port)
         .to_socket_addrs()
@@ -1126,6 +1504,53 @@ fn probe_http(host: &str, port: u16, path: &str) -> Result<(), String> {
     } else {
         Err(format!("readiness returned HTTP {status}"))
     }
+}
+
+fn probe_http_json(
+    host: &str,
+    port: u16,
+    path: &str,
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    let address = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve {label} endpoint: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{label} endpoint did not resolve to an address"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250))
+        .map_err(|error| format!("{label} connection failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|error| format!("failed to configure {label} read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(250)))
+        .map_err(|error| format!("failed to configure {label} write timeout: {error}"))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|error| format!("failed to write {label} request: {error}"))?;
+    let mut response = Vec::new();
+    BufReader::new(stream)
+        .read_to_end(&mut response)
+        .map_err(|error| format!("failed to read {label} response: {error}"))?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| format!("{label} returned an invalid HTTP response"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| format!("{label} returned non-UTF-8 HTTP headers: {error}"))?;
+    let status_line = headers.lines().next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| format!("invalid {label} HTTP status line {status_line:?}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("{label} returned HTTP {status}"));
+    }
+    serde_json::from_slice(&response[header_end + 4..])
+        .map_err(|error| format!("{label} returned invalid JSON: {error}"))
 }
 
 fn terminate_local(handle: &HostProcessHandle, trigger: CleanupTrigger) -> CleanupEvidence {
@@ -1668,7 +2093,7 @@ pub(crate) fn ssh_output(target: &str, script: &str) -> Result<Output, String> {
         .map_err(|error| format!("failed to launch SSH for {target:?}: {error}"))
 }
 
-fn process_start_time(pid: u32) -> Result<Option<u64>, String> {
+pub(crate) fn process_start_time(pid: u32) -> Result<Option<u64>, String> {
     let path = format!("/proc/{pid}/stat");
     let stat = match fs::read_to_string(&path) {
         Ok(stat) => stat,
@@ -1725,6 +2150,382 @@ fn unix_time_millis() -> Result<u64, ReadinessFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolve::LaunchFilePlan;
+    use inferlab_protocol::EndpointProtocol;
+    use std::net::TcpListener;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn launch_file(root: &Path, text: &str, name: &str) -> LaunchFilePlan {
+        let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let relative_path = format!("launch-files/{sha256}/{name}");
+        LaunchFilePlan {
+            resolved_path: root.join(&relative_path),
+            relative_path,
+            text: text.to_owned(),
+            sha256,
+        }
+    }
+
+    fn run_script_with_input(script: &str, input: &[u8]) -> Result<Output, String> {
+        let mut command = Command::new("bash");
+        command.args(["-c", script]);
+        command_output_with_input(command, input).map_err(|error| error.to_string())
+    }
+
+    fn target_registry_endpoint(
+        registry_body: String,
+    ) -> Result<(EndpointPlan, thread::JoinHandle<Result<(), String>>), String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+                let mut request_line = String::new();
+                let mut reader =
+                    BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+                reader
+                    .read_line(&mut request_line)
+                    .map_err(|error| error.to_string())?;
+                loop {
+                    let mut header = String::new();
+                    reader
+                        .read_line(&mut header)
+                        .map_err(|error| error.to_string())?;
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                }
+                let body = if request_line.starts_with("GET /workers ") {
+                    registry_body.as_bytes()
+                } else {
+                    b""
+                };
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(body);
+                stream
+                    .write_all(&response)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        });
+        Ok((
+            EndpointPlan {
+                host: "127.0.0.1".to_owned(),
+                port,
+                protocol: EndpointProtocol::Http,
+                api_path: "/v1/completions".to_owned(),
+                prefix_cache_reset: None,
+            },
+            server,
+        ))
+    }
+
+    fn target_registry_probe<'a>(
+        expected_targets: &'a [TargetRegistryExpectedTarget],
+    ) -> HttpTargetRegistryProbe<'a> {
+        HttpTargetRegistryProbe {
+            readiness_path: "/readiness",
+            registry_path: "/workers",
+            targets_field: "workers",
+            target_url_field: "url",
+            target_role_field: "worker_type",
+            target_healthy_field: "is_healthy",
+            target_bootstrap_port_field: "bootstrap_port",
+            expected_targets,
+        }
+    }
+
+    fn alive_status() -> ProcessStatus {
+        ProcessStatus {
+            queried: true,
+            alive: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn local_launch_file_publication_reuses_the_immutable_target() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let launch_file = launch_file(
+            root.path(),
+            "worker: \u{2603}\nmode: context\n",
+            "worker.yaml",
+        );
+
+        materialize_local_launch_files(std::slice::from_ref(&launch_file))?;
+        let first_metadata =
+            fs::metadata(&launch_file.resolved_path).map_err(|error| error.to_string())?;
+        materialize_local_launch_files(std::slice::from_ref(&launch_file))?;
+        let second_metadata =
+            fs::metadata(&launch_file.resolved_path).map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            fs::read_to_string(&launch_file.resolved_path).map_err(|error| error.to_string())?,
+            launch_file.text
+        );
+        assert_eq!(first_metadata.ino(), second_metadata.ino());
+        assert_eq!(second_metadata.permissions().mode() & 0o222, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn local_launch_file_mismatch_fails_before_spawn_without_replacing_it() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let cache = root.path().join("cache");
+        let launch_file = launch_file(&cache, "expected\n", "worker.yaml");
+        let parent = launch_file
+            .resolved_path
+            .parent()
+            .ok_or_else(|| "launch file has no parent".to_owned())?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fs::write(&launch_file.resolved_path, "stale\n").map_err(|error| error.to_string())?;
+        let marker = root.path().join("spawned");
+        let command = CommandPlan {
+            argv: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("printf launched > {}", shell_quote_path(&marker)),
+            ],
+            env: BTreeMap::new(),
+            explicit_env: Vec::new(),
+            pass_env: Vec::new(),
+            cwd: root.path().to_path_buf(),
+        };
+        let launch_files = vec![launch_file.clone()];
+
+        let result = spawn_local(ProcessSpec {
+            launch: &LaunchPlan::Local,
+            command: &command,
+            launch_files: &launch_files,
+            cache_root: &cache,
+            stdout: &root.path().join("stdout.log"),
+            stderr: &root.path().join("stderr.log"),
+            remote_dir: &root.path().join("remote"),
+            container: None,
+        });
+
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(handle) => {
+                let _ = terminate_local(&handle, CleanupTrigger::StartupRollback);
+                return Err("mismatched launch file unexpectedly spawned a process".to_owned());
+            }
+        };
+        assert!(!failure.ownership_unknown, "{failure:?}");
+        assert!(failure.message.contains("does not match"), "{failure:?}");
+        assert!(!marker.exists());
+        assert_eq!(
+            fs::read_to_string(&launch_file.resolved_path).map_err(|error| error.to_string())?,
+            "stale\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_launch_file_script_publishes_stdin_without_replacing_targets() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let published = launch_file(
+            root.path(),
+            "worker: \u{96ea}\nmode: context\n",
+            "worker.yaml",
+        );
+        let script = remote_launch_file_script(&published)?;
+
+        let first = run_script_with_input(&script, published.text.as_bytes())?;
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let first_metadata =
+            fs::metadata(&published.resolved_path).map_err(|error| error.to_string())?;
+        let first_inode = first_metadata.ino();
+        assert_eq!(first_metadata.permissions().mode() & 0o222, 0);
+        let reused = run_script_with_input(&script, published.text.as_bytes())?;
+        assert!(
+            reused.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reused.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&published.resolved_path).map_err(|error| error.to_string())?,
+            published.text
+        );
+        assert_eq!(
+            fs::metadata(&published.resolved_path)
+                .map_err(|error| error.to_string())?
+                .ino(),
+            first_inode
+        );
+
+        let corrupt = launch_file(root.path(), "expected\n", "corrupt.yaml");
+        let corrupt_parent = corrupt
+            .resolved_path
+            .parent()
+            .ok_or_else(|| "launch file has no parent".to_owned())?;
+        fs::create_dir_all(corrupt_parent).map_err(|error| error.to_string())?;
+        fs::write(&corrupt.resolved_path, "stale\n").map_err(|error| error.to_string())?;
+        let rejected = run_script_with_input(
+            &remote_launch_file_script(&corrupt)?,
+            corrupt.text.as_bytes(),
+        )?;
+        assert!(!rejected.status.success());
+        assert_eq!(
+            fs::read_to_string(&corrupt.resolved_path).map_err(|error| error.to_string())?,
+            "stale\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_registry_readiness_records_all_expected_targets() -> Result<(), String> {
+        let (endpoint, server) = target_registry_endpoint(
+            serde_json::json!({
+                "workers": [
+                    {
+                        "url": "http://prefill:30000",
+                        "worker_type": "prefill",
+                        "is_healthy": true,
+                        "bootstrap_port": 8998
+                    },
+                    {
+                        "url": "http://decode:30001",
+                        "worker_type": "decode",
+                        "is_healthy": true
+                    }
+                ]
+            })
+            .to_string(),
+        )?;
+        let expected = vec![
+            TargetRegistryExpectedTarget {
+                url: "http://prefill:30000".to_owned(),
+                role: "prefill".to_owned(),
+                bootstrap_port: Some(8998),
+            },
+            TargetRegistryExpectedTarget {
+                url: "http://decode:30001".to_owned(),
+                role: "decode".to_owned(),
+                bootstrap_port: None,
+            },
+        ];
+
+        let evidence = wait_http_target_registry_ready(
+            alive_status,
+            &endpoint,
+            target_registry_probe(&expected),
+            Some(1),
+        )
+        .map_err(|failure| failure.message)?;
+        server
+            .join()
+            .map_err(|_| "target registry fixture panicked".to_owned())??;
+
+        let record_value = serde_json::to_value(&evidence).map_err(|error| error.to_string())?;
+        assert_eq!(record_value["kind"], "http_target_registry");
+        assert_eq!(
+            record_value["matched_targets"].as_array().map(Vec::len),
+            Some(2)
+        );
+        let ReadinessEvidence::HttpTargetRegistry {
+            readiness_url,
+            registry_url,
+            attempts,
+            matched_targets,
+            ..
+        } = evidence
+        else {
+            return Err("target registry readiness returned the wrong evidence kind".to_owned());
+        };
+        assert_eq!(
+            readiness_url,
+            format!("http://127.0.0.1:{}/readiness", endpoint.port)
+        );
+        assert_eq!(
+            registry_url,
+            format!("http://127.0.0.1:{}/workers", endpoint.port)
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            matched_targets,
+            vec![
+                TargetRegistryMatchEvidence {
+                    url: "http://prefill:30000".to_owned(),
+                    role: "prefill".to_owned(),
+                    healthy: true,
+                    bootstrap_port: Some(8998),
+                },
+                TargetRegistryMatchEvidence {
+                    url: "http://decode:30001".to_owned(),
+                    role: "decode".to_owned(),
+                    healthy: true,
+                    bootstrap_port: None,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_registry_readiness_rejects_partial_registration() -> Result<(), String> {
+        let (endpoint, server) = target_registry_endpoint(
+            serde_json::json!({
+                "workers": [{
+                    "url": "http://prefill:30000",
+                    "worker_type": "prefill",
+                    "is_healthy": true,
+                    "bootstrap_port": 8998
+                }]
+            })
+            .to_string(),
+        )?;
+        let expected = vec![
+            TargetRegistryExpectedTarget {
+                url: "http://prefill:30000".to_owned(),
+                role: "prefill".to_owned(),
+                bootstrap_port: Some(8998),
+            },
+            TargetRegistryExpectedTarget {
+                url: "http://decode:30001".to_owned(),
+                role: "decode".to_owned(),
+                bootstrap_port: None,
+            },
+        ];
+
+        let failure = match wait_http_target_registry_ready(
+            alive_status,
+            &endpoint,
+            target_registry_probe(&expected),
+            Some(0),
+        ) {
+            Err(failure) => failure,
+            Ok(evidence) => {
+                return Err(format!(
+                    "partial target registration unexpectedly became ready: {evidence:?}"
+                ));
+            }
+        };
+        server
+            .join()
+            .map_err(|_| "target registry fixture panicked".to_owned())??;
+
+        assert_eq!(failure.kind, ReadinessFailureKind::Timeout);
+        assert!(
+            failure
+                .message
+                .contains("target registry has no \"decode\" target at \"http://decode:30001\""),
+            "{}",
+            failure.message
+        );
+        Ok(())
+    }
 
     #[test]
     fn hardware_rows_parse_through_banner_noise_in_index_order() -> Result<(), String> {

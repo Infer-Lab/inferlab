@@ -1106,6 +1106,7 @@ mod tests {
                 pass_env: Vec::new(),
                 cwd: PathBuf::from("/workspace/.inferlab"),
             },
+            launch_files: Vec::new(),
             readiness: ReadinessPlan::Http {
                 path: "/v1/models".to_owned(),
                 timeout_seconds: Some(60),

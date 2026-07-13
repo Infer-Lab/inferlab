@@ -1,0 +1,34 @@
+{
+  "status": "ok",
+  "protocol_version": "4",
+  "result": {
+    "operation": "render_serve",
+    "output": {
+      "integration": {
+        "adapter_id": "fixture",
+        "adapter_version": "0.2.0",
+        "framework": "fixture"
+      },
+      "processes": [
+        {
+          "id": "server",
+          "launch_files": [
+            {
+              "relative_path": "launch-files/2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281/generation.yaml",
+              "text": "generation_config:\n  temperature: 0.0\n",
+              "sha256": "2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281"
+            }
+          ],
+          "process": {
+            "argv": [
+              "fixture-server",
+              "--generation-config",
+              "/cache/runtime/server/launch-files/2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281/generation.yaml"
+            ],
+            "env": {}
+          }
+        }
+      ]
+    }
+  }
+}

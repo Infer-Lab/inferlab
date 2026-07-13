@@ -6,16 +6,17 @@ use crate::workspace::{
     ServeProfileDefinition, WorkspaceSnapshot,
 };
 use inferlab_protocol::{
-    ClientEndpointInput, EndpointAssignment, EndpointProtocol, KvTransferMechanism, Parallelism,
-    PlanServeInput, PlanServeResult, ProcessSpec, ProtocolVersion, PublicEndpointRequirement,
-    ReadinessProbe, RenderServeInput, RenderedServeProcess, ServeModelInput,
-    ServeProcessAllocation, ServeReplicaRequirement, ServeRoleInput, ServeRoleKind, ServeRoleLink,
-    ServeTopology, SettingValue,
+    ClientEndpointInput, EndpointAssignment, EndpointProtocol, KvTransferMechanism,
+    LaunchFileDeclaration, Parallelism, PlanServeInput, PlanServeResult, ProcessSpec,
+    ProtocolVersion, PublicEndpointRequirement, ReadinessProbe, RenderInputDeclaration,
+    RenderServeInput, RenderedServeProcess, ServeModelInput, ServeProcessAllocation,
+    ServeReplicaRequirement, ServeRoleInput, ServeRoleKind, ServeRoleLink, ServeRoleResult,
+    ServeTopology, SettingValue, SuppliedRenderInput, TargetEndpointScheme,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -223,7 +224,27 @@ pub enum ReadinessPlan {
         timeout_seconds: Option<u64>,
         timeout_source: SettingSource,
     },
+    HttpTargetRegistry {
+        readiness_path: String,
+        registry_path: String,
+        targets_field: String,
+        target_url_field: String,
+        target_role_field: String,
+        target_healthy_field: String,
+        target_bootstrap_port_field: String,
+        expected_targets: Vec<TargetRegistryExpectedTarget>,
+        timeout_seconds: Option<u64>,
+        timeout_source: SettingSource,
+    },
     ProcessAlive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TargetRegistryExpectedTarget {
+    pub url: String,
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -362,10 +383,19 @@ pub struct ProcessPlan {
     pub launch_dependencies: Vec<String>,
     pub allocation: AllocationPlan,
     pub command: CommandPlan,
+    pub launch_files: Vec<LaunchFilePlan>,
     pub readiness: ReadinessPlan,
     pub endpoint: EndpointPlan,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_target: Option<CaptureTargetPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LaunchFilePlan {
+    pub relative_path: String,
+    pub resolved_path: PathBuf,
+    pub text: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -711,8 +741,59 @@ fn resolve_role_inputs(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinProxyKind {
+    VllmMooncake,
+    VllmNixl,
+    Sglang,
+    Trtllm,
+}
+
+impl BuiltinProxyKind {
+    fn meta(self) -> inferlab_proxy::core::ProxyMeta {
+        match self {
+            Self::VllmMooncake => inferlab_proxy::vllm_mooncake::meta(),
+            Self::VllmNixl => inferlab_proxy::vllm_nixl::meta(),
+            Self::Sglang => inferlab_proxy::sglang::meta(),
+            Self::Trtllm => inferlab_proxy::trtllm::meta(),
+        }
+    }
+
+    const fn command_name(self) -> &'static str {
+        match self {
+            Self::VllmMooncake => "vllm-mooncake",
+            Self::VllmNixl => "vllm-nixl",
+            Self::Sglang => "sglang",
+            Self::Trtllm => "trtllm",
+        }
+    }
+}
+
+fn builtin_proxy_kind(
+    framework: &str,
+    transport: Option<KvTransferMechanism>,
+) -> Result<BuiltinProxyKind, InferlabError> {
+    match (framework, transport) {
+        ("vllm", Some(KvTransferMechanism::Mooncake)) => Ok(BuiltinProxyKind::VllmMooncake),
+        ("vllm", Some(KvTransferMechanism::Nixl)) => Ok(BuiltinProxyKind::VllmNixl),
+        ("sglang", Some(KvTransferMechanism::Mooncake | KvTransferMechanism::Nixl)) => {
+            Ok(BuiltinProxyKind::Sglang)
+        }
+        ("tensorrt-llm", Some(KvTransferMechanism::Nixl)) => Ok(BuiltinProxyKind::Trtllm),
+        (_, None) => Err(InferlabError::InvalidConfig {
+            message: "built-in prefill/decode proxy requires a KV-transfer mechanism".to_owned(),
+        }),
+        _ => Err(InferlabError::InvalidConfig {
+            message: format!(
+                "framework {framework:?} does not support the built-in prefill/decode proxy"
+            ),
+        }),
+    }
+}
+
 fn render_builtin_proxy(
     requirement: &PublicEndpointRequirement,
+    framework: &str,
     transport: Option<KvTransferMechanism>,
     allocations: &[ResolvedProcessAllocation],
 ) -> Result<RenderedServeProcess, InferlabError> {
@@ -746,9 +827,7 @@ fn render_builtin_proxy(
             message: "built-in proxy requires prefill and decode replica entry points".to_owned(),
         });
     }
-    let transport = transport.ok_or_else(|| InferlabError::InvalidConfig {
-        message: "built-in prefill/decode proxy requires a KV-transfer mechanism".to_owned(),
-    })?;
+    let proxy_kind = builtin_proxy_kind(framework, transport)?;
     let executable = std::env::current_exe().map_err(|source| InferlabError::Read {
         path: PathBuf::from("/proc/self/exe"),
         source,
@@ -757,10 +836,7 @@ fn render_builtin_proxy(
         executable.to_string_lossy().into_owned(),
         "__internal".to_owned(),
         "proxy".to_owned(),
-        match transport {
-            KvTransferMechanism::Mooncake => "vllm-mooncake".to_owned(),
-            KvTransferMechanism::Nixl => "vllm-nixl".to_owned(),
-        },
+        proxy_kind.command_name().to_owned(),
         "--host".to_owned(),
         proxy.wire.endpoint.host.clone(),
         "--port".to_owned(),
@@ -768,7 +844,10 @@ fn render_builtin_proxy(
     ];
     for replica in prefill {
         argv.extend(["--prefill".to_owned(), endpoint_url(&replica.wire.endpoint)]);
-        if transport == KvTransferMechanism::Mooncake {
+        if matches!(
+            proxy_kind,
+            BuiltinProxyKind::VllmMooncake | BuiltinProxyKind::Sglang
+        ) {
             let bootstrap = replica.wire.ports.get("bootstrap").ok_or_else(|| {
                 InferlabError::InvalidConfig {
                     message: format!(
@@ -777,7 +856,13 @@ fn render_builtin_proxy(
                     ),
                 }
             })?;
-            argv.push(endpoint_url(bootstrap));
+            match proxy_kind {
+                BuiltinProxyKind::VllmMooncake => argv.push(endpoint_url(bootstrap)),
+                BuiltinProxyKind::Sglang => {
+                    argv.extend([bootstrap.host.clone(), bootstrap.port.to_string()]);
+                }
+                BuiltinProxyKind::VllmNixl | BuiltinProxyKind::Trtllm => {}
+            }
         }
     }
     for replica in decode {
@@ -789,11 +874,150 @@ fn render_builtin_proxy(
             argv,
             env: BTreeMap::new(),
         },
+        launch_files: Vec::new(),
     })
 }
 
 fn endpoint_url(endpoint: &EndpointAssignment) -> String {
     format!("http://{}:{}", endpoint.host, endpoint.port)
+}
+
+fn load_render_inputs(
+    workspace_root: &Path,
+    integration: &str,
+    declarations: &[RenderInputDeclaration],
+) -> Result<Vec<SuppliedRenderInput>, InferlabError> {
+    declarations
+        .iter()
+        .map(|declaration| {
+            let source = Path::new(&declaration.source_path);
+            let path = if source.is_absolute() {
+                source.to_owned()
+            } else {
+                workspace_root.join(source)
+            };
+            let bytes = std::fs::read(&path).map_err(|source| InferlabError::RenderInputRead {
+                integration: integration.to_owned(),
+                source_path: declaration.source_path.clone(),
+                path: path.clone(),
+                source,
+            })?;
+            let text =
+                String::from_utf8(bytes).map_err(|source| InferlabError::RenderInputUtf8 {
+                    integration: integration.to_owned(),
+                    source_path: declaration.source_path.clone(),
+                    path,
+                    source,
+                })?;
+            let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+            Ok(SuppliedRenderInput {
+                source_path: declaration.source_path.clone(),
+                text,
+                sha256,
+            })
+        })
+        .collect()
+}
+
+fn validate_launch_file_declarations(
+    integration: &str,
+    process_id: &str,
+    runtime_cache_root: &Path,
+    process: &ProcessSpec,
+    declarations: &[LaunchFileDeclaration],
+) -> Result<Vec<LaunchFilePlan>, InferlabError> {
+    declarations
+        .iter()
+        .map(|declaration| {
+            let relative_path = Path::new(&declaration.relative_path);
+            let components = relative_path.components().collect::<Vec<_>>();
+            let name = match components.as_slice() {
+                [
+                    Component::Normal(root),
+                    Component::Normal(digest),
+                    Component::Normal(name),
+                ] if root.to_str() == Some("launch-files")
+                    && digest.to_str() == Some(declaration.sha256.as_str())
+                    && is_lowercase_sha256(&declaration.sha256) =>
+                {
+                    name.to_str()
+                }
+                _ => None,
+            };
+            let Some(name) = name else {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "integration {integration:?} rendered launch file {:?} for process \
+                         {process_id:?} without canonical path \
+                         launch-files/<64-lowercase-sha256>/<name>",
+                        declaration.relative_path
+                    ),
+                });
+            };
+            let canonical = format!("launch-files/{}/{name}", declaration.sha256);
+            if declaration.relative_path != canonical {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "integration {integration:?} rendered launch file {:?} for process \
+                         {process_id:?} without canonical path \
+                         launch-files/<64-lowercase-sha256>/<name>",
+                        declaration.relative_path
+                    ),
+                });
+            }
+            let actual_sha256 = format!("{:x}", Sha256::digest(declaration.text.as_bytes()));
+            if declaration.sha256 != actual_sha256 {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "integration {integration:?} rendered launch file {:?} for process \
+                         {process_id:?} with content digest {:?}, expected {actual_sha256:?}",
+                        declaration.relative_path, declaration.sha256
+                    ),
+                });
+            }
+            let resolved_path = runtime_cache_root.join(relative_path);
+            if !matches!(
+                resolved_path.strip_prefix(runtime_cache_root),
+                Ok(path) if path == relative_path
+            ) {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "integration {integration:?} rendered launch file {:?} outside process \
+                         {process_id:?} runtime cache {:?}",
+                        declaration.relative_path, runtime_cache_root
+                    ),
+                });
+            }
+            let resolved = resolved_path.to_str().ok_or_else(|| InferlabError::InvalidConfig {
+                message: format!(
+                    "process {process_id:?} launch-file path {resolved_path:?} is not valid UTF-8"
+                ),
+            })?;
+            if !process.argv.iter().any(|argument| argument == resolved)
+                && !process.env.values().any(|value| value == resolved)
+            {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "integration {integration:?} rendered launch file {resolved_path:?} for \
+                         process {process_id:?} without an exact argv or environment reference"
+                    ),
+                });
+            }
+            Ok(LaunchFilePlan {
+                relative_path: declaration.relative_path.clone(),
+                resolved_path,
+                text: declaration.text.clone(),
+                sha256: declaration.sha256.clone(),
+            })
+        })
+        .collect()
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn resolve<C: AdapterClient>(
@@ -1072,6 +1296,11 @@ pub fn resolve<C: AdapterClient>(
         &requirements,
         builtin_proxy.map(|_| public_process.as_str()),
     )?;
+    let render_inputs = load_render_inputs(
+        &workspace.root,
+        &profile.integration,
+        &planned.render_inputs,
+    )?;
     let rendering = adapter.render_serve(
         &workspace.root,
         &profile.integration,
@@ -1092,6 +1321,7 @@ pub fn resolve<C: AdapterClient>(
                 .iter()
                 .map(|allocation| allocation.wire.clone())
                 .collect(),
+            render_inputs,
             profiling,
         },
     )?;
@@ -1119,6 +1349,7 @@ pub fn resolve<C: AdapterClient>(
     if let Some(requirement) = builtin_proxy {
         rendered_processes.push(render_builtin_proxy(
             requirement,
+            &planned.integration.framework,
             kv_transfer,
             &allocations,
         )?);
@@ -1165,6 +1396,13 @@ pub fn resolve<C: AdapterClient>(
                 ),
             });
         }
+        let launch_files = validate_launch_file_declarations(
+            &profile.integration,
+            &requirement.id,
+            &allocation.runtime_cache.path,
+            &rendered_process.process,
+            &rendered_process.launch_files,
+        )?;
         let machine_id = &allocation.wire.machine_id;
         let machine = workspace.local.machines.get(machine_id).ok_or_else(|| {
             InferlabError::InvalidConfig {
@@ -1193,19 +1431,17 @@ pub fn resolve<C: AdapterClient>(
         // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
         let mut explicit_env: Vec<String> = rendered_process.process.env.keys().cloned().collect();
         env.extend(rendered_process.process.env.clone());
-        if !allocation.wire.devices.is_empty() {
-            env.insert(
-                "CUDA_VISIBLE_DEVICES".to_owned(),
-                allocation
-                    .wire
-                    .devices
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            explicit_env.push("CUDA_VISIBLE_DEVICES".to_owned());
-        }
+        env.insert(
+            "CUDA_VISIBLE_DEVICES".to_owned(),
+            allocation
+                .wire
+                .devices
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        explicit_env.push("CUDA_VISIBLE_DEVICES".to_owned());
         env.insert("PWD".to_owned(), runtime_cwd.to_string_lossy().into_owned());
         explicit_env.push("PWD".to_owned());
         explicit_env.sort();
@@ -1255,12 +1491,15 @@ pub fn resolve<C: AdapterClient>(
                 pass_env: Vec::new(),
                 cwd: runtime_cwd,
             },
+            launch_files,
             readiness: readiness_plan(
                 &requirement.readiness,
                 profile.readiness_timeout_seconds,
                 &recipe.serve_profile,
                 profiling,
-            ),
+                &planned.roles,
+                &allocations,
+            )?,
             endpoint,
             capture_target: requirement.capture_target.clone(),
         });
@@ -1426,15 +1665,7 @@ pub fn resolve<C: AdapterClient>(
         .collect();
     let (routing_implementation, routing_policy) = match &planned.public_endpoint {
         PublicEndpointRequirement::BuiltinProxy { .. } => {
-            let meta = match kv_transfer {
-                Some(KvTransferMechanism::Mooncake) => inferlab_proxy::vllm_mooncake::meta(),
-                Some(KvTransferMechanism::Nixl) => inferlab_proxy::vllm_nixl::meta(),
-                None => {
-                    return Err(InferlabError::InvalidConfig {
-                        message: "built-in proxy requires a KV-transfer mechanism".to_owned(),
-                    });
-                }
-            };
+            let meta = builtin_proxy_kind(&planned.integration.framework, kv_transfer)?.meta();
             (
                 RoutingImplementationPlan::Inferlab {
                     id: meta.id.to_owned(),
@@ -1536,7 +1767,7 @@ pub fn resolve<C: AdapterClient>(
                 adapter_version: planned.integration.adapter_version,
                 framework: planned.integration.framework,
                 executable: executable_name(&profile.integration),
-                protocol_version: ProtocolVersion::V3,
+                protocol_version: ProtocolVersion::V4,
                 plan_request_sha256: planning.request_sha256,
                 plan_response_sha256: planning.response_sha256,
                 render_request_sha256: rendering.request_sha256,
@@ -2002,7 +2233,7 @@ fn validate_serve_graph(
             } => {
                 graph_roles.contains(source.as_str())
                     && graph_roles.contains(target.as_str())
-                    && role_has_port(&plan.replicas, target, port)
+                    && role_all_have_port(&plan.replicas, target, port)
             }
             ServeRoleLink::SideChannel {
                 source,
@@ -2011,8 +2242,8 @@ fn validate_serve_graph(
             } => {
                 graph_roles.contains(source.as_str())
                     && graph_roles.contains(target.as_str())
-                    && role_has_port(&plan.replicas, source, port)
-                    && role_has_port(&plan.replicas, target, port)
+                    && role_all_have_port(&plan.replicas, source, port)
+                    && role_all_have_port(&plan.replicas, target, port)
             }
         };
         if !valid {
@@ -2059,8 +2290,24 @@ fn validate_serve_graph(
                 ),
             });
         }
-        let transport_link = match kv_transfer {
-            Some(KvTransferMechanism::Mooncake) => plan.links.iter().any(|link| {
+        let transport_link = match (integration, kv_transfer) {
+            ("tensorrt-llm", Some(KvTransferMechanism::Nixl)) => {
+                if plan.links.iter().any(|link| {
+                    matches!(
+                        link,
+                        ServeRoleLink::Bootstrap { .. } | ServeRoleLink::SideChannel { .. }
+                    )
+                }) {
+                    return Err(InferlabError::InvalidConfig {
+                        message: format!(
+                            "integration {integration:?} declared a bootstrap or side-channel link for in-band NIXL transfer"
+                        ),
+                    });
+                }
+                true
+            }
+            ("sglang", Some(KvTransferMechanism::Mooncake | KvTransferMechanism::Nixl))
+            | (_, Some(KvTransferMechanism::Mooncake)) => plan.links.iter().any(|link| {
                 matches!(
                     link,
                     ServeRoleLink::Bootstrap { source, target, port }
@@ -2069,7 +2316,7 @@ fn validate_serve_graph(
                             && role_all_have_port(&plan.replicas, prefill, port)
                 )
             }),
-            Some(KvTransferMechanism::Nixl) => plan.links.iter().any(|link| {
+            (_, Some(KvTransferMechanism::Nixl)) => plan.links.iter().any(|link| {
                 matches!(
                     link,
                     ServeRoleLink::SideChannel { source, target, port }
@@ -2079,7 +2326,7 @@ fn validate_serve_graph(
                             && role_all_have_port(&plan.replicas, decode, port)
                 )
             }),
-            None => false,
+            (_, None) => false,
         };
         if !transport_link {
             return Err(InferlabError::InvalidConfig {
@@ -2090,13 +2337,6 @@ fn validate_serve_graph(
         }
     }
     Ok(())
-}
-
-fn role_has_port(replicas: &[ServeReplicaRequirement], role: &str, port: &str) -> bool {
-    replicas
-        .iter()
-        .filter(|replica| replica.role_id == role)
-        .any(|replica| replica.ports.iter().any(|candidate| candidate == port))
 }
 
 fn role_all_have_port(replicas: &[ServeReplicaRequirement], role: &str, port: &str) -> bool {
@@ -2497,21 +2737,92 @@ fn readiness_plan(
     timeout: u64,
     profile: &str,
     capture_armed: bool,
-) -> ReadinessPlan {
+    roles: &[ServeRoleResult],
+    allocations: &[ResolvedProcessAllocation],
+) -> Result<ReadinessPlan, InferlabError> {
+    let timeout_source = SettingSource::ServeProfile {
+        id: profile.to_owned(),
+    };
     match probe {
-        ReadinessProbe::Http { path } => ReadinessPlan::Http {
+        ReadinessProbe::Http { path } => Ok(ReadinessPlan::Http {
             path: path.clone(),
             // A capture-armed server's readiness wait is unbounded
             // ([[RFC-0004:C-WORKLOAD-PROFILING]]): instrumentation multiplies
             // startup unpredictably, and the wait still terminates on process
             // death or interruption.
             timeout_seconds: (!capture_armed).then_some(timeout),
-            timeout_source: SettingSource::ServeProfile {
-                id: profile.to_owned(),
-            },
-        },
-        ReadinessProbe::ProcessAlive => ReadinessPlan::ProcessAlive,
+            timeout_source,
+        }),
+        ReadinessProbe::HttpTargetRegistry(registry) => {
+            let expected_targets = allocations
+                .iter()
+                .filter(|allocation| allocation.wire.rank == 0)
+                .filter_map(|allocation| {
+                    roles
+                        .iter()
+                        .find(|role| role.id == allocation.wire.role_id)
+                        .map(|role| (allocation, role.kind))
+                })
+                .filter_map(|(allocation, kind)| match kind {
+                    ServeRoleKind::Prefill => Some((
+                        allocation,
+                        registry.prefill_role_value.as_str(),
+                        Some(registry.prefill_bootstrap_port.as_str()),
+                    )),
+                    ServeRoleKind::Decode => {
+                        Some((allocation, registry.decode_role_value.as_str(), None))
+                    }
+                    ServeRoleKind::Serve | ServeRoleKind::Router => None,
+                })
+                .map(|(allocation, role, bootstrap_port)| {
+                    let bootstrap_port = bootstrap_port
+                        .map(|port| {
+                            allocation
+                                .wire
+                                .ports
+                                .get(port)
+                                .map(|endpoint| endpoint.port)
+                                .ok_or_else(|| InferlabError::InvalidConfig {
+                                    message: format!(
+                                        "prefill process {:?} has no registry bootstrap port {port:?}",
+                                        allocation.wire.process_id
+                                    ),
+                                })
+                        })
+                        .transpose()?;
+                    Ok(TargetRegistryExpectedTarget {
+                        url: target_endpoint_url(
+                            &allocation.wire.endpoint,
+                            registry.target_scheme,
+                        ),
+                        role: role.to_owned(),
+                        bootstrap_port,
+                    })
+                })
+                .collect::<Result<Vec<_>, InferlabError>>()?;
+            Ok(ReadinessPlan::HttpTargetRegistry {
+                readiness_path: registry.readiness_path.clone(),
+                registry_path: registry.registry_path.clone(),
+                targets_field: registry.targets_field.clone(),
+                target_url_field: registry.target_url_field.clone(),
+                target_role_field: registry.target_role_field.clone(),
+                target_healthy_field: registry.target_healthy_field.clone(),
+                target_bootstrap_port_field: registry.target_bootstrap_port_field.clone(),
+                expected_targets,
+                timeout_seconds: (!capture_armed).then_some(timeout),
+                timeout_source,
+            })
+        }
+        ReadinessProbe::ProcessAlive => Ok(ReadinessPlan::ProcessAlive),
     }
+}
+
+fn target_endpoint_url(endpoint: &EndpointAssignment, scheme: TargetEndpointScheme) -> String {
+    let scheme = match scheme {
+        TargetEndpointScheme::Http => "http",
+        TargetEndpointScheme::Grpc => "grpc",
+    };
+    format!("{scheme}://{}:{}", endpoint.host, endpoint.port)
 }
 
 pub(crate) fn current_environment() -> Result<BTreeMap<String, String>, InferlabError> {
@@ -2928,7 +3239,187 @@ fn lookup<'a, T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inferlab_protocol::{ParallelismAttention, ParallelismExperts, ParallelismOuter};
+    use inferlab_protocol::{
+        EndpointRequirement, HttpTargetRegistryReadiness, IntegrationIdentity,
+        LaunchFileDeclaration, ParallelismAttention, ParallelismExperts, ParallelismOuter,
+        RenderInputDeclaration,
+    };
+
+    fn launch_file(text: &str, name: &str) -> LaunchFileDeclaration {
+        let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+        LaunchFileDeclaration {
+            relative_path: format!("launch-files/{sha256}/{name}"),
+            text: text.to_owned(),
+            sha256,
+        }
+    }
+
+    fn launch_process(argv: Vec<String>, env: BTreeMap<String, String>) -> ProcessSpec {
+        ProcessSpec { argv, env }
+    }
+
+    fn bootstrap_prefill_decode_plan(framework: &str) -> (Vec<ServeRoleInput>, PlanServeResult) {
+        let role = |id: &str, kind| ServeRoleInput {
+            id: id.to_owned(),
+            kind,
+            replica_count: 1,
+            parallelism: Parallelism::default(),
+            settings: BTreeMap::new(),
+        };
+        let requested_roles = vec![
+            role("prefill", ServeRoleKind::Prefill),
+            role("decode", ServeRoleKind::Decode),
+        ];
+        let roles = requested_roles
+            .iter()
+            .map(|role| ServeRoleResult {
+                id: role.id.clone(),
+                kind: role.kind,
+                replica_count: role.replica_count,
+                effective_settings: BTreeMap::new(),
+                effective_parallelism: Parallelism::default(),
+            })
+            .collect();
+        let replicas = requested_roles
+            .iter()
+            .map(|role| ServeReplicaRequirement {
+                id: role.id.clone(),
+                role_id: role.id.clone(),
+                replica_index: 0,
+                accelerator_count: 1,
+                ports: if role.kind == ServeRoleKind::Prefill {
+                    vec!["bootstrap".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                primary_ports: vec!["master".to_owned()],
+                primary_readiness: ReadinessProbe::Http {
+                    path: "/v1/models".to_owned(),
+                },
+                worker_readiness: ReadinessProbe::ProcessAlive,
+                capture_target: None,
+            })
+            .collect();
+        let plan = PlanServeResult {
+            integration: IntegrationIdentity {
+                adapter_id: format!("inferlab-{framework}"),
+                adapter_version: "1".to_owned(),
+                framework: framework.to_owned(),
+            },
+            effective_settings: BTreeMap::new(),
+            effective_parallelism: Parallelism::default(),
+            roles,
+            replicas,
+            links: vec![
+                ServeRoleLink::RequestRouting {
+                    source: "router".to_owned(),
+                    targets: vec!["prefill".to_owned(), "decode".to_owned()],
+                },
+                ServeRoleLink::KvTransfer {
+                    source: "prefill".to_owned(),
+                    target: "decode".to_owned(),
+                    mechanism: KvTransferMechanism::Nixl,
+                },
+                ServeRoleLink::Bootstrap {
+                    source: "router".to_owned(),
+                    target: "prefill".to_owned(),
+                    port: "bootstrap".to_owned(),
+                },
+            ],
+            public_endpoint: PublicEndpointRequirement::BuiltinProxy {
+                process_id: "proxy".to_owned(),
+                role_id: "router".to_owned(),
+                prefill_role: "prefill".to_owned(),
+                decode_role: "decode".to_owned(),
+                readiness: ReadinessProbe::Http {
+                    path: "/healthcheck".to_owned(),
+                },
+            },
+            endpoint: EndpointRequirement {
+                protocol: EndpointProtocol::Http,
+                api_path: "/v1/completions".to_owned(),
+                prefix_cache_reset: None,
+            },
+            render_inputs: Vec::new(),
+        };
+        (requested_roles, plan)
+    }
+
+    fn native_trtllm_prefill_decode_plan() -> (Vec<ServeRoleInput>, PlanServeResult) {
+        let (requested_roles, mut plan) = bootstrap_prefill_decode_plan("tensorrt-llm");
+        plan.links
+            .retain(|link| !matches!(link, ServeRoleLink::Bootstrap { .. }));
+        for replica in &mut plan.replicas {
+            replica.ports.clear();
+        }
+        plan.roles.push(ServeRoleResult {
+            id: "router".to_owned(),
+            kind: ServeRoleKind::Router,
+            replica_count: 1,
+            effective_settings: BTreeMap::new(),
+            effective_parallelism: Parallelism::default(),
+        });
+        plan.replicas.push(ServeReplicaRequirement {
+            id: "router".to_owned(),
+            role_id: "router".to_owned(),
+            replica_index: 0,
+            accelerator_count: 0,
+            ports: Vec::new(),
+            primary_ports: Vec::new(),
+            primary_readiness: ReadinessProbe::Http {
+                path: "/health".to_owned(),
+            },
+            worker_readiness: ReadinessProbe::ProcessAlive,
+            capture_target: None,
+        });
+        plan.public_endpoint = PublicEndpointRequirement::Replica {
+            replica_id: "router".to_owned(),
+        };
+        (requested_roles, plan)
+    }
+
+    fn add_second_replica(
+        requested_roles: &mut [ServeRoleInput],
+        plan: &mut PlanServeResult,
+        role_id: &str,
+        ports: Vec<String>,
+    ) -> Result<(), String> {
+        requested_roles
+            .iter_mut()
+            .find(|role| role.id == role_id)
+            .ok_or_else(|| format!("missing requested role {role_id:?}"))?
+            .replica_count = 2;
+        plan.roles
+            .iter_mut()
+            .find(|role| role.id == role_id)
+            .ok_or_else(|| format!("missing planned role {role_id:?}"))?
+            .replica_count = 2;
+        let mut replica = plan
+            .replicas
+            .iter()
+            .find(|replica| replica.role_id == role_id)
+            .cloned()
+            .ok_or_else(|| format!("missing planned replica for role {role_id:?}"))?;
+        replica.id = format!("{role_id}-001");
+        replica.replica_index = 1;
+        replica.ports = ports;
+        plan.replicas.push(replica);
+        Ok(())
+    }
+
+    fn add_first_replica_port(
+        plan: &mut PlanServeResult,
+        role_id: &str,
+        port: &str,
+    ) -> Result<(), String> {
+        plan.replicas
+            .iter_mut()
+            .find(|replica| replica.role_id == role_id && replica.replica_index == 0)
+            .ok_or_else(|| format!("missing first replica for role {role_id:?}"))?
+            .ports
+            .push(port.to_owned());
+        Ok(())
+    }
 
     #[test]
     fn effective_parallelism_preserves_explicit_role_components() {
@@ -2966,5 +3457,419 @@ mod tests {
                 .err()
                 .is_some_and(|error| error.to_string().contains("outer.tensor_parallel_size"))
         );
+    }
+
+    #[test]
+    fn nixl_transport_link_is_framework_specific() -> Result<(), String> {
+        let (sglang_roles, sglang_plan) = bootstrap_prefill_decode_plan("sglang");
+        assert!(
+            validate_serve_graph(
+                "sglang",
+                ServeTopology::PrefillDecode,
+                &sglang_roles,
+                Some(KvTransferMechanism::Nixl),
+                &sglang_plan,
+            )
+            .is_ok()
+        );
+
+        let (vllm_roles, vllm_plan) = bootstrap_prefill_decode_plan("vllm");
+        let result = validate_serve_graph(
+            "vllm",
+            ServeTopology::PrefillDecode,
+            &vllm_roles,
+            Some(KvTransferMechanism::Nixl),
+            &vllm_plan,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("required KV transport link"))
+        );
+
+        let (trtllm_roles, trtllm_plan) = native_trtllm_prefill_decode_plan();
+        assert!(
+            validate_serve_graph(
+                "tensorrt-llm",
+                ServeTopology::PrefillDecode,
+                &trtllm_roles,
+                Some(KvTransferMechanism::Nixl),
+                &trtllm_plan,
+            )
+            .is_ok()
+        );
+
+        let mut endpoint_link_plan = trtllm_plan.clone();
+        add_first_replica_port(&mut endpoint_link_plan, "prefill", "bootstrap")?;
+        endpoint_link_plan.links.push(ServeRoleLink::Bootstrap {
+            source: "router".to_owned(),
+            target: "prefill".to_owned(),
+            port: "bootstrap".to_owned(),
+        });
+        let result = validate_serve_graph(
+            "tensorrt-llm",
+            ServeTopology::PrefillDecode,
+            &trtllm_roles,
+            Some(KvTransferMechanism::Nixl),
+            &endpoint_link_plan,
+        );
+        assert!(result.is_err_and(|error| error.to_string().contains("in-band NIXL")));
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_link_requires_every_target_replica_endpoint() -> Result<(), String> {
+        let (mut roles, mut plan) = bootstrap_prefill_decode_plan("sglang");
+        add_first_replica_port(&mut plan, "decode", "diagnostic")?;
+        add_second_replica(&mut roles, &mut plan, "decode", Vec::new())?;
+        plan.links.push(ServeRoleLink::Bootstrap {
+            source: "router".to_owned(),
+            target: "decode".to_owned(),
+            port: "diagnostic".to_owned(),
+        });
+
+        let result = validate_serve_graph(
+            "sglang",
+            ServeTopology::PrefillDecode,
+            &roles,
+            Some(KvTransferMechanism::Nixl),
+            &plan,
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("unknown endpoints")));
+        Ok(())
+    }
+
+    #[test]
+    fn side_channel_link_requires_every_source_and_target_replica_endpoint() -> Result<(), String> {
+        for missing_role in ["prefill", "decode"] {
+            let (mut roles, mut plan) = bootstrap_prefill_decode_plan("sglang");
+            add_first_replica_port(&mut plan, "prefill", "diagnostic")?;
+            add_first_replica_port(&mut plan, "decode", "diagnostic")?;
+            let second_ports = if missing_role == "prefill" {
+                vec!["bootstrap".to_owned()]
+            } else {
+                Vec::new()
+            };
+            add_second_replica(&mut roles, &mut plan, missing_role, second_ports)?;
+            plan.links.push(ServeRoleLink::SideChannel {
+                source: "prefill".to_owned(),
+                target: "decode".to_owned(),
+                port: "diagnostic".to_owned(),
+            });
+
+            let result = validate_serve_graph(
+                "sglang",
+                ServeTopology::PrefillDecode,
+                &roles,
+                Some(KvTransferMechanism::Nixl),
+                &plan,
+            );
+
+            assert!(
+                result.is_err_and(|error| error.to_string().contains("unknown endpoints")),
+                "side channel accepted a missing {missing_role} replica endpoint"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn target_registry_readiness_derives_rank_zero_serving_targets() -> Result<(), InferlabError> {
+        let role = |id: &str, kind| ServeRoleResult {
+            id: id.to_owned(),
+            kind,
+            replica_count: 1,
+            effective_settings: BTreeMap::new(),
+            effective_parallelism: Parallelism::default(),
+        };
+        let roles = vec![
+            role("prefill", ServeRoleKind::Prefill),
+            role("decode", ServeRoleKind::Decode),
+            role("router", ServeRoleKind::Router),
+        ];
+        let allocation =
+            |process_id: &str, role_id: &str, rank: u32, port: u16, bootstrap_port: Option<u16>| {
+                let mut ports = BTreeMap::new();
+                if let Some(bootstrap_port) = bootstrap_port {
+                    ports.insert(
+                        "bootstrap".to_owned(),
+                        EndpointAssignment {
+                            host: "node.example".to_owned(),
+                            port: bootstrap_port,
+                        },
+                    );
+                }
+                ResolvedProcessAllocation {
+                    wire: ServeProcessAllocation {
+                        process_id: process_id.to_owned(),
+                        role_id: role_id.to_owned(),
+                        replica_id: role_id.to_owned(),
+                        replica_index: 0,
+                        rank,
+                        machine_id: "node".to_owned(),
+                        model_locator: "/models/example".to_owned(),
+                        runtime_cache_root: format!("/cache/{process_id}"),
+                        devices: Vec::new(),
+                        endpoint: EndpointAssignment {
+                            host: "node.example".to_owned(),
+                            port,
+                        },
+                        ports,
+                    },
+                    runtime_cache: RuntimeCachePlan {
+                        storage_root: PathBuf::from("/cache"),
+                        storage_root_source: RuntimeCacheRootSource::WorkspaceDefault,
+                        namespace: RuntimeCacheNamespacePlan {
+                            workspace_source_digest: "source".to_owned(),
+                            pixi_environment: "sglang".to_owned(),
+                            image_id: None,
+                            machine: "node".to_owned(),
+                            process: process_id.to_owned(),
+                        },
+                        path: PathBuf::from(format!("/cache/{process_id}")),
+                    },
+                }
+            };
+        let allocations = vec![
+            allocation("prefill", "prefill", 0, 8000, Some(9000)),
+            allocation("prefill-rank-001", "prefill", 1, 8001, Some(9001)),
+            allocation("decode", "decode", 0, 8100, None),
+            allocation("router", "router", 0, 30000, None),
+        ];
+        let probe = ReadinessProbe::HttpTargetRegistry(Box::new(HttpTargetRegistryReadiness {
+            target_scheme: inferlab_protocol::TargetEndpointScheme::Grpc,
+            readiness_path: "/readiness".to_owned(),
+            registry_path: "/workers".to_owned(),
+            targets_field: "workers".to_owned(),
+            target_url_field: "url".to_owned(),
+            target_role_field: "worker_type".to_owned(),
+            target_healthy_field: "is_healthy".to_owned(),
+            target_bootstrap_port_field: "bootstrap_port".to_owned(),
+            prefill_role_value: "prefill".to_owned(),
+            decode_role_value: "decode".to_owned(),
+            prefill_bootstrap_port: "bootstrap".to_owned(),
+        }));
+
+        let readiness = readiness_plan(&probe, 900, "sglang-pd", false, &roles, &allocations)?;
+        assert!(matches!(
+            &readiness,
+            ReadinessPlan::HttpTargetRegistry { .. }
+        ));
+        if let ReadinessPlan::HttpTargetRegistry {
+            expected_targets, ..
+        } = readiness
+        {
+            assert_eq!(
+                expected_targets,
+                vec![
+                    TargetRegistryExpectedTarget {
+                        url: "grpc://node.example:8000".to_owned(),
+                        role: "prefill".to_owned(),
+                        bootstrap_port: Some(9000),
+                    },
+                    TargetRegistryExpectedTarget {
+                        url: "grpc://node.example:8100".to_owned(),
+                        role: "decode".to_owned(),
+                        bootstrap_port: None,
+                    },
+                ]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn render_inputs_preserve_original_paths_exact_text_and_digest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let relative_path = "configs/operator.yaml";
+        let relative_text = "batch_scheduler:\n  enable_chunked_context: true\n";
+        std::fs::create_dir_all(workspace.path().join("configs"))?;
+        std::fs::write(workspace.path().join(relative_path), relative_text)?;
+
+        let absolute = workspace.path().join("absolute.yaml");
+        let absolute_text = "kv_cache_config:\n  enable_block_reuse: false\n";
+        std::fs::write(&absolute, absolute_text)?;
+        let absolute_path = absolute.to_string_lossy().into_owned();
+        let declarations = vec![
+            RenderInputDeclaration {
+                source_path: relative_path.to_owned(),
+            },
+            RenderInputDeclaration {
+                source_path: absolute_path.clone(),
+            },
+        ];
+
+        let supplied = load_render_inputs(workspace.path(), "tensorrt-llm", &declarations)?;
+
+        assert_eq!(supplied[0].source_path, relative_path);
+        assert_eq!(supplied[0].text, relative_text);
+        assert_eq!(
+            supplied[0].sha256,
+            format!("{:x}", Sha256::digest(relative_text.as_bytes()))
+        );
+        assert_eq!(supplied[1].source_path, absolute_path);
+        assert_eq!(supplied[1].text, absolute_text);
+        assert_eq!(
+            supplied[1].sha256,
+            format!("{:x}", Sha256::digest(absolute_text.as_bytes()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_render_input_is_a_typed_resolution_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let missing = RenderInputDeclaration {
+            source_path: "configs/missing.yaml".to_owned(),
+        };
+
+        let result = load_render_inputs(workspace.path(), "tensorrt-llm", &[missing]);
+
+        assert!(matches!(result, Err(InferlabError::RenderInputRead { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn non_utf8_render_input_is_a_typed_resolution_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workspace = tempfile::tempdir()?;
+        std::fs::write(workspace.path().join("operator.yaml"), [0xff, 0xfe])?;
+        let declaration = RenderInputDeclaration {
+            source_path: "operator.yaml".to_owned(),
+        };
+
+        let result = load_render_inputs(workspace.path(), "tensorrt-llm", &[declaration]);
+
+        assert!(matches!(result, Err(InferlabError::RenderInputUtf8 { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_files_preserve_valid_argv_and_env_references() -> Result<(), InferlabError> {
+        let cache_root = Path::new("/does/not/need/to/exist/cache/worker");
+        let argv_file = launch_file("worker: argv\n", "worker.yaml");
+        let env_file = launch_file("worker: 零\n", "environment.yaml");
+        let argv_path = cache_root.join(&argv_file.relative_path);
+        let env_path = cache_root.join(&env_file.relative_path);
+        let process = launch_process(
+            vec![
+                "server".to_owned(),
+                "--config".to_owned(),
+                argv_path.to_string_lossy().into_owned(),
+            ],
+            BTreeMap::from([(
+                "SERVER_CONFIG".to_owned(),
+                env_path.to_string_lossy().into_owned(),
+            )]),
+        );
+
+        let plans = validate_launch_file_declarations(
+            "tensorrt-llm",
+            "worker",
+            cache_root,
+            &process,
+            &[argv_file.clone(), env_file.clone()],
+        )?;
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].relative_path, argv_file.relative_path);
+        assert_eq!(plans[0].resolved_path, argv_path);
+        assert_eq!(plans[0].text, argv_file.text);
+        assert_eq!(plans[0].sha256, argv_file.sha256);
+        assert_eq!(plans[1].resolved_path, env_path);
+        Ok(())
+    }
+
+    #[test]
+    fn launch_file_path_must_be_canonical() {
+        let cache_root = Path::new("/cache/worker");
+        let mut declaration = launch_file("worker: invalid-path\n", "worker.yaml");
+        declaration.relative_path =
+            format!("launch-files/{}/nested/worker.yaml", declaration.sha256);
+        let resolved = cache_root.join(&declaration.relative_path);
+        let process = launch_process(
+            vec![resolved.to_string_lossy().into_owned()],
+            BTreeMap::new(),
+        );
+
+        let result = validate_launch_file_declarations(
+            "tensorrt-llm",
+            "worker",
+            cache_root,
+            &process,
+            &[declaration],
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("canonical path")));
+    }
+
+    #[test]
+    fn launch_file_digest_must_match_utf8_text() {
+        let cache_root = Path::new("/cache/worker");
+        let mut declaration = launch_file("worker: original\n", "worker.yaml");
+        declaration.text = "worker: changed\n".to_owned();
+        let resolved = cache_root.join(&declaration.relative_path);
+        let process = launch_process(
+            vec![resolved.to_string_lossy().into_owned()],
+            BTreeMap::new(),
+        );
+
+        let result = validate_launch_file_declarations(
+            "tensorrt-llm",
+            "worker",
+            cache_root,
+            &process,
+            &[declaration],
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("content digest")));
+    }
+
+    #[test]
+    fn launch_file_digest_must_be_complete_lowercase_hex() {
+        let cache_root = Path::new("/cache/worker");
+        let mut declaration = launch_file("worker: uppercase-digest\n", "worker.yaml");
+        declaration.sha256.make_ascii_uppercase();
+        declaration.relative_path = format!("launch-files/{}/worker.yaml", declaration.sha256);
+        let resolved = cache_root.join(&declaration.relative_path);
+        let process = launch_process(
+            vec![resolved.to_string_lossy().into_owned()],
+            BTreeMap::new(),
+        );
+
+        let result = validate_launch_file_declarations(
+            "tensorrt-llm",
+            "worker",
+            cache_root,
+            &process,
+            &[declaration],
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("64-lowercase-sha256")));
+    }
+
+    #[test]
+    fn launch_file_requires_an_exact_invocation_reference() {
+        let cache_root = Path::new("/cache/worker");
+        let declaration = launch_file("worker: unreferenced\n", "worker.yaml");
+        let resolved = cache_root.join(&declaration.relative_path);
+        let process = launch_process(
+            vec![format!("--config={}", resolved.to_string_lossy())],
+            BTreeMap::new(),
+        );
+
+        let result = validate_launch_file_declarations(
+            "tensorrt-llm",
+            "worker",
+            cache_root,
+            &process,
+            &[declaration],
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("exact argv or environment")));
     }
 }

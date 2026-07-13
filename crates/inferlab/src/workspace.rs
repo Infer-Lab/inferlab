@@ -711,11 +711,9 @@ pub fn load_workspace(
     root: PathBuf,
     local: Option<&Path>,
 ) -> Result<LoadedWorkspace, InferlabError> {
-    // The shared parent of WORKSPACE_FILE and WORKSPACE_FRAGMENT_DIR: a
-    // symlinked `.inferlab` would route every final-node guard below through
-    // the link, so the intermediate component is guarded first.
-    symlink_guard(&root.join(".inferlab"), ".inferlab")?;
-    let workspace_path = root.join(WORKSPACE_FILE);
+    // Resolved before the committed configuration loads: a fresh checkout
+    // missing this git-ignored file deserves that guidance as the first
+    // error a new operator sees, ahead of any workspace-config problem.
     let local_path = local
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.join(DEFAULT_LOCAL_FILE));
@@ -741,12 +739,8 @@ pub fn load_workspace(
             });
         }
     };
-    symlink_guard(&workspace_path, WORKSPACE_FILE)?;
-    let mut config: WorkspaceConfig = load_toml(&workspace_path)?;
-    compose_workspace_fragments(&root, &mut config)?;
+    let config = load_workspace_config(&root)?;
     let bindings: LocalBindings = load_toml(&local_path)?;
-    validate_workspace(&root, &config)?;
-    validate_pixi(&root, &config)?;
     validate_local_bindings(&bindings)?;
     let snapshot = inspect_workspace(&root, &local_path, &config)?;
     Ok(LoadedWorkspace {
@@ -755,6 +749,25 @@ pub fn load_workspace(
         local: bindings,
         snapshot,
     })
+}
+
+/// Load and validate the committed workspace configuration alone, without
+/// the machine-private local bindings `load_workspace` also requires. Serves
+/// callers that only need declared facts — environment identifiers, for
+/// instance — before an operator has bound this machine's local facts
+/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]).
+pub fn load_workspace_config(root: &Path) -> Result<WorkspaceConfig, InferlabError> {
+    // The shared parent of WORKSPACE_FILE and WORKSPACE_FRAGMENT_DIR: a
+    // symlinked `.inferlab` would route every final-node guard below through
+    // the link, so the intermediate component is guarded first.
+    symlink_guard(&root.join(".inferlab"), ".inferlab")?;
+    let workspace_path = root.join(WORKSPACE_FILE);
+    symlink_guard(&workspace_path, WORKSPACE_FILE)?;
+    let mut config: WorkspaceConfig = load_toml(&workspace_path)?;
+    compose_workspace_fragments(root, &mut config)?;
+    validate_workspace(root, &config)?;
+    validate_pixi(root, &config)?;
+    Ok(config)
 }
 
 fn canonicalize_root(root: PathBuf) -> Result<PathBuf, InferlabError> {

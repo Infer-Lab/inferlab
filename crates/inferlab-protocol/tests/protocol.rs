@@ -1,5 +1,7 @@
 use inferlab_protocol::{
-    AdapterRequest, AdapterResponse, PROTOCOL_SCHEMA_ID, ProtocolVersion, protocol_schema,
+    AdapterRequest, AdapterResponse, AdapterResult, PROTOCOL_SCHEMA_ID, ProtocolVersion,
+    ReadinessProbe, RenderInputDeclaration, SuppliedRenderInput, TargetEndpointScheme,
+    protocol_schema,
 };
 use std::error::Error;
 
@@ -19,6 +21,10 @@ const VALID_RENDER_RESPONSE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../protocol/fixtures/valid/render-serve-response.json"
 ));
+const VALID_LAUNCH_FILE_RESPONSE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/render-serve-response-launch-file.json"
+));
 const VALID_ERROR_RESPONSE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../protocol/fixtures/valid/error-response.json"
@@ -31,9 +37,21 @@ const INVALID_RESPONSE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../protocol/fixtures/invalid/response-wrong-shape.json"
 ));
+const VALID_HTTP_TARGET_REGISTRY_READINESS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/http-target-registry-readiness.json"
+));
+const VALID_RENDER_INPUT_DECLARATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/render-input-declaration.json"
+));
+const VALID_SUPPLIED_RENDER_INPUT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/supplied-render-input.json"
+));
 const GENERATED_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../protocol/schema/adapter-protocol-v3.schema.json"
+    "/../../protocol/schema/adapter-protocol-v4.schema.json"
 ));
 
 #[test]
@@ -42,13 +60,47 @@ fn valid_fixtures_deserialize_and_round_trip() -> Result<(), Box<dyn Error>> {
     let plan_response: AdapterResponse = serde_json::from_str(VALID_PLAN_RESPONSE)?;
     let render_request: AdapterRequest = serde_json::from_str(VALID_RENDER_REQUEST)?;
     let render_response: AdapterResponse = serde_json::from_str(VALID_RENDER_RESPONSE)?;
+    let launch_file_response: AdapterResponse = serde_json::from_str(VALID_LAUNCH_FILE_RESPONSE)?;
     let error_response: AdapterResponse = serde_json::from_str(VALID_ERROR_RESPONSE)?;
 
-    assert_eq!(plan_request.protocol_version(), ProtocolVersion::V3);
-    assert_eq!(plan_response.protocol_version(), ProtocolVersion::V3);
-    assert_eq!(render_request.protocol_version(), ProtocolVersion::V3);
-    assert_eq!(render_response.protocol_version(), ProtocolVersion::V3);
-    assert_eq!(error_response.protocol_version(), ProtocolVersion::V3);
+    assert_eq!(plan_request.protocol_version(), ProtocolVersion::V4);
+    assert_eq!(plan_response.protocol_version(), ProtocolVersion::V4);
+    assert_eq!(render_request.protocol_version(), ProtocolVersion::V4);
+    assert_eq!(render_response.protocol_version(), ProtocolVersion::V4);
+    assert_eq!(error_response.protocol_version(), ProtocolVersion::V4);
+
+    let AdapterResponse::Ok { result, .. } = &plan_response else {
+        return Err("plan fixture did not contain a successful response".into());
+    };
+    let AdapterResult::PlanServe { output } = result.as_ref() else {
+        return Err("plan fixture did not contain plan output".into());
+    };
+    assert!(output.render_inputs.is_empty());
+
+    let AdapterRequest::RenderServe { input, .. } = &render_request else {
+        return Err("render fixture did not contain a render request".into());
+    };
+    assert!(input.render_inputs.is_empty());
+
+    let AdapterResponse::Ok { result, .. } = &launch_file_response else {
+        return Err("launch-file fixture did not contain a successful response".into());
+    };
+    let AdapterResult::RenderServe { output } = result.as_ref() else {
+        return Err("render fixture did not contain render output".into());
+    };
+    let launch_file = output.processes[0]
+        .launch_files
+        .first()
+        .ok_or("render fixture did not contain a launch file")?;
+    assert_eq!(
+        launch_file.relative_path,
+        "launch-files/2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281/generation.yaml"
+    );
+    assert_eq!(
+        launch_file.sha256,
+        "2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281"
+    );
+    assert_eq!(launch_file.text, "generation_config:\n  temperature: 0.0\n");
     assert_eq!(
         serde_json::from_str::<AdapterRequest>(&serde_json::to_string(&plan_request)?)?,
         plan_request
@@ -66,8 +118,82 @@ fn valid_fixtures_deserialize_and_round_trip() -> Result<(), Box<dyn Error>> {
         render_response
     );
     assert_eq!(
+        serde_json::from_str::<AdapterResponse>(&serde_json::to_string(&launch_file_response)?)?,
+        launch_file_response
+    );
+    assert_eq!(
         serde_json::from_str::<AdapterResponse>(&serde_json::to_string(&error_response)?)?,
         error_response
+    );
+    Ok(())
+}
+
+#[test]
+fn http_target_registry_readiness_fixture_preserves_registry_contract() -> Result<(), Box<dyn Error>>
+{
+    let readiness: ReadinessProbe = serde_json::from_str(VALID_HTTP_TARGET_REGISTRY_READINESS)?;
+    let ReadinessProbe::HttpTargetRegistry(registry) = readiness else {
+        return Err("fixture did not deserialize as HTTP target-registry readiness".into());
+    };
+    let inferlab_protocol::HttpTargetRegistryReadiness {
+        target_scheme,
+        readiness_path,
+        registry_path,
+        targets_field,
+        target_url_field,
+        target_role_field,
+        target_healthy_field,
+        target_bootstrap_port_field,
+        prefill_role_value,
+        decode_role_value,
+        prefill_bootstrap_port,
+    } = *registry;
+
+    assert_eq!(target_scheme, TargetEndpointScheme::Http);
+
+    assert_eq!(
+        (
+            readiness_path.as_str(),
+            registry_path.as_str(),
+            targets_field.as_str(),
+            target_url_field.as_str(),
+            target_role_field.as_str(),
+            target_healthy_field.as_str(),
+            target_bootstrap_port_field.as_str(),
+            prefill_role_value.as_str(),
+            decode_role_value.as_str(),
+            prefill_bootstrap_port.as_str(),
+        ),
+        (
+            "/readiness",
+            "/workers",
+            "workers",
+            "url",
+            "worker_type",
+            "is_healthy",
+            "bootstrap_port",
+            "prefill",
+            "decode",
+            "bootstrap",
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn render_input_fixtures_preserve_declared_path_and_supplied_text() -> Result<(), Box<dyn Error>> {
+    let declaration: RenderInputDeclaration = serde_json::from_str(VALID_RENDER_INPUT_DECLARATION)?;
+    let supplied: SuppliedRenderInput = serde_json::from_str(VALID_SUPPLIED_RENDER_INPUT)?;
+
+    assert_eq!(declaration.source_path, "configs/operator.yaml");
+    assert_eq!(supplied.source_path, declaration.source_path);
+    assert_eq!(
+        supplied.text,
+        "batch_scheduler:\n  enable_chunked_context: true\n"
+    );
+    assert_eq!(
+        supplied.sha256,
+        "898caa1654c13bd4b1f2eba75d17c09b8fc3ea1370e5532a5111be220d50baa3"
     );
     Ok(())
 }
@@ -140,5 +266,8 @@ fn generated_schema_is_current_and_versioned() -> Result<(), Box<dyn Error>> {
     assert!(GENERATED_SCHEMA.contains("prefill_decode"));
     assert!(GENERATED_SCHEMA.contains("builtin_proxy"));
     assert!(GENERATED_SCHEMA.contains("capture_target"));
+    assert!(GENERATED_SCHEMA.contains("http_target_registry"));
+    assert!(GENERATED_SCHEMA.contains("launch_files"));
+    assert!(GENERATED_SCHEMA.contains("render_inputs"));
     Ok(())
 }

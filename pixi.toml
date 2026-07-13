@@ -20,6 +20,8 @@ inferlab-adapter-sdk = { path = "python/inferlab-adapter-sdk", editable = true }
 inferlab-bench-runner = { path = "python/inferlab-bench-runner", editable = true }
 inferlab-eval-runner = { path = "python/inferlab-eval-runner", editable = true }
 inferlab-integration-sglang = { path = "python/inferlab-integration-sglang", editable = true }
+inferlab-integration-tensorrt-llm = { path = "python/inferlab-integration-tensorrt-llm", editable = true }
+inferlab-integration-tokenspeed = { path = "python/inferlab-integration-tokenspeed", editable = true }
 inferlab-integration-vllm = { path = "python/inferlab-integration-vllm", editable = true }
 
 [activation.env]

@@ -1,6 +1,6 @@
 {
   "operation": "plan_serve",
-  "protocol_version": "3",
+  "protocol_version": "4",
   "input": {
     "model": {
       "locator": "/private/weights/dsv4",

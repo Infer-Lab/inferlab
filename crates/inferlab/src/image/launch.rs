@@ -111,6 +111,22 @@ pub fn select(
             record.resolved.image.source_set, recipe.source_set
         )));
     }
+    let (image_id, platform) = host_assembly(&record, record_id)?;
+    Ok(ImageLaunchPlan {
+        record_id: record_id.to_owned(),
+        image_id,
+        platform,
+        workspace_revision: record.resolved.workspace.revision,
+    })
+}
+
+/// The record's successful assembly for the launching host's platform, the
+/// shared precondition of every image-backed execution
+/// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
+fn host_assembly(
+    record: &StoredImageRecord,
+    record_id: &str,
+) -> Result<(String, String), InferlabError> {
     let platform = host_platform();
     let Some(assembly) = record
         .assemblies
@@ -142,12 +158,18 @@ pub fn select(
             )));
         }
     };
-    Ok(ImageLaunchPlan {
-        record_id: record_id.to_owned(),
-        image_id,
-        platform,
-        workspace_revision: record.resolved.workspace.revision,
-    })
+    Ok((image_id, platform))
+}
+
+/// Select an image build record for ad-hoc execution
+/// ([[RFC-0002:C-ADHOC-EXECUTION]]): no recipe participates, so the record's
+/// stored facts and a successful host-platform assembly are the only
+/// preconditions, and the executed environment is structurally the one the
+/// record's image realizes.
+pub(crate) fn select_for_adhoc(root: &Path, record_id: &str) -> Result<String, InferlabError> {
+    let record = load_record(root, record_id)?;
+    let (image_id, _) = host_assembly(&record, record_id)?;
+    Ok(image_id)
 }
 
 /// Validate an external-image selection against workspace facts, before
@@ -183,25 +205,7 @@ pub fn select_external(
             declaration.integration, profile.integration
         )));
     }
-    // A read-only presence probe: a missing image is the operator's pull to
-    // make, never Inferlab's.
-    let inspect = std::process::Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            &declaration.reference,
-        ])
-        .output()
-        .map_err(|source| reject(format!("docker image inspect failed to launch: {source}")))?;
-    if !inspect.status.success() {
-        return Err(reject(format!(
-            "external image {external_id:?} ({}) is not present in local builder storage; \
-             run: docker pull {}",
-            declaration.reference, declaration.reference
-        )));
-    }
+    probe_local_presence(external_id, &declaration.reference)?;
     let digest = declaration
         .reference
         .rsplit_once('@')
@@ -301,6 +305,41 @@ pub(crate) fn apply(
     containerize(execution, &image.image_id, machines, false);
     execution.server.image = Some(image.clone());
     Ok(())
+}
+
+/// A read-only presence probe: a missing image is the operator's pull to
+/// make, never Inferlab's.
+fn probe_local_presence(external_id: &str, reference: &str) -> Result<(), InferlabError> {
+    let inspect = std::process::Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", reference])
+        .output()
+        .map_err(|source| reject(format!("docker image inspect failed to launch: {source}")))?;
+    if !inspect.status.success() {
+        return Err(reject(format!(
+            "external image {external_id:?} ({reference}) is not present in local builder \
+             storage; run: docker pull {reference}"
+        )));
+    }
+    Ok(())
+}
+
+/// Select a declared external serving image for ad-hoc execution
+/// ([[RFC-0002:C-ADHOC-EXECUTION]]): the declaration must exist and the
+/// image must already be present locally. No recipe participates, so the
+/// launch surface's integration agreement has no counterpart to check
+/// against; the execution is not qualified by this workspace either way.
+pub(crate) fn select_external_for_adhoc(
+    workspace: &LoadedWorkspace,
+    external_id: &str,
+) -> Result<String, InferlabError> {
+    let Some(declaration) = workspace.config.external_images.get(external_id) else {
+        return Err(reject(format!(
+            "unknown external image {external_id:?}; declare it under [external_images] in the \
+             workspace"
+        )));
+    };
+    probe_local_presence(external_id, &declaration.reference)?;
+    Ok(declaration.reference.clone())
 }
 
 fn reject(message: String) -> InferlabError {

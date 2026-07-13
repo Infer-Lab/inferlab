@@ -172,5 +172,50 @@ pub(crate) fn remove_container(target: Option<&str>, container: &str) -> Removal
             already_absent: true,
         };
     }
+    // A `--rm` container whose exit races this removal: the daemon owns an
+    // in-flight removal it refuses to double-remove, so confirmation is
+    // observing the container disappear within the same removal deadline.
+    if stderr.contains("is already in progress") && confirm_container_absent(target, container) {
+        return Removal::Confirmed {
+            already_absent: true,
+        };
+    }
     Removal::Unconfirmed(RemovalFailure::Exit { status, stderr })
+}
+
+/// Poll the daemon on the container's launch machine until it no longer
+/// knows the container, bounded by [`REMOVAL_TIMEOUT`]. Any answer other
+/// than a definitive not-found keeps polling; the deadline decides.
+fn confirm_container_absent(target: Option<&str>, container: &str) -> bool {
+    let argv = match target {
+        Some(target) => crate::ssh::ssh_argv(
+            target,
+            &format!(
+                "docker container inspect --format {{{{.Id}}}} {}",
+                crate::shell::shell_quote(container)
+            ),
+        ),
+        None => vec![
+            "docker".to_owned(),
+            "container".to_owned(),
+            "inspect".to_owned(),
+            "--format".to_owned(),
+            "{{.Id}}".to_owned(),
+            container.to_owned(),
+        ],
+    };
+    let deadline = std::time::Instant::now() + REMOVAL_TIMEOUT;
+    loop {
+        if let Ok(BoundedWait::Exited { status, stderr, .. }) =
+            run_bounded(&argv, None, None, REMOVAL_TIMEOUT)
+            && !status.success()
+            && String::from_utf8_lossy(&stderr).contains("No such container")
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }

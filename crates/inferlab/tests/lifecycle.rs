@@ -56,6 +56,9 @@ impl TestWorkspace {
             root.path().join("pixi.lock"),
             "version: 6\nenvironments:\n  vllm: {}\n",
         )?;
+        // ensure_usable checks this prefix exists on disk before shelling
+        // out to pixi at all.
+        fs::create_dir_all(root.path().join(".pixi/envs/vllm"))?;
         fs::write(
             root.path().join(".gitignore"),
             ".inferlab/local.toml\n.inferlab/ssh-events.log\n",
@@ -321,6 +324,85 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn start_materializes_launch_files_and_preserves_them_in_the_record() -> Result<(), Box<dyn Error>>
+{
+    let workspace = TestWorkspace::new()?;
+    let started = workspace.run_json(&[
+        "serve",
+        "start",
+        "dsv4-qualify",
+        "--set",
+        "server.fixture_mode=\"launch-file\"",
+    ])?;
+    let id = started["id"].as_str().ok_or("missing record id")?;
+    let launch_file = &started["resolved"]["server"]["processes"][0]["launch_files"][0];
+    let resolved_path = launch_file["resolved_path"]
+        .as_str()
+        .ok_or("missing resolved launch-file path")?;
+    let text = launch_file["text"]
+        .as_str()
+        .ok_or("missing launch-file text")?;
+
+    assert_eq!(launch_file["text"], "fixture: runtime\nunicode: 雪\n");
+    assert_eq!(fs::read_to_string(resolved_path)?, text);
+    assert!(
+        started["resolved"]["server"]["processes"][0]["command"]["argv"]
+            .as_array()
+            .is_some_and(|argv| argv.iter().any(|value| value == resolved_path))
+    );
+    let persisted: Value = serde_json::from_slice(&fs::read(
+        workspace
+            .root
+            .path()
+            .join(format!(".inferlab/records/{id}/record.json")),
+    )?)?;
+    assert_eq!(
+        persisted["resolved"]["server"]["processes"][0]["launch_files"][0],
+        launch_file.clone()
+    );
+
+    workspace.run_json(&["serve", "stop", id])?;
+    Ok(())
+}
+
+#[test]
+fn local_launch_file_conflict_fails_the_record_before_spawn() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let args = [
+        "serve",
+        "start",
+        "dsv4-qualify",
+        "--set",
+        "server.fixture_mode=\"launch-file\"",
+    ];
+    let mut dry_args = args.to_vec();
+    dry_args.push("--dry-run");
+    let dry = workspace.run_json(&dry_args)?;
+    let path = dry["server"]["processes"][0]["launch_files"][0]["resolved_path"]
+        .as_str()
+        .ok_or("resolved launch-file path")?;
+    fs::create_dir_all(Path::new(path).parent().ok_or("launch-file parent")?)?;
+    fs::write(path, "stale\n")?;
+
+    let output = workspace.run(&args)?;
+    assert!(!output.status.success());
+    let records = workspace.root.path().join(".inferlab/records");
+    let entries = fs::read_dir(records)?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(entries.len(), 1);
+    let record: Value = serde_json::from_slice(&fs::read(entries[0].path().join("record.json"))?)?;
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["failure"]["phase"], "launch");
+    assert!(
+        record["failure"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not match declared digest"))
+    );
+    assert!(record["processes"][0]["handle"].is_null());
+    assert_eq!(fs::read_to_string(path)?, "stale\n");
+    Ok(())
+}
+
+#[test]
 fn remote_machine_realizations_run_declared_checks_before_launch() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     workspace.configure_ssh_pair()?;
@@ -374,6 +456,96 @@ fn remote_machine_realizations_run_declared_checks_before_launch() -> Result<(),
     }
 
     workspace.run_json(&["serve", "stop", id])?;
+    Ok(())
+}
+
+#[test]
+fn ssh_launch_materializes_files_before_each_remote_spawn() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_ssh_pair()?;
+
+    let started = workspace.run_json(&[
+        "serve",
+        "start",
+        "dsv4-qualify",
+        "--set",
+        "server.fixture_mode=\"launch-file\"",
+    ])?;
+    let id = started["id"].as_str().ok_or("missing record id")?;
+    let processes = started["resolved"]["server"]["processes"]
+        .as_array()
+        .ok_or("resolved processes")?;
+    assert_eq!(processes.len(), 2);
+    for process in processes {
+        let launch_file = &process["launch_files"][0];
+        let path = launch_file["resolved_path"]
+            .as_str()
+            .ok_or("resolved launch-file path")?;
+        assert_eq!(
+            fs::read_to_string(path)?,
+            launch_file["text"].as_str().ok_or("launch-file text")?
+        );
+    }
+
+    let events = fs::read_to_string(&workspace.ssh_events)?;
+    let lines: Vec<&str> = events.lines().collect();
+    for machine in ["node-a", "node-b"] {
+        let materialize = lines
+            .iter()
+            .position(|line| *line == format!("{machine} materialize"))
+            .ok_or("materialize event")?;
+        let launch = lines
+            .iter()
+            .position(|line| *line == format!("{machine} launch"))
+            .ok_or("launch event")?;
+        assert!(
+            materialize < launch,
+            "machine {machine} must materialize before launch: {events}"
+        );
+    }
+
+    workspace.run_json(&["serve", "stop", id])?;
+    Ok(())
+}
+
+#[test]
+fn ssh_launch_file_conflict_records_failure_without_launching() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_ssh_pair()?;
+    let args = [
+        "serve",
+        "start",
+        "dsv4-qualify",
+        "--set",
+        "server.fixture_mode=\"launch-file\"",
+    ];
+    let mut dry_args = args.to_vec();
+    dry_args.push("--dry-run");
+    let dry = workspace.run_json(&dry_args)?;
+    let path = dry["server"]["processes"][0]["launch_files"][0]["resolved_path"]
+        .as_str()
+        .ok_or("resolved launch-file path")?;
+    fs::create_dir_all(Path::new(path).parent().ok_or("launch-file parent")?)?;
+    fs::write(path, "stale\n")?;
+    fs::write(&workspace.ssh_events, "")?;
+
+    let output = workspace.run(&args)?;
+    assert!(!output.status.success());
+    let records = workspace.root.path().join(".inferlab/records");
+    let entries = fs::read_dir(records)?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(entries.len(), 1);
+    let record: Value = serde_json::from_slice(&fs::read(entries[0].path().join("record.json"))?)?;
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["failure"]["phase"], "launch");
+    assert!(
+        record["processes"]
+            .as_array()
+            .is_some_and(|processes| processes.iter().all(|process| process["handle"].is_null()))
+    );
+    let events = fs::read_to_string(&workspace.ssh_events)?;
+    assert!(events.lines().any(|line| line.ends_with(" materialize")));
+    assert!(!events.lines().any(|line| line.ends_with(" launch")));
+    assert_eq!(fs::read_to_string(path)?, "stale\n");
     Ok(())
 }
 
@@ -794,6 +966,7 @@ if [ "$1" = cat ]; then
 fi
 command="$3"
 case "$command" in
+  *INFERLAB_LAUNCH_FILE*) operation=materialize ;;
   *INFERLAB_PREFLIGHT*) operation=preflight ;;
   *INFERLAB_HANDLE*) operation=launch ;;
   *INFERLAB_CLEANUP*) operation=cleanup ;;
@@ -826,6 +999,7 @@ done
 "#;
 
 const ADAPTER: &str = r#"#!/usr/bin/env python3
+import hashlib
 import json
 import sys
 
@@ -890,15 +1064,29 @@ if operation == "plan_serve":
 elif operation == "render_serve":
     processes = []
     for allocation in input["allocations"]:
+        launch_files = []
         if mode == "launch-failure":
             argv = ["inferlab-missing-fixture-server"]
         else:
+            server_mode = "ready" if mode == "launch-file" else mode
             argv = [
-                "fixture-server", mode,
+                "fixture-server", server_mode,
                 allocation["endpoint"]["host"], str(allocation["endpoint"]["port"]),
             ]
+            if mode == "launch-file":
+                text = "fixture: runtime\nunicode: 雪\n"
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                relative_path = f"launch-files/{digest}/fixture.yaml"
+                resolved_path = f'{allocation["runtime_cache_root"]}/{relative_path}'
+                argv.append(resolved_path)
+                launch_files.append({
+                    "relative_path": relative_path,
+                    "text": text,
+                    "sha256": digest,
+                })
         processes.append({
             "id": allocation["process_id"],
+            "launch_files": launch_files,
             "process": {
                 "argv": argv,
                 "env": {
@@ -916,7 +1104,7 @@ else:
     raise ValueError(operation)
 print(json.dumps({
     "status": "ok",
-    "protocol_version": "3",
+    "protocol_version": "4",
     "result": {"operation": operation, "output": output}
 }))
 "#;

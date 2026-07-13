@@ -1,0 +1,14 @@
+{
+  "kind": "http_target_registry",
+  "target_scheme": "http",
+  "readiness_path": "/readiness",
+  "registry_path": "/workers",
+  "targets_field": "workers",
+  "target_url_field": "url",
+  "target_role_field": "worker_type",
+  "target_healthy_field": "is_healthy",
+  "target_bootstrap_port_field": "bootstrap_port",
+  "prefill_role_value": "prefill",
+  "decode_role_value": "decode",
+  "prefill_bootstrap_port": "bootstrap"
+}

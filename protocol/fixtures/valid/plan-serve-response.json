@@ -1,12 +1,12 @@
 {
   "status": "ok",
-  "protocol_version": "3",
+  "protocol_version": "4",
   "result": {
     "operation": "plan_serve",
     "output": {
       "integration": {
         "adapter_id": "inferlab-vllm",
-        "adapter_version": "0.1.0",
+        "adapter_version": "0.2.0",
         "framework": "vllm"
       },
       "effective_settings": {

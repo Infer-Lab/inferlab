@@ -50,6 +50,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
+# Inferlab owns readiness; the router's internal guard must not expire first.
+_ROUTER_WORKER_STARTUP_TIMEOUT_SECS = 2_147_483_647
+
 _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--block-size": 1,
     "--compilation-config": 1,
@@ -138,9 +141,10 @@ def _adapter_version() -> str:
     try:
         return version("inferlab-integration-vllm")
     except PackageNotFoundError:
-        # Image-backed lowering executes this module from mounted
-        # release-owned sources with no installed distribution metadata;
-        # the adjacent pyproject is the version authority there.
+        # Raw source-tree execution with no installed distribution
+        # metadata: the adjacent pyproject is the version authority.
+        # External-image lowering mounts each package's dist-info beside
+        # its module, so importlib.metadata resolves there instead.
         pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
         with pyproject.open("rb") as handle:
             project_version: str = tomllib.load(handle)["project"]["version"]
@@ -570,6 +574,7 @@ def _render_process(
     argv.extend(merge_serve_args(settings.extra_args or [], inferlab_args, _INFERLAB_OPTION_ARITY))
     return RenderedServeProcess(
         id=allocation.process_id,
+        launch_files=[],
         process=ProcessSpec(argv=argv, env=process_env),
     )
 
@@ -650,6 +655,8 @@ def _render_router(
         allocation.endpoint.host,
         "--port",
         str(allocation.endpoint.port),
+        "--worker-startup-timeout-secs",
+        str(_ROUTER_WORKER_STARTUP_TIMEOUT_SECS),
         "--vllm-pd-disaggregation",
     ]
     if input.kv_transfer is None:
@@ -677,7 +684,11 @@ def _render_router(
             "round_robin",
         ]
     )
-    return RenderedServeProcess(id=allocation.process_id, process=ProcessSpec(argv=argv, env={}))
+    return RenderedServeProcess(
+        id=allocation.process_id,
+        launch_files=[],
+        process=ProcessSpec(argv=argv, env={}),
+    )
 
 
 def render_serve(input: RenderServeInput) -> RenderServeResult:

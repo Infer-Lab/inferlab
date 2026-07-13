@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode="${1:-check}"
-schema="${root}/protocol/schema/adapter-protocol-v3.schema.json"
+schema="${root}/protocol/schema/adapter-protocol-v4.schema.json"
 models="${root}/python/inferlab-adapter-sdk/src/inferlab_adapter_sdk/_generated.py"
 temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
@@ -11,10 +11,10 @@ trap 'rm -rf "${temporary}"' EXIT
 mkdir -p "${temporary}/schema"
 cargo run --quiet --locked --manifest-path "${root}/Cargo.toml" \
   -p inferlab-protocol --example generate_schema -- \
-  "${temporary}/schema/adapter-protocol-v3.schema.json"
+  "${temporary}/schema/adapter-protocol-v4.schema.json"
 
 datamodel-codegen \
-  --input "${temporary}/schema/adapter-protocol-v3.schema.json" \
+  --input "${temporary}/schema/adapter-protocol-v4.schema.json" \
   --input-file-type jsonschema \
   --output "${temporary}/_generated.py" \
   --output-model-type pydantic_v2.BaseModel \
@@ -35,11 +35,11 @@ datamodel-codegen \
 case "${mode}" in
   generate)
     mkdir -p "$(dirname "${schema}")" "$(dirname "${models}")"
-    cp "${temporary}/schema/adapter-protocol-v3.schema.json" "${schema}"
+    cp "${temporary}/schema/adapter-protocol-v4.schema.json" "${schema}"
     cp "${temporary}/_generated.py" "${models}"
     ;;
   check)
-    cmp "${temporary}/schema/adapter-protocol-v3.schema.json" "${schema}"
+    cmp "${temporary}/schema/adapter-protocol-v4.schema.json" "${schema}"
     cmp "${temporary}/_generated.py" "${models}"
     ;;
   *)

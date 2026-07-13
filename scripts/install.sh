@@ -1,10 +1,8 @@
 #!/bin/sh
-# Install the inferlab binary (x86_64 / aarch64 Linux) from GitHub releases,
-# and optionally unpack the agent plugin package next to it.
+# Install the inferlab binary (x86_64 / aarch64 Linux) from GitHub releases.
 #
 # Options:
 #   --bin-dir <path>   Install the binary to this directory (default: ~/.local/bin)
-#   --no-plugin        Skip downloading the agent plugin package
 #   --help             Show this help and exit
 #
 # Environment:
@@ -15,11 +13,10 @@ set -eu
 
 VERSION="${INFERLAB_VERSION:-latest}"
 BIN_DIR="${HOME}/.local/bin"
-WITH_PLUGIN=true
 REPO="Infer-Lab/inferlab"
 
 show_help() {
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -32,10 +29,9 @@ command -v curl > /dev/null 2>&1 || die "curl is required"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --bin-dir)   [ $# -ge 2 ] || die "--bin-dir requires a value"
-                     BIN_DIR="$2"; shift 2 ;;
-        --no-plugin) WITH_PLUGIN=false; shift ;;
-        --help|-h)   show_help ;;
+        --bin-dir) [ $# -ge 2 ] || die "--bin-dir requires a value"
+                   BIN_DIR="$2"; shift 2 ;;
+        --help|-h) show_help ;;
         *) die "unknown option: $1" ;;
     esac
 done
@@ -67,19 +63,10 @@ mkdir -p "$BIN_DIR"
 install -m 0755 "$WORK/$ASSET" "$BIN_DIR/inferlab"
 printf 'installed %s -> %s/inferlab\n' "$ASSET" "$BIN_DIR"
 
-if [ "$WITH_PLUGIN" = true ]; then
-    fetch inferlab-plugin.tar.gz
-    fetch inferlab-plugin.tar.gz.sha256
-    (cd "$WORK" && sha256sum -c inferlab-plugin.tar.gz.sha256 >/dev/null) \
-        || die "checksum mismatch for inferlab-plugin.tar.gz"
-    PLUGIN_DIR="${HOME}/.local/share/inferlab/plugin"
-    rm -rf "$PLUGIN_DIR"
-    mkdir -p "$PLUGIN_DIR"
-    tar -xzf "$WORK/inferlab-plugin.tar.gz" -C "$PLUGIN_DIR"
-    printf 'plugin package -> %s\n' "$PLUGIN_DIR"
-    printf 'next: %s/inferlab agent install --agent all --from-checkout %s\n' \
-        "$BIN_DIR" "$PLUGIN_DIR"
-fi
+# The freshly-installed binary carries the agent plugin package itself
+# (RFC-0008:C-AGENT-PLUGIN): no separate download or unpack step is needed
+# to install it.
+printf 'next: %s/inferlab agent install --agent all\n' "$BIN_DIR"
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

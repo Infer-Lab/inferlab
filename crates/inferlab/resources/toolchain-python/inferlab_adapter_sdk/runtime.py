@@ -35,7 +35,7 @@ type RenderServeHandler = Callable[[RenderServeInput], RenderServeResult]
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, object]
 
-PROTOCOL_V3 = ProtocolVersion()
+PROTOCOL_V4 = ProtocolVersion()
 
 
 def plain_setting(value: SettingValue) -> JsonValue:
@@ -118,13 +118,13 @@ class AdapterOperationError(Exception):
 def error_response(code: AdapterErrorCode, message: str) -> AdapterResponse:
     return AdapterResponse(
         root=AdapterResponseError(
-            protocol_version=PROTOCOL_V3,
+            protocol_version=PROTOCOL_V4,
             error=AdapterError(code=code, message=message),
         )
     )
 
 
-SUPPORTED_PROTOCOL_VERSION = "3"
+SUPPORTED_PROTOCOL_VERSION = "4"
 
 
 def handle_request(
@@ -175,7 +175,7 @@ def handle_request(
 
     return AdapterResponse(
         root=AdapterResponseOk(
-            protocol_version=PROTOCOL_V3,
+            protocol_version=PROTOCOL_V4,
             result=AdapterResult(root=result),
         )
     )

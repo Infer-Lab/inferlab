@@ -10,14 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// The adapter protocol version an integration speaks. The only accepted value
-/// is `3` (serialized as the string `"3"`); a mismatch is rejected before
-/// lowering.
+/// The shared protocol version used by framework integrations and release-owned
+/// measurement clients. The only accepted value is `4` (serialized as the
+/// string `"4"`); a mismatch is rejected before lowering.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum ProtocolVersion {
-    /// Protocol version 3.
-    #[serde(rename = "3")]
-    V3,
+    /// Protocol version 4.
+    #[serde(rename = "4")]
+    V4,
 }
 
 /// The one JSON request an integration reads from stdin, tagged by the
@@ -85,6 +85,8 @@ pub struct RenderServeInput {
     pub roles: Vec<ServeRoleResult>,
     pub links: Vec<ServeRoleLink>,
     pub allocations: Vec<ServeProcessAllocation>,
+    #[serde(default)]
+    pub render_inputs: Vec<SuppliedRenderInput>,
     #[serde(default)]
     pub profiling: bool,
 }
@@ -400,6 +402,26 @@ pub struct PlanServeResult {
     pub links: Vec<ServeRoleLink>,
     pub public_endpoint: PublicEndpointRequirement,
     pub endpoint: EndpointRequirement,
+    #[serde(default)]
+    pub render_inputs: Vec<RenderInputDeclaration>,
+}
+
+/// One workspace-authored UTF-8 source file an integration declares during
+/// planning for the control plane to supply during final rendering.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderInputDeclaration {
+    pub source_path: String,
+}
+
+/// The original declared path plus the exact UTF-8 contents and digest the
+/// control plane supplies to an integration during final rendering.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuppliedRenderInput {
+    pub source_path: String,
+    pub text: String,
+    pub sha256: String,
 }
 
 /// A whole-replica resource and readiness requirement the integration declares
@@ -515,7 +537,17 @@ pub struct RenderServeResult {
 #[serde(deny_unknown_fields)]
 pub struct RenderedServeProcess {
     pub id: String,
+    pub launch_files: Vec<LaunchFileDeclaration>,
     pub process: ProcessSpec,
+}
+
+/// One immutable text input a rendered process requires before it can launch.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchFileDeclaration {
+    pub relative_path: String,
+    pub text: String,
+    pub sha256: String,
 }
 
 /// An HTTP action (method and path) invoked against the workload endpoint.
@@ -558,8 +590,38 @@ pub struct ProcessSpec {
 pub enum ReadinessProbe {
     /// Ready when an HTTP GET of `path` succeeds.
     Http { path: String },
+    /// Ready when the public endpoint succeeds and its HTTP target registry
+    /// contains every control-plane-derived serving target.
+    HttpTargetRegistry(Box<HttpTargetRegistryReadiness>),
     /// Ready as soon as the process is alive.
     ProcessAlive,
+}
+
+/// The integration-owned HTTP registry contract for target-aware readiness.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpTargetRegistryReadiness {
+    pub target_scheme: TargetEndpointScheme,
+    pub readiness_path: String,
+    pub registry_path: String,
+    pub targets_field: String,
+    pub target_url_field: String,
+    pub target_role_field: String,
+    pub target_healthy_field: String,
+    pub target_bootstrap_port_field: String,
+    pub prefill_role_value: String,
+    pub decode_role_value: String,
+    pub prefill_bootstrap_port: String,
+}
+
+/// The application protocol used to identify serving targets in a registry.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetEndpointScheme {
+    /// HTTP serving endpoint.
+    Http,
+    /// gRPC serving endpoint.
+    Grpc,
 }
 
 /// The workload endpoint's protocol and API path, plus an optional

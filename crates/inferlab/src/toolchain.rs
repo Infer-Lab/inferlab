@@ -135,11 +135,7 @@ pub fn install() -> Result<InstallReport, InferlabError> {
     }
 
     if path.exists() {
-        fs::remove_dir_all(&path).map_err(|source| InferlabError::ToolchainIo {
-            operation: "remove incomplete",
-            path: path.clone(),
-            source,
-        })?;
+        fs::remove_dir_all(&path).map_err(|source| removal_error(&path, source))?;
     }
     write_release_files(&path)?;
     install_locked(&path)?;
@@ -588,4 +584,117 @@ fn eval_runner_path(path: &Path) -> PathBuf {
 
 fn bench_runner_path(path: &Path) -> PathBuf {
     path.join("runner/inferlab_bench_runner/bench_client.py")
+}
+
+/// A replacement blocked by live holders identifies the holding processes
+/// ([[RFC-0004:C-INFERLAB-TOOLCHAIN]]): the failure is otherwise
+/// undiagnosable on network filesystems, where open handles turn removals
+/// into silly-rename residue and the path stays busy until the holders
+/// exit.
+fn removal_error(path: &Path, source: std::io::Error) -> InferlabError {
+    let holders = holding_processes(path);
+    if holders.is_empty() {
+        return InferlabError::ToolchainIo {
+            operation: "remove incomplete",
+            path: path.to_path_buf(),
+            source,
+        };
+    }
+    InferlabError::ToolchainHeld {
+        path: path.to_path_buf(),
+        holders: holders.join(", "),
+        source,
+    }
+}
+
+/// Same-user processes holding the path: executable, working directory,
+/// open file descriptors, or mapped files under it. Unreadable /proc
+/// entries (other users' processes) are skipped.
+fn holding_processes(path: &Path) -> Vec<String> {
+    const HOLDER_LIMIT: usize = 8;
+    let prefix = path.to_string_lossy().into_owned();
+    let mut holders = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return holders;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let proc_dir = entry.path();
+        if !process_holds_path(&proc_dir, &prefix) {
+            continue;
+        }
+        let comm = fs::read_to_string(proc_dir.join("comm")).unwrap_or_default();
+        holders.push(format!("{pid} ({})", comm.trim()));
+        if holders.len() >= HOLDER_LIMIT {
+            holders.push("and possibly more".to_owned());
+            break;
+        }
+    }
+    holders
+}
+
+fn process_holds_path(proc_dir: &Path, prefix: &str) -> bool {
+    let link_holds = |name: &str| {
+        fs::read_link(proc_dir.join(name))
+            .map(|target| target.to_string_lossy().starts_with(prefix))
+            .unwrap_or(false)
+    };
+    if link_holds("exe") || link_holds("cwd") {
+        return true;
+    }
+    if let Ok(fds) = fs::read_dir(proc_dir.join("fd")) {
+        for fd in fds.flatten() {
+            if fs::read_link(fd.path())
+                .map(|target| target.to_string_lossy().starts_with(prefix))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    fs::read_to_string(proc_dir.join("maps"))
+        .map(|maps| maps.contains(prefix))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::holding_processes;
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn holders_are_named_by_pid_and_comm() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("inferlab-holders-{}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let pid = child.id();
+        let holders = holding_processes(&dir);
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+        if !holders.iter().any(|h| h.starts_with(&format!("{pid} "))) {
+            return Err(format!(
+                "holder scan missed pid {pid} with cwd under the path: {holders:?}"
+            ));
+        }
+        Ok(())
+    }
 }

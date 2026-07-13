@@ -95,6 +95,8 @@ environments:
       - pypi: ./python/inferlab-bench-runner
       - pypi: ./python/inferlab-eval-runner
       - pypi: ./python/inferlab-integration-sglang
+      - pypi: ./python/inferlab-integration-tensorrt-llm
+      - pypi: ./python/inferlab-integration-tokenspeed
       - pypi: ./python/inferlab-integration-vllm
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -1228,20 +1230,31 @@ packages:
 - pypi: ./python/inferlab-bench-runner
   name: inferlab-bench-runner
   requires_dist:
-  - inferlab-adapter-sdk==0.1.0
+  - inferlab-adapter-sdk==0.2.0
   requires_python: '>=3.12'
 - pypi: ./python/inferlab-eval-runner
   name: inferlab-eval-runner
   requires_dist:
-  - inferlab-adapter-sdk==0.1.0
+  - inferlab-adapter-sdk==0.2.0
   requires_python: '>=3.12'
 - pypi: ./python/inferlab-integration-sglang
   name: inferlab-integration-sglang
   requires_dist:
-  - inferlab-adapter-sdk==0.1.0
+  - inferlab-adapter-sdk==0.2.0
+  requires_python: '>=3.12'
+- pypi: ./python/inferlab-integration-tensorrt-llm
+  name: inferlab-integration-tensorrt-llm
+  requires_dist:
+  - inferlab-adapter-sdk==0.2.0
+  - pyyaml>=6,<7
+  requires_python: '>=3.12'
+- pypi: ./python/inferlab-integration-tokenspeed
+  name: inferlab-integration-tokenspeed
+  requires_dist:
+  - inferlab-adapter-sdk==0.2.0
   requires_python: '>=3.12'
 - pypi: ./python/inferlab-integration-vllm
   name: inferlab-integration-vllm
   requires_dist:
-  - inferlab-adapter-sdk==0.1.0
+  - inferlab-adapter-sdk==0.2.0
   requires_python: '>=3.12'

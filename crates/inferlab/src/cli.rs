@@ -7,7 +7,7 @@ use crate::resolve::{ResolveRequest, Workflow, resolve};
 use crate::server;
 use crate::toolchain;
 use crate::workload::{self, WorkloadStatus};
-use crate::workspace::{discover_workspace, load_workspace};
+use crate::workspace::{discover_workspace, load_workspace, load_workspace_config};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::io::Write;
@@ -48,6 +48,8 @@ enum Command {
     Recipe(RecipeCommand),
     /// Run one named Bench against an explicit managed server.
     Bench(BenchArgs),
+    /// Execute one command inside a selected serving-environment realization.
+    Run(RunArgs),
     /// Produce and validate runtime images from the workspace.
     #[command(subcommand)]
     Image(ImageCommand),
@@ -66,7 +68,8 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
-    /// Install the plugin from a local checkout or unpacked release tarball.
+    /// Install the plugin. Defaults to the package embedded in this binary;
+    /// `--from-checkout` overrides the source.
     Install(AgentInstallArgs),
     /// Update the installed plugin through its marketplace.
     Update(AgentSelectArgs),
@@ -82,33 +85,18 @@ struct AgentInstallArgs {
     select: AgentSelectArgs,
 
     /// Repository checkout or unpacked release tarball carrying the plugin
-    /// package.
+    /// package. Overrides the package embedded in this binary when given;
+    /// omitting it installs the embedded package, which needs no path and
+    /// no network access.
     #[arg(long, value_name = "DIR")]
-    from_checkout: PathBuf,
+    from_checkout: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct AgentSelectArgs {
     /// Agent runtime to operate on.
-    #[arg(long, value_enum, default_value_t = AgentRuntimeArg::All)]
-    agent: AgentRuntimeArg,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum AgentRuntimeArg {
-    Claude,
-    Codex,
-    All,
-}
-
-impl From<AgentRuntimeArg> for crate::agent::AgentSelector {
-    fn from(value: AgentRuntimeArg) -> Self {
-        match value {
-            AgentRuntimeArg::Claude => Self::Claude,
-            AgentRuntimeArg::Codex => Self::Codex,
-            AgentRuntimeArg::All => Self::All,
-        }
-    }
+    #[arg(long, value_enum, default_value_t = crate::agent::AgentSelector::All)]
+    agent: crate::agent::AgentSelector,
 }
 
 #[derive(Debug, Subcommand)]
@@ -200,6 +188,10 @@ enum InternalProxyCommand {
     /// Run the vLLM NIXL proxy.
     #[command(name = "vllm-nixl")]
     VllmNixl(VllmNixlProxyArgs),
+    /// Run the SGLang prefill/decode proxy.
+    Sglang(SglangProxyArgs),
+    /// Run the TensorRT-LLM prefill/decode proxy.
+    Trtllm(TrtllmProxyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -226,10 +218,44 @@ struct VllmNixlProxyArgs {
     decode: Vec<String>,
 }
 
+#[derive(Debug, Args)]
+struct SglangProxyArgs {
+    #[arg(long)]
+    host: String,
+    #[arg(long)]
+    port: u16,
+    #[arg(long, num_args = 3, action = clap::ArgAction::Append)]
+    prefill: Vec<String>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    decode: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct TrtllmProxyArgs {
+    #[arg(long)]
+    host: String,
+    #[arg(long)]
+    port: u16,
+    #[arg(long, action = clap::ArgAction::Append)]
+    prefill: Vec<String>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    decode: Vec<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum EnvCommand {
     /// Produce the committed Pixi lock from a clean local prefix.
     Lock,
+    /// Report whether declared serving environments are confirmed usable.
+    Status(EnvStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct EnvStatusArgs {
+    /// Report on this declared environment only. Omit to report on every
+    /// declared environment.
+    #[arg(long)]
+    environment: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -295,6 +321,43 @@ struct RecipeRunArgs {
     capture: Vec<String>,
 }
 
+/// Ad-hoc execution ([[RFC-0002:C-ADHOC-EXECUTION]]). The argument shape
+/// carries the clause's selection rules: the two image forms are one
+/// exclusive group, an explicit environment belongs to the local realization
+/// only, and mounts and GPU selections exist only where a container does.
+#[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("container-image").args(["image", "external_image"]))]
+struct RunArgs {
+    /// Workspace environment to activate. Defaults to the single declared
+    /// environment; required when the workspace declares more than one.
+    #[arg(long, value_name = "ENVIRONMENT", conflicts_with = "container-image")]
+    environment: Option<String>,
+
+    /// Execute inside this image build record's host-platform assembled
+    /// image instead of the locally installed environment.
+    #[arg(long, value_name = "IMAGE_BUILD_RECORD")]
+    image: Option<String>,
+
+    /// Execute inside this declared external serving image — a digest-pinned
+    /// image this workspace did not build and does not qualify.
+    #[arg(long, value_name = "EXTERNAL_IMAGE")]
+    external_image: Option<String>,
+
+    /// Bind an absolute host path at the same path inside the container,
+    /// read-only; append `:rw` to write. May be repeated.
+    #[arg(long = "mount", value_name = "PATH[:rw]", requires = "container-image")]
+    mounts: Vec<String>,
+
+    /// Host GPU devices to expose to the container: an index or a
+    /// comma-joined list. Without it the container requests no GPUs.
+    #[arg(long, value_name = "INDEX[,INDEX...]", requires = "container-image")]
+    gpus: Option<String>,
+
+    /// Command to execute.
+    #[arg(last = true, required = true, value_name = "CMD")]
+    command: Vec<String>,
+}
+
 #[derive(Debug, Args)]
 struct RecordArgs {
     /// Managed server record identifier returned by `serve start`.
@@ -334,6 +397,7 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
             let root = discover_workspace(workspace.as_deref())?;
             write_json(&environment::lock_workspace(&root)?)
         }
+        Command::Env(EnvCommand::Status(args)) => run_env_status(workspace, args),
         Command::Toolchain(ToolchainCommand::Install) => write_json(&toolchain::install()?),
         Command::Serve(ServeCommand::Start(selection)) => {
             run_selection(workspace, local, Workflow::ServeStart, selection, &[])
@@ -358,6 +422,25 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
             &args.capture,
         ),
         Command::Bench(args) => run_bench_command(workspace, local, args),
+        Command::Run(args) => {
+            let root = discover_workspace(workspace.as_deref())?;
+            let loaded = load_workspace(root, local.as_deref())?;
+            let code = crate::adhoc::execute(
+                &loaded,
+                &crate::adhoc::AdHocRequest {
+                    environment: args.environment.as_deref(),
+                    image: args.image.as_deref(),
+                    external_image: args.external_image.as_deref(),
+                    mounts: &args.mounts,
+                    gpus: args.gpus.as_deref(),
+                    command: &args.command,
+                },
+            )?;
+            // The command's status is the operation's status
+            // ([[RFC-0002:C-ADHOC-EXECUTION]]): a nonzero exit here is the
+            // command's own report, never an Inferlab diagnostic.
+            std::process::exit(code);
+        }
         Command::Image(ImageCommand::Build(args)) => run_image_build(workspace, local, args),
         Command::Scratchpad(command) => {
             let root = discover_workspace(workspace.as_deref())?;
@@ -379,11 +462,11 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
         Command::Agent(command) => {
             let report = match command {
                 AgentCommand::Install(args) => {
-                    crate::agent::install(args.select.agent.into(), &args.from_checkout)
+                    crate::agent::install(args.select.agent, args.from_checkout.as_deref())
                 }
-                AgentCommand::Update(args) => crate::agent::update(args.agent.into()),
-                AgentCommand::Uninstall(args) => crate::agent::uninstall(args.agent.into()),
-                AgentCommand::Doctor(args) => crate::agent::doctor(args.agent.into()),
+                AgentCommand::Update(args) => crate::agent::update(args.agent),
+                AgentCommand::Uninstall(args) => crate::agent::uninstall(args.agent),
+                AgentCommand::Doctor(args) => crate::agent::doctor(args.agent),
             };
             // Exactly one report per operation, whatever failed — validation,
             // preflight, or a native CLI mid-way; the commands that ran are
@@ -408,6 +491,44 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
             Ok(())
         }
         Command::Internal(args) => run_internal(args),
+    }
+}
+
+fn run_env_status(
+    workspace_path: Option<PathBuf>,
+    args: EnvStatusArgs,
+) -> Result<(), InferlabError> {
+    let root = discover_workspace(workspace_path.as_deref())?;
+    let config = load_workspace_config(&root)?;
+    let selected: Vec<(String, String)> = match args.environment.as_deref() {
+        Some(id) => {
+            let definition =
+                config
+                    .environments
+                    .get(id)
+                    .ok_or_else(|| InferlabError::InvalidConfig {
+                        message: format!(
+                            "unknown environment {id:?}; the workspace declares {:?}",
+                            config.environments.keys().collect::<Vec<_>>()
+                        ),
+                    })?;
+            vec![(id.to_owned(), definition.pixi_environment.clone())]
+        }
+        None => config
+            .environments
+            .iter()
+            .map(|(id, definition)| (id.clone(), definition.pixi_environment.clone()))
+            .collect(),
+    };
+    let reports = environment::status(&root, &selected)?;
+    let unconfirmed = reports
+        .iter()
+        .any(|report| report.status != environment::EnvironmentStatusKind::Confirmed);
+    write_json(&reports)?;
+    if unconfirmed {
+        Err(InferlabError::EnvironmentStatusUnconfirmed)
+    } else {
+        Ok(())
     }
 }
 
@@ -464,6 +585,24 @@ fn run_internal(args: InternalArgs) -> Result<(), InferlabError> {
                 })?;
                 Ok(())
             }
+            InternalProxyCommand::Sglang(args) => {
+                inferlab_proxy::sglang::run(inferlab_proxy::sglang::Config {
+                    host: args.host,
+                    port: args.port,
+                    prefill: sglang_prefill_targets(&args.prefill)?,
+                    decode: args.decode,
+                })?;
+                Ok(())
+            }
+            InternalProxyCommand::Trtllm(args) => {
+                inferlab_proxy::trtllm::run(inferlab_proxy::trtllm::Config {
+                    host: args.host,
+                    port: args.port,
+                    prefill: args.prefill,
+                    decode: args.decode,
+                })?;
+                Ok(())
+            }
         },
     }
 }
@@ -484,6 +623,34 @@ fn mooncake_prefill_targets(
             bootstrap_url: values[1].clone(),
         })
         .collect())
+}
+
+fn sglang_prefill_targets(
+    values: &[String],
+) -> Result<Vec<inferlab_proxy::sglang::PrefillTarget>, InferlabError> {
+    if values.is_empty() || !values.len().is_multiple_of(3) {
+        return Err(InferlabError::InvalidConfig {
+            message:
+                "SGLang proxy requires repeated --prefill URL BOOTSTRAP_HOST BOOTSTRAP_PORT triples"
+                    .to_owned(),
+        });
+    }
+    values
+        .chunks_exact(3)
+        .map(|values| {
+            let bootstrap_port =
+                values[2]
+                    .parse::<u16>()
+                    .map_err(|error| InferlabError::InvalidConfig {
+                        message: format!("invalid SGLang bootstrap port {:?}: {error}", values[2]),
+                    })?;
+            Ok(inferlab_proxy::sglang::PrefillTarget {
+                url: values[0].clone(),
+                bootstrap_host: values[1].clone(),
+                bootstrap_port,
+            })
+        })
+        .collect()
 }
 
 fn run_bench_command(
