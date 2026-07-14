@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 /// The workspace must provide a runnable vLLM recipe, locked Pixi environment,
 /// integration package, model-weight binding, and local machine binding.
 #[test]
-#[ignore = "requires a real vLLM workspace, model weights, and accelerator"]
+#[ignore = "requires a real vLLM workspace, model weights, and devices"]
 fn manual_vllm_single_role_start_status_stop_record() -> Result<(), Box<dyn Error>> {
     let workspace = PathBuf::from(std::env::var("INFERLAB_E2E_WORKSPACE")?);
     let recipe = std::env::var("INFERLAB_E2E_RECIPE").unwrap_or_else(|_| "dsv4-qualify".to_owned());
@@ -57,7 +57,7 @@ fn manual_vllm_single_role_start_status_stop_record() -> Result<(), Box<dyn Erro
 /// Runs the complete closed-loop qualification and verifies that the aggregate
 /// remains sufficient to locate each native result after the server is gone.
 #[test]
-#[ignore = "requires a real vLLM workspace, model weights, and accelerator"]
+#[ignore = "requires a real vLLM workspace, model weights, and devices"]
 fn manual_vllm_recipe_eval_bench_cleanup() -> Result<(), Box<dyn Error>> {
     let workspace = PathBuf::from(std::env::var("INFERLAB_E2E_WORKSPACE")?);
     let recipe = std::env::var("INFERLAB_E2E_RECIPE").unwrap_or_else(|_| "dsv4-qualify".to_owned());
@@ -129,7 +129,7 @@ fn manual_vllm_recipe_eval_bench_cleanup() -> Result<(), Box<dyn Error>> {
 ///
 /// `INFERLAB_E2E_WORKSPACE=/path/to/workspace INFERLAB_E2E_LOCAL=/path/to/local.toml cargo test -p inferlab --test manual_vllm manual_vllm_two_node_start_logs_stop_record -- --ignored --nocapture`
 #[test]
-#[ignore = "requires two accelerator hosts, a shared checkout, model weights, and vLLM"]
+#[ignore = "requires two device hosts, a shared checkout, model weights, and vLLM"]
 fn manual_vllm_two_node_start_logs_stop_record() -> Result<(), Box<dyn Error>> {
     let workspace = PathBuf::from(std::env::var("INFERLAB_E2E_WORKSPACE")?);
     let local = PathBuf::from(std::env::var("INFERLAB_E2E_LOCAL")?);
@@ -143,9 +143,9 @@ fn manual_vllm_two_node_start_logs_stop_record() -> Result<(), Box<dyn Error>> {
             "start",
             &recipe,
             "--set",
-            "server.extra_env.NCCL_DEBUG=\"INFO\"",
+            "server.settings.extra_env.NCCL_DEBUG=\"INFO\"",
             "--set",
-            "server.extra_env.NCCL_DEBUG_SUBSYS=\"INIT,NET\"",
+            "server.settings.extra_env.NCCL_DEBUG_SUBSYS=\"INIT,NET\"",
         ],
     )?;
     let id = started["id"]
@@ -249,7 +249,7 @@ fn manual_vllm_two_node_start_logs_stop_record() -> Result<(), Box<dyn Error>> {
 ///
 /// `INFERLAB_E2E_WORKSPACE=/path/to/workspace INFERLAB_E2E_LOCAL=/path/to/local.toml INFERLAB_E2E_PD_RECIPE=recipe INFERLAB_E2E_PD_MOONCAKE_CASE=case INFERLAB_E2E_BENCH=bench cargo test -p inferlab --test manual_vllm manual_vllm_mooncake_pd_profiled_bench -- --ignored --nocapture`
 #[test]
-#[ignore = "requires a real multi-role vLLM Mooncake workspace, Nsight Systems, and accelerators"]
+#[ignore = "requires a real multi-role vLLM Mooncake workspace, Nsight Systems, and devices"]
 fn manual_vllm_mooncake_pd_profiled_bench() -> Result<(), Box<dyn Error>> {
     manual_vllm_pd_profiled_bench("mooncake", "INFERLAB_E2E_PD_MOONCAKE_CASE")
 }
@@ -258,7 +258,7 @@ fn manual_vllm_mooncake_pd_profiled_bench() -> Result<(), Box<dyn Error>> {
 /// variables match the Mooncake command above, replacing the case variable with
 /// `INFERLAB_E2E_PD_NIXL_CASE`.
 #[test]
-#[ignore = "requires a real multi-role vLLM NIXL workspace, Nsight Systems, and accelerators"]
+#[ignore = "requires a real multi-role vLLM NIXL workspace, Nsight Systems, and devices"]
 fn manual_vllm_nixl_pd_profiled_bench() -> Result<(), Box<dyn Error>> {
     manual_vllm_pd_profiled_bench("nixl", "INFERLAB_E2E_PD_NIXL_CASE")
 }
@@ -350,7 +350,7 @@ fn manual_vllm_pd_profiled_bench(
 /// `INFERLAB_E2E_WORKSPACE=/path/to/workspace INFERLAB_E2E_IMAGE=<image-id> \
 ///  cargo test -p inferlab --test manual_vllm -- --ignored manual_image --nocapture`
 #[test]
-#[ignore = "requires a real vLLM workspace, model weights, a local Docker daemon, and an accelerator"]
+#[ignore = "requires a real vLLM workspace, model weights, a local Docker daemon, and devices"]
 fn manual_image_build_validates_one_runtime_image() -> Result<(), Box<dyn Error>> {
     let workspace = PathBuf::from(std::env::var("INFERLAB_E2E_WORKSPACE")?);
     let image = std::env::var("INFERLAB_E2E_IMAGE")?;

@@ -19,7 +19,7 @@ from inferlab_eval_runner.eval_client import (
 def lm_eval_request(tmp_path: Path) -> EvalClientRequest:
     return EvalClientRequest.model_validate(
         {
-            "protocol_version": "4",
+            "protocol_version": "5",
             "endpoint": {
                 "protocol": "http",
                 "host": "127.0.0.1",
@@ -49,7 +49,7 @@ def lm_eval_request(tmp_path: Path) -> EvalClientRequest:
 def openai_smoke_request(tmp_path: Path) -> EvalClientRequest:
     return EvalClientRequest.model_validate(
         {
-            "protocol_version": "4",
+            "protocol_version": "5",
             "endpoint": {
                 "protocol": "http",
                 "host": "127.0.0.1",

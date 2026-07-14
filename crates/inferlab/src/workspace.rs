@@ -1,5 +1,5 @@
 use crate::InferlabError;
-use inferlab_protocol::{KvTransferMechanism, Parallelism, ServeRoleKind, ServeTopology};
+use inferlab_protocol::{KvTransferMechanism, Parallelism, ServeTopology};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,11 +25,9 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub models: BTreeMap<String, ModelDefinition>,
     #[serde(default)]
-    pub serve_profiles: BTreeMap<String, ServeProfileDefinition>,
+    pub stacks: BTreeMap<String, StackDefinition>,
     #[serde(default)]
-    pub source_sets: BTreeMap<String, SourceSetDefinition>,
-    #[serde(default)]
-    pub environments: BTreeMap<String, EnvironmentDefinition>,
+    pub servers: BTreeMap<String, ServerDefinition>,
     #[serde(default)]
     pub evals: BTreeMap<String, EvalDefinition>,
     #[serde(default)]
@@ -59,11 +57,9 @@ struct WorkspaceFragment {
     #[serde(default)]
     models: BTreeMap<String, ModelDefinition>,
     #[serde(default)]
-    serve_profiles: BTreeMap<String, ServeProfileDefinition>,
+    stacks: BTreeMap<String, StackDefinition>,
     #[serde(default)]
-    source_sets: BTreeMap<String, SourceSetDefinition>,
-    #[serde(default)]
-    environments: BTreeMap<String, EnvironmentDefinition>,
+    servers: BTreeMap<String, ServerDefinition>,
     #[serde(default)]
     evals: BTreeMap<String, EvalDefinition>,
     #[serde(default)]
@@ -93,17 +89,16 @@ pub struct ExternalImageDefinition {
 }
 
 /// A named runtime-image production unit ([[RFC-0007:C-IMAGE-BUILD]]): the
-/// serving environment selection, base image, target platform batch, and
+/// stack selection, base image, target platform batch, and
 /// recipe-referenced model validation coordinates.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageDefinition {
-    pub environment: String,
-    pub source_set: String,
+    pub stack: String,
     pub base_image: String,
     pub platforms: Vec<String>,
-    /// Source-set paths built into wheels for the image. Omit to build every
-    /// source-set path. Paths consumed only at wheel-build time through the
+    /// Stack source paths built into wheels for the image. Omit to build every
+    /// stack source path. Paths consumed only at wheel-build time through the
     /// activation environment (for example DeepGEMM, compiled into the vLLM
     /// wheel) are excluded by declaring the subset.
     #[serde(default)]
@@ -117,36 +112,47 @@ pub struct ImageDefinition {
 pub struct ImageValidationCoordinate {
     pub recipe: String,
     #[serde(default)]
-    pub case: Option<String>,
+    pub server_case: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDefinition {
-    pub weight: String,
-    #[serde(default)]
-    pub served_name: Option<String>,
+    pub served_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ServeProfileDefinition {
+pub struct StackDefinition {
     pub integration: String,
+    pub pixi_environment: String,
+    #[serde(default)]
+    pub source_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<EnvironmentCheckDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_postprocess: Vec<EnvironmentScriptDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerDefinition {
+    pub stack: String,
+    pub model: String,
+    pub topology: ServeTopology,
     pub readiness_timeout_seconds: u64,
     /// Response deadline for framework window-control actions
     /// ([[RFC-0004:C-WORKLOAD-PROFILING]]); the readiness timeout does not
     /// apply to capture-armed serving, but control actions still need a
     /// bound because a lost window start silently shifts range identities.
-    #[serde(default = "default_capture_control_deadline")]
-    pub capture_control_deadline_seconds: u64,
-    #[serde(default = "default_serve_topology")]
-    pub topology: ServeTopology,
-    #[serde(default = "default_routing_backend")]
-    pub routing_backend: String,
+    #[serde(default)]
+    pub capture_control_deadline_seconds: Option<u64>,
+    #[serde(default)]
+    pub routing_backend: Option<String>,
     #[serde(default)]
     pub kv_transfer: Option<KvTransferMechanism>,
     #[serde(default)]
-    pub profiling: bool,
+    pub profiling: Option<bool>,
     /// Operator escape inputs onto the managed profiler commands
     /// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
     #[serde(default, skip_serializing_if = "ProfilerEscapes::is_empty")]
@@ -157,29 +163,22 @@ pub struct ServeProfileDefinition {
     pub settings: BTreeMap<String, toml::Value>,
     #[serde(default)]
     pub roles: BTreeMap<String, ServeRoleDefinition>,
+    #[serde(default)]
+    pub cases: BTreeMap<String, ServerCaseDefinition>,
+    #[serde(default)]
+    pub default_case: Option<String>,
 }
 
-const fn default_serve_topology() -> ServeTopology {
-    ServeTopology::Single
-}
-
-const fn default_capture_control_deadline() -> u64 {
-    60
-}
-
-fn default_routing_backend() -> String {
-    "builtin".to_owned()
-}
+pub(crate) const DEFAULT_CAPTURE_CONTROL_DEADLINE_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeRoleDefinition {
-    pub kind: ServeRoleKind,
-    #[serde(default = "default_replica_count")]
-    pub replicas: u32,
+    #[serde(default)]
+    pub replicas: Option<u32>,
     #[serde(default)]
     pub parallelism: Parallelism,
-    /// Role escapes merge into the profile's
+    /// Role escapes merge into the server's common inputs
     /// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
     #[serde(default, skip_serializing_if = "ProfilerEscapes::is_empty")]
     pub profiler: ProfilerEscapes,
@@ -206,11 +205,14 @@ impl ProfilerEscapes {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NsysEscapes {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub executable: Option<String>,
     pub launch_options: Vec<String>,
     pub start_options: Vec<String>,
     pub trace: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_switch: Option<String>,
     pub env: BTreeMap<String, String>,
 }
@@ -220,8 +222,8 @@ impl NsysEscapes {
         self == &Self::default()
     }
 
-    /// Role escapes merge into profile escapes: scalars replace, option
-    /// lists concatenate with the role's after the profile's, the trace set
+    /// Role escapes merge into common server escapes: scalars replace, option
+    /// lists concatenate with the role's after the common values, the trace set
     /// replaces, and environment entries merge with the role value winning
     /// ([[RFC-0004:C-WORKLOAD-PROFILING]]).
     pub fn merged_with(&self, role: &Self) -> Self {
@@ -258,31 +260,6 @@ pub struct ServeRoleOverride {
     pub settings: BTreeMap<String, toml::Value>,
 }
 
-const fn default_replica_count() -> u32 {
-    1
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceSetDefinition {
-    pub paths: Vec<PathBuf>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct EnvironmentDefinition {
-    pub pixi_environment: String,
-    /// Read-only realization checks ([[RFC-0002:C-ENVIRONMENT-CHECKS]]): one
-    /// declared set serves the local workspace, image builds, and the
-    /// in-image gate.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<EnvironmentCheckDefinition>,
-    /// Deterministic finishing steps of the image realization only; never
-    /// executed against the local workspace environment.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub image_postprocess: Vec<EnvironmentScriptDefinition>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentCheckDefinition {
@@ -314,19 +291,19 @@ pub enum EvalDefinition {
     },
     LmEval {
         task: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         dataset: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         split: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         few_shot: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<u64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         max_tokens: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         concurrency: Option<u32>,
         metric: String,
         threshold: f64,
@@ -346,15 +323,15 @@ pub enum BenchDefinition {
         temperature: f64,
         #[serde(default)]
         concurrency: Vec<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prompts_per_concurrency: Option<u32>,
         #[serde(default)]
         request_rates: Vec<RequestRate>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         request_count: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_seconds: Option<u64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         burstiness: Option<f64>,
         #[serde(default)]
         reset_prefix_cache: bool,
@@ -372,13 +349,13 @@ pub enum BenchDefinition {
         target_threshold: f64,
         #[serde(default = "default_max_refinement_steps")]
         max_refinement_steps: u32,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         min_rate_resolution: Option<f64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         request_count: Option<u32>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_seconds: Option<u64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         burstiness: Option<f64>,
         #[serde(default)]
         reset_prefix_cache: bool,
@@ -481,40 +458,32 @@ pub struct WorkloadSuiteDefinition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeDefinition {
-    pub model: String,
-    pub serve_profile: String,
-    pub source_set: String,
-    pub environment: String,
+    pub server: String,
     pub workload_suite: String,
-    pub cases: Vec<RecipeCase>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecipeCase {
-    pub id: String,
-    #[serde(default)]
-    pub topology: Option<ServeTopology>,
-    #[serde(default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerCaseDefinition {
+    pub readiness_timeout_seconds: Option<u64>,
     pub routing_backend: Option<String>,
-    #[serde(default)]
     pub kv_transfer: Option<KvTransferMechanism>,
-    #[serde(default)]
     pub profiling: Option<bool>,
-    #[serde(default)]
     pub parallelism: Parallelism,
-    #[serde(default)]
     pub settings: BTreeMap<String, toml::Value>,
-    #[serde(default)]
     pub roles: BTreeMap<String, ServeRoleOverride>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalBindings {
-    pub default_placement: String,
+    #[serde(default)]
+    pub default_placement: Option<String>,
+    #[serde(default)]
     pub model_weights: BTreeMap<String, ModelWeightBinding>,
+    #[serde(default)]
     pub machines: BTreeMap<String, MachineBinding>,
+    #[serde(default)]
     pub placements: BTreeMap<String, PlacementBinding>,
     #[serde(default)]
     pub builders: BTreeMap<String, BuilderBinding>,
@@ -554,7 +523,8 @@ pub enum BuilderKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelWeightBinding {
-    pub locator: String,
+    #[serde(default)]
+    pub locator: Option<String>,
     #[serde(default)]
     pub machine_locators: BTreeMap<String, String>,
 }
@@ -563,10 +533,8 @@ pub struct ModelWeightBinding {
 #[serde(deny_unknown_fields)]
 pub struct MachineBinding {
     pub host: String,
-    pub port: u16,
-    #[serde(default)]
-    pub extra_ports: Vec<u16>,
     pub devices: Vec<u32>,
+    pub ports: Vec<u16>,
     #[serde(default)]
     pub workspace: Option<PathBuf>,
     #[serde(default)]
@@ -635,19 +603,109 @@ pub struct PlacementBinding {
     pub roles: BTreeMap<String, PlacementRoleBinding>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PlacementRoleBinding {
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PlacementRoleBinding {
+    MachinePool(PlacementRoleMachinePoolBinding),
+    Direct(RankPlacementBinding),
+    MultiRank(MultiRankReplicaPlacementBinding),
+    Replicas(PlacementRoleReplicasBinding),
+}
+
+impl PlacementRoleBinding {
+    pub const fn uses_machine_pool(&self) -> bool {
+        matches!(self, Self::MachinePool(_))
+    }
+
+    pub const fn uses_explicit_replicas(&self) -> bool {
+        !self.uses_machine_pool()
+    }
+
+    pub fn machines(&self) -> Option<&[String]> {
+        match self {
+            Self::MachinePool(binding) => Some(&binding.machines),
+            Self::Direct(_) | Self::MultiRank(_) | Self::Replicas(_) => None,
+        }
+    }
+
+    pub fn replica_count(&self) -> Option<usize> {
+        match self {
+            Self::MachinePool(_) => None,
+            Self::Direct(_) | Self::MultiRank(_) => Some(1),
+            Self::Replicas(binding) => Some(binding.replicas.len()),
+        }
+    }
+
+    pub fn ranks_for_replica(&self, replica_index: usize) -> Option<&[RankPlacementBinding]> {
+        match self {
+            Self::MachinePool(_) => None,
+            Self::Direct(rank) if replica_index == 0 => Some(std::slice::from_ref(rank)),
+            Self::MultiRank(replica) if replica_index == 0 => Some(&replica.ranks),
+            Self::Replicas(binding) => binding
+                .replicas
+                .get(replica_index)
+                .map(ReplicaPlacementBinding::ranks),
+            Self::Direct(_) | Self::MultiRank(_) => None,
+        }
+    }
+
+    pub const fn is_direct_single_replica(&self) -> bool {
+        matches!(self, Self::Direct(_))
+    }
+
+    pub fn is_multi_rank_replica(&self, replica_index: usize) -> bool {
+        match self {
+            Self::MultiRank(_) => replica_index == 0,
+            Self::Replicas(binding) => binding
+                .replicas
+                .get(replica_index)
+                .is_some_and(|replica| matches!(replica, ReplicaPlacementBinding::MultiRank(_))),
+            Self::MachinePool(_) | Self::Direct(_) => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementRoleMachinePoolBinding {
     pub machines: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementRoleReplicasBinding {
+    pub replicas: Vec<ReplicaPlacementBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ReplicaPlacementBinding {
+    Direct(RankPlacementBinding),
+    MultiRank(MultiRankReplicaPlacementBinding),
+}
+
+impl ReplicaPlacementBinding {
+    pub fn ranks(&self) -> &[RankPlacementBinding] {
+        match self {
+            Self::Direct(rank) => std::slice::from_ref(rank),
+            Self::MultiRank(replica) => &replica.ranks,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultiRankReplicaPlacementBinding {
     pub ranks: Vec<RankPlacementBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RankPlacementBinding {
-    pub replica: u32,
     pub machine: String,
-    pub gpus: Vec<u32>,
+    pub devices: Vec<u32>,
+    #[serde(default)]
+    pub endpoint_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -668,12 +726,12 @@ pub struct LoadedWorkspace {
     pub snapshot: WorkspaceSnapshot,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkspaceSnapshot {
     pub revision: String,
     pub dirty: bool,
     pub source_digest: String,
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub source_exclusions: Vec<PathBuf>,
     pub revision_reproducible: bool,
     pub pixi_manifest_sha256: String,
@@ -768,6 +826,118 @@ pub fn load_workspace_config(root: &Path) -> Result<WorkspaceConfig, InferlabErr
     validate_workspace(root, &config)?;
     validate_pixi(root, &config)?;
     Ok(config)
+}
+
+pub fn workspace_summary(config: &WorkspaceConfig) -> String {
+    let mut output = format!("workspace schema {}\n", config.schema_version);
+    push_catalog_section(
+        &mut output,
+        "stacks",
+        config.stacks.iter().map(|(id, stack)| {
+            format!(
+                "{id} (integration: {}, pixi: {})",
+                stack.integration, stack.pixi_environment
+            )
+        }),
+    );
+    push_catalog_section(
+        &mut output,
+        "models",
+        config
+            .models
+            .iter()
+            .map(|(id, model)| format!("{id} (served name: {})", model.served_name)),
+    );
+    push_catalog_section(
+        &mut output,
+        "servers",
+        config.servers.iter().map(|(id, server)| {
+            let cases = if server.cases.is_empty() {
+                "none".to_owned()
+            } else {
+                server.cases.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            let selection = case_selection_label(server);
+            format!(
+                "{id} (stack: {}, model: {}, topology: {}, cases: {cases}, selection: {selection})",
+                server.stack,
+                server.model,
+                topology_label(server.topology)
+            )
+        }),
+    );
+    push_catalog_section(&mut output, "evals", config.evals.keys().cloned());
+    push_catalog_section(&mut output, "benches", config.benches.keys().cloned());
+    push_catalog_section(
+        &mut output,
+        "workload suites",
+        config.workload_suites.iter().map(|(id, suite)| {
+            let gate = suite.gate.as_deref().unwrap_or("none");
+            format!(
+                "{id} (evals: [{}], benches: [{}], gate: {gate})",
+                suite.evals.join(", "),
+                suite.benches.join(", ")
+            )
+        }),
+    );
+    push_catalog_section(
+        &mut output,
+        "recipes",
+        config.recipes.iter().map(|(id, recipe)| {
+            format!(
+                "{id} (server: {}, workload suite: {})",
+                recipe.server, recipe.workload_suite
+            )
+        }),
+    );
+    output
+}
+
+fn push_catalog_section(
+    output: &mut String,
+    label: &str,
+    values: impl IntoIterator<Item = String>,
+) {
+    output.push('\n');
+    output.push_str(label);
+    output.push_str(":\n");
+    let mut empty = true;
+    for value in values {
+        empty = false;
+        output.push_str("  ");
+        output.push_str(&value);
+        output.push('\n');
+    }
+    if empty {
+        output.push_str("  (none)\n");
+    }
+}
+
+fn case_selection_label(server: &ServerDefinition) -> String {
+    if let Some(default) = &server.default_case {
+        format!("default {default}")
+    } else if server.cases.len() == 1 {
+        server.cases.keys().next().map_or_else(
+            || "base server".to_owned(),
+            |case| format!("sole case {case}"),
+        )
+    } else {
+        "base server".to_owned()
+    }
+}
+
+const fn topology_label(topology: ServeTopology) -> &'static str {
+    match topology {
+        ServeTopology::Single => "single",
+        ServeTopology::PrefillDecode => "prefill-decode",
+    }
+}
+
+pub(crate) fn snapshot_workspace(
+    root: &Path,
+    config: &WorkspaceConfig,
+) -> Result<WorkspaceSnapshot, InferlabError> {
+    inspect_workspace(root, &root.join(DEFAULT_LOCAL_FILE), config)
 }
 
 fn canonicalize_root(root: PathBuf) -> Result<PathBuf, InferlabError> {
@@ -908,23 +1078,16 @@ fn merge_fragment(
         provenance,
     )?;
     merge_section(
-        &mut config.serve_profiles,
-        fragment.serve_profiles,
-        "serve profile",
+        &mut config.stacks,
+        fragment.stacks,
+        "stack",
         file,
         provenance,
     )?;
     merge_section(
-        &mut config.source_sets,
-        fragment.source_sets,
-        "source set",
-        file,
-        provenance,
-    )?;
-    merge_section(
-        &mut config.environments,
-        fragment.environments,
-        "environment",
+        &mut config.servers,
+        fragment.servers,
+        "server",
         file,
         provenance,
     )?;
@@ -995,54 +1158,48 @@ fn merge_section<T>(
 }
 
 fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), InferlabError> {
-    if config.schema_version != 1 {
+    if config.schema_version != 2 {
         return invalid(format!(
-            "unsupported workspace schema version {}; expected 1",
+            "unsupported workspace schema version {}; expected 2",
             config.schema_version
         ));
     }
-    for (id, source_set) in &config.source_sets {
-        require_id("source set", id)?;
-        if source_set.paths.is_empty() {
-            return invalid(format!("source set {id:?} must contain at least one path"));
-        }
-        for path in &source_set.paths {
+    for (id, stack) in &config.stacks {
+        require_id("stack", id)?;
+        require_nonempty("integration", id, &stack.integration)?;
+        require_nonempty("Pixi environment", id, &stack.pixi_environment)?;
+        for path in &stack.source_paths {
             if !is_safe_relative(path) {
                 return invalid(format!(
-                    "source set {id:?} path {} must be workspace-relative without parent traversal",
+                    "stack {id:?} source path {} must be workspace-relative without parent traversal",
                     path.display()
                 ));
             }
             reject_symlink_components(root, id, path)?;
             if !root.join(path).exists() {
                 return invalid(format!(
-                    "source set {id:?} path {} does not exist",
+                    "stack {id:?} source path {} does not exist",
                     path.display()
                 ));
             }
         }
-    }
-
-    for (id, environment) in &config.environments {
-        require_id("environment", id)?;
-        require_nonempty("Pixi environment", id, &environment.pixi_environment)?;
         let mut seen_checks = BTreeSet::new();
-        for check in &environment.checks {
-            require_id("environment check", &check.id)?;
+        for check in &stack.checks {
+            require_id("stack check", &check.id)?;
             if !seen_checks.insert(&check.id) {
                 return invalid(format!(
-                    "environment {id:?} declares duplicate check id {:?}",
+                    "stack {id:?} declares duplicate check id {:?}",
                     check.id
                 ));
             }
             validate_environment_script(root, id, "check", &check.id, &check.script)?;
         }
         let mut seen_postprocess = BTreeSet::new();
-        for step in &environment.image_postprocess {
-            require_id("environment postprocess step", &step.id)?;
+        for step in &stack.image_postprocess {
+            require_id("stack postprocess step", &step.id)?;
             if !seen_postprocess.insert(&step.id) {
                 return invalid(format!(
-                    "environment {id:?} declares duplicate image postprocess id {:?}",
+                    "stack {id:?} declares duplicate image postprocess id {:?}",
                     step.id
                 ));
             }
@@ -1057,36 +1214,73 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
     }
     for (id, model) in &config.models {
         require_id("model", id)?;
-        require_nonempty("model weight binding", id, &model.weight)?;
+        require_nonempty("served model name", id, &model.served_name)?;
     }
-    for (id, profile) in &config.serve_profiles {
-        require_id("serve profile", id)?;
-        require_nonempty("integration", id, &profile.integration)?;
-        require_nonempty("routing backend", id, &profile.routing_backend)?;
-        if profile.readiness_timeout_seconds == 0 {
+    for (id, server) in &config.servers {
+        require_id("server", id)?;
+        require_reference("stack", &server.stack, &config.stacks)?;
+        require_reference("model", &server.model, &config.models)?;
+        if server.readiness_timeout_seconds == 0 {
             return invalid(format!(
-                "serve profile {id:?} readiness_timeout_seconds must be nonzero"
+                "server {id:?} readiness_timeout_seconds must be nonzero"
             ));
         }
-        if profile.capture_control_deadline_seconds == 0 {
+        if server.capture_control_deadline_seconds == Some(0) {
             return invalid(format!(
-                "serve profile {id:?} capture_control_deadline_seconds must be nonzero"
+                "server {id:?} capture_control_deadline_seconds must be nonzero"
             ));
         }
-        validate_parallelism("serve profile", id, &profile.parallelism)?;
-        validate_profiler_escapes(&format!("serve profile {id:?}"), &profile.profiler)?;
-        for (role_id, role) in &profile.roles {
+        if server.topology == ServeTopology::Single
+            && (server.routing_backend.is_some() || server.kv_transfer.is_some())
+        {
+            return invalid(format!(
+                "single-topology server {id:?} must not declare routing_backend or kv_transfer"
+            ));
+        }
+        if let Some(backend) = &server.routing_backend {
+            require_nonempty("server routing backend", id, backend)?;
+        }
+        validate_parallelism("server", id, &server.parallelism)?;
+        validate_profiler_escapes(&format!("server {id:?}"), &server.profiler)?;
+        for (role_id, role) in &server.roles {
             require_id("serve role", role_id)?;
-            if role.replicas == 0 {
+            validate_server_role(id, server.topology, role_id)?;
+            if role.replicas == Some(0) {
                 return invalid(format!(
                     "serve role {role_id:?} replica count must be nonzero"
                 ));
             }
             validate_parallelism("serve role", role_id, &role.parallelism)?;
-            validate_profiler_escapes(
-                &format!("serve profile {id:?} role {role_id:?}"),
-                &role.profiler,
-            )?;
+            validate_profiler_escapes(&format!("server {id:?} role {role_id:?}"), &role.profiler)?;
+        }
+        if let Some(default_case) = &server.default_case
+            && !server.cases.contains_key(default_case)
+        {
+            return invalid(format!(
+                "server {id:?} default_case references unknown case {default_case:?}"
+            ));
+        }
+        for (case_id, case) in &server.cases {
+            require_id("server case", case_id)?;
+            if case.readiness_timeout_seconds == Some(0) {
+                return invalid(format!(
+                    "server case {case_id:?} readiness_timeout_seconds must be nonzero"
+                ));
+            }
+            if let Some(backend) = &case.routing_backend {
+                require_nonempty("server case routing backend", case_id, backend)?;
+            }
+            validate_parallelism("server case", case_id, &case.parallelism)?;
+            for (role_id, role) in &case.roles {
+                require_id("server case role", role_id)?;
+                validate_server_role(id, server.topology, role_id)?;
+                if role.replicas == Some(0) {
+                    return invalid(format!(
+                        "server case {case_id:?} role {role_id:?} replica count must be nonzero"
+                    ));
+                }
+                validate_parallelism("server case role", role_id, &role.parallelism)?;
+            }
         }
     }
     for (id, bench) in &config.benches {
@@ -1123,51 +1317,17 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
 
     for (id, recipe) in &config.recipes {
         require_id("recipe", id)?;
-        require_reference("model", &recipe.model, &config.models)?;
-        require_reference(
-            "serve profile",
-            &recipe.serve_profile,
-            &config.serve_profiles,
-        )?;
-        require_reference("source set", &recipe.source_set, &config.source_sets)?;
-        require_reference("environment", &recipe.environment, &config.environments)?;
+        require_reference("server", &recipe.server, &config.servers)?;
         require_reference(
             "workload suite",
             &recipe.workload_suite,
             &config.workload_suites,
         )?;
-        if recipe.cases.is_empty() {
-            return invalid(format!("recipe {id:?} must declare at least one case"));
-        }
-        let mut case_ids = BTreeSet::new();
-        for case in &recipe.cases {
-            require_id("recipe case", &case.id)?;
-            if !case_ids.insert(&case.id) {
-                return invalid(format!(
-                    "recipe {id:?} declares duplicate case {:?}",
-                    case.id
-                ));
-            }
-            validate_parallelism("recipe case", &case.id, &case.parallelism)?;
-            if let Some(backend) = &case.routing_backend {
-                require_nonempty("recipe case routing backend", &case.id, backend)?;
-            }
-            for (role_id, role) in &case.roles {
-                require_id("recipe case role", role_id)?;
-                if role.replicas == Some(0) {
-                    return invalid(format!(
-                        "recipe case role {role_id:?} replica count must be nonzero"
-                    ));
-                }
-                validate_parallelism("recipe case role", role_id, &role.parallelism)?;
-            }
-        }
     }
 
     for (id, image) in &config.images {
         require_id("image", id)?;
-        require_reference("environment", &image.environment, &config.environments)?;
-        require_reference("source set", &image.source_set, &config.source_sets)?;
+        require_reference("stack", &image.stack, &config.stacks)?;
         require_nonempty("base image", id, &image.base_image)?;
         if image.base_image.chars().any(char::is_whitespace) {
             return invalid(format!(
@@ -1197,13 +1357,7 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
             }
         }
         if let Some(packages) = &image.packages {
-            if packages.is_empty() {
-                return invalid(format!(
-                    "image {id:?} declares an empty package selection; omit the field to build \
-                     every source-set path"
-                ));
-            }
-            let source_set = &config.source_sets[&image.source_set];
+            let stack = &config.stacks[&image.stack];
             for package in packages {
                 if !is_safe_relative(package) {
                     return invalid(format!(
@@ -1212,15 +1366,11 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
                         package.display()
                     ));
                 }
-                if !source_set
-                    .paths
-                    .iter()
-                    .any(|path| package.starts_with(path))
-                {
+                if !stack.source_paths.contains(package) {
                     return invalid(format!(
-                        "image {id:?} package path {} is not under a path of source set {:?}",
+                        "image {id:?} package path {} is not one of stack {:?}'s source_paths",
                         package.display(),
-                        image.source_set
+                        image.stack
                     ));
                 }
             }
@@ -1229,26 +1379,20 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
             let Some(recipe) = config.recipes.get(&coordinate.recipe) else {
                 return invalid(format!("unknown recipe {:?}", coordinate.recipe));
             };
-            if let Some(case) = &coordinate.case
-                && !recipe.cases.iter().any(|declared| &declared.id == case)
+            let server = &config.servers[&recipe.server];
+            if let Some(case) = &coordinate.server_case
+                && !server.cases.contains_key(case)
             {
                 return invalid(format!(
-                    "image {id:?} validation references unknown case {case:?} of recipe {:?}",
-                    coordinate.recipe
+                    "image {id:?} validation references unknown server case {case:?} of recipe {:?}",
+                    coordinate.recipe,
                 ));
             }
-            if recipe.environment != image.environment {
+            if server.stack != image.stack {
                 return invalid(format!(
-                    "image {id:?} selects environment {:?} but validation recipe {:?} selects {:?}; \
+                    "image {id:?} selects stack {:?} but validation recipe {:?} selects server stack {:?}; \
                      a validation recipe must run the serving stack the image contains",
-                    image.environment, coordinate.recipe, recipe.environment
-                ));
-            }
-            if recipe.source_set != image.source_set {
-                return invalid(format!(
-                    "image {id:?} selects source set {:?} but validation recipe {:?} selects {:?}; \
-                     a validation recipe must run the serving stack the image contains",
-                    image.source_set, coordinate.recipe, recipe.source_set
+                    image.stack, coordinate.recipe, server.stack
                 ));
             }
         }
@@ -1296,6 +1440,25 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
         // ([[RFC-0006:C-INTEGRATIONS]]).
     }
     Ok(())
+}
+
+fn validate_server_role(
+    server: &str,
+    topology: ServeTopology,
+    role: &str,
+) -> Result<(), InferlabError> {
+    let valid = match topology {
+        ServeTopology::Single => role == "serve",
+        ServeTopology::PrefillDecode => matches!(role, "prefill" | "decode"),
+    };
+    if valid {
+        Ok(())
+    } else {
+        invalid(format!(
+            "server {server:?} topology {topology:?} does not permit declared role {role:?}; \
+             roles are canonical and router is derived"
+        ))
+    }
 }
 
 fn validate_parallelism(
@@ -1376,7 +1539,7 @@ fn validate_parallelism(
     Ok(())
 }
 
-fn validate_eval(id: &str, definition: &EvalDefinition) -> Result<(), InferlabError> {
+pub(crate) fn validate_eval(id: &str, definition: &EvalDefinition) -> Result<(), InferlabError> {
     match definition {
         EvalDefinition::OpenAiSmoke {
             prompt,
@@ -1605,11 +1768,12 @@ fn require_optional_nonempty(
 }
 
 fn validate_local_bindings(local: &LocalBindings) -> Result<(), InferlabError> {
-    require_nonempty(
-        "default placement",
-        "local bindings",
-        &local.default_placement,
-    )?;
+    if let Some(default_placement) = &local.default_placement {
+        require_nonempty("default placement", "local bindings", default_placement)?;
+        if !local.placements.contains_key(default_placement) {
+            return invalid(format!("unknown default placement {default_placement:?}"));
+        }
+    }
     if local.adapter.image_timeout_seconds == Some(0) {
         return invalid(
             "adapter image_timeout_seconds must be positive; omit it for the default deadline"
@@ -1619,15 +1783,16 @@ fn validate_local_bindings(local: &LocalBindings) -> Result<(), InferlabError> {
     for id in local.builders.keys() {
         require_id("builder binding", id)?;
     }
-    if !local.placements.contains_key(&local.default_placement) {
-        return invalid(format!(
-            "unknown default placement {:?}",
-            local.default_placement
-        ));
-    }
     for (id, weight) in &local.model_weights {
         require_id("model weight binding", id)?;
-        require_nonempty("model weight locator", id, &weight.locator)?;
+        if let Some(locator) = &weight.locator {
+            require_nonempty("model weight locator", id, locator)?;
+        }
+        if weight.locator.is_none() && weight.machine_locators.is_empty() {
+            return invalid(format!(
+                "model weight binding {id:?} must declare locator, machine_locators, or both"
+            ));
+        }
         for (machine, locator) in &weight.machine_locators {
             if !local.machines.contains_key(machine) {
                 return invalid(format!(
@@ -1640,15 +1805,12 @@ fn validate_local_bindings(local: &LocalBindings) -> Result<(), InferlabError> {
     for (id, machine) in &local.machines {
         require_id("machine binding", id)?;
         require_nonempty("machine host", id, &machine.host)?;
-        if machine.port == 0 {
-            return invalid(format!("machine binding {id:?} port must be nonzero"));
-        }
         let unique: BTreeSet<_> = machine.devices.iter().collect();
         if unique.len() != machine.devices.len() {
             return invalid(format!("machine binding {id:?} contains duplicate devices"));
         }
-        let mut ports = BTreeSet::from([machine.port]);
-        for port in &machine.extra_ports {
+        let mut ports = BTreeSet::new();
+        for port in &machine.ports {
             if *port == 0 {
                 return invalid(format!("machine binding {id:?} port must be nonzero"));
             }
@@ -1750,9 +1912,18 @@ fn validate_local_bindings(local: &LocalBindings) -> Result<(), InferlabError> {
     }
     for (id, placement) in &local.placements {
         require_id("placement binding", id)?;
-        if placement.machines.is_empty() && placement.roles.is_empty() {
+        let uses_role_pools = placement
+            .roles
+            .values()
+            .any(PlacementRoleBinding::uses_machine_pool);
+        let uses_explicit_replicas = placement
+            .roles
+            .values()
+            .any(PlacementRoleBinding::uses_explicit_replicas);
+        let uses_pools = !placement.machines.is_empty() || uses_role_pools;
+        if uses_pools == uses_explicit_replicas {
             return invalid(format!(
-                "placement binding {id:?} must contain at least one machine"
+                "placement binding {id:?} must use exactly one of machine pools or explicit replicas"
             ));
         }
         let mut machines = BTreeSet::new();
@@ -1768,67 +1939,132 @@ fn validate_local_bindings(local: &LocalBindings) -> Result<(), InferlabError> {
                 ));
             }
         }
-        let mut explicit_gpus = BTreeSet::new();
+        let mut explicit_devices = BTreeSet::new();
+        let mut explicit_ports = BTreeSet::new();
         for (role, role_placement) in &placement.roles {
             require_id("placement role", role)?;
-            if role_placement.machines.is_empty() && role_placement.ranks.is_empty() {
+            if let Some(role_machines) = role_placement.machines() {
+                if role_machines.is_empty() {
+                    return invalid(format!(
+                        "placement binding {id:?} role {role:?} machine pool must not be empty"
+                    ));
+                }
+                let mut role_seen = BTreeSet::new();
+                for machine in role_machines {
+                    if !role_seen.insert(machine) {
+                        return invalid(format!(
+                            "placement binding {id:?} role {role:?} contains duplicate machine {machine:?}"
+                        ));
+                    }
+                    if !local.machines.contains_key(machine) {
+                        return invalid(format!(
+                            "placement binding {id:?} role {role:?} references unknown machine {machine:?}"
+                        ));
+                    }
+                }
+                continue;
+            }
+            if !matches!(role.as_str(), "serve" | "prefill" | "decode" | "router") {
                 return invalid(format!(
-                    "placement binding {id:?} role {role:?} must contain machines or rank GPU groups"
+                    "placement binding {id:?} contains non-canonical role {role:?}"
                 ));
             }
-            let mut role_seen = BTreeSet::new();
-            for machine in &role_placement.machines {
-                if !role_seen.insert(machine) {
-                    return invalid(format!(
-                        "placement binding {id:?} role {role:?} contains duplicate machine {machine:?}"
-                    ));
-                }
-                if !local.machines.contains_key(machine) {
-                    return invalid(format!(
-                        "placement binding {id:?} role {role:?} references unknown machine {machine:?}"
-                    ));
-                }
+            if role == "router" && !role_placement.is_direct_single_replica() {
+                return invalid(format!(
+                    "placement binding {id:?} router must contain exactly one direct replica"
+                ));
             }
-            for rank in &role_placement.ranks {
-                if rank.gpus.is_empty() {
-                    return invalid(format!(
-                        "placement binding {id:?} role {role:?} rank GPU group must not be empty"
-                    ));
-                }
-                let machine = local.machines.get(&rank.machine).ok_or_else(|| {
-                    InferlabError::InvalidConfig {
+            let replica_count =
+                role_placement
+                    .replica_count()
+                    .ok_or_else(|| InferlabError::InvalidConfig {
                         message: format!(
-                            "placement binding {id:?} role {role:?} references unknown machine {:?}",
-                            rank.machine
+                            "placement binding {id:?} role {role:?} does not define replicas"
                         ),
-                    }
-                })?;
-                if !role_placement.machines.is_empty()
-                    && !role_placement.machines.contains(&rank.machine)
-                {
+                    })?;
+            if matches!(role_placement, PlacementRoleBinding::Replicas(_)) && replica_count < 2 {
+                return invalid(format!(
+                    "placement binding {id:?} role {role:?} replicas form requires at least two replicas"
+                ));
+            }
+
+            for replica_index in 0..replica_count {
+                let replica_index =
+                    u32::try_from(replica_index).map_err(|_| InferlabError::InvalidConfig {
+                        message: format!(
+                            "placement binding {id:?} role {role:?} has too many replicas"
+                        ),
+                    })?;
+                let ranks = role_placement
+                    .ranks_for_replica(replica_index as usize)
+                    .ok_or_else(|| InferlabError::InvalidConfig {
+                        message: format!(
+                            "placement binding {id:?} role {role:?} replica {replica_index} is missing"
+                        ),
+                    })?;
+                if role_placement.is_multi_rank_replica(replica_index as usize) && ranks.len() < 2 {
                     return invalid(format!(
-                        "placement binding {id:?} role {role:?} rank machine {:?} is outside its machine pool",
-                        rank.machine
+                        "placement binding {id:?} role {role:?} replica {replica_index} multi-rank form requires at least two ranks"
                     ));
                 }
-                let mut rank_seen = BTreeSet::new();
-                for gpu in &rank.gpus {
-                    if !rank_seen.insert(gpu) {
+                for (rank_index, rank) in ranks.iter().enumerate() {
+                    let rank_index =
+                        u32::try_from(rank_index).map_err(|_| InferlabError::InvalidConfig {
+                            message: format!(
+                                "placement binding {id:?} role {role:?} replica {replica_index} has too many ranks"
+                            ),
+                        })?;
+                    let machine = local.machines.get(&rank.machine).ok_or_else(|| {
+                        InferlabError::InvalidConfig {
+                            message: format!(
+                                "placement binding {id:?} rank ({role:?}, {replica_index}, {rank_index}) references unknown machine {:?}",
+                                rank.machine
+                            ),
+                        }
+                    })?;
+                    if role == "router" && !rank.devices.is_empty() {
                         return invalid(format!(
-                            "placement binding {id:?} role {role:?} rank contains duplicate GPU {gpu}"
+                            "placement binding {id:?} router must use no devices"
                         ));
                     }
-                    if !machine.devices.contains(gpu) {
+                    if role != "router" && rank.devices.is_empty() {
                         return invalid(format!(
-                            "placement binding {id:?} role {role:?} references unavailable GPU {}:{}",
-                            rank.machine, gpu
+                            "placement binding {id:?} rank ({role:?}, {replica_index}, {rank_index}) must bind at least one device"
                         ));
                     }
-                    if !explicit_gpus.insert((rank.machine.as_str(), *gpu)) {
-                        return invalid(format!(
-                            "placement binding {id:?} assigns GPU {}:{} more than once",
-                            rank.machine, gpu
-                        ));
+                    let mut rank_devices = BTreeSet::new();
+                    for device in &rank.devices {
+                        if !rank_devices.insert(device) {
+                            return invalid(format!(
+                                "placement binding {id:?} rank ({role:?}, {replica_index}, {rank_index}) contains duplicate device {device}"
+                            ));
+                        }
+                        if !machine.devices.contains(device) {
+                            return invalid(format!(
+                                "placement binding {id:?} references unavailable device {}:{device}",
+                                rank.machine
+                            ));
+                        }
+                        if !explicit_devices.insert((&rank.machine, *device)) {
+                            return invalid(format!(
+                                "placement binding {id:?} assigns device {}:{device} more than once",
+                                rank.machine
+                            ));
+                        }
+                    }
+                    if let Some(port) = rank.endpoint_port {
+                        if !machine.ports.contains(&port) {
+                            return invalid(format!(
+                                "placement binding {id:?} rank ({role:?}, {replica_index}, {rank_index}) endpoint_port {port} is not in machine {:?}'s port pool",
+                                rank.machine
+                            ));
+                        }
+                        if !explicit_ports.insert((&rank.machine, port)) {
+                            return invalid(format!(
+                                "placement binding {id:?} assigns endpoint port {}:{port} more than once",
+                                rank.machine
+                            ));
+                        }
                     }
                 }
             }
@@ -1850,43 +2086,21 @@ fn validate_pixi(root: &Path, config: &WorkspaceConfig) -> Result<(), InferlabEr
             source,
         })?;
     let declared_environments = manifest.get("environments").and_then(toml::Value::as_table);
-    for (id, environment) in &config.environments {
-        let exists = environment.pixi_environment == "default"
-            || declared_environments.is_some_and(|environments| {
-                environments.contains_key(&environment.pixi_environment)
-            });
+    for (id, stack) in &config.stacks {
+        let exists = stack.pixi_environment == "default"
+            || declared_environments
+                .is_some_and(|environments| environments.contains_key(&stack.pixi_environment));
         if !exists {
             return invalid(format!(
-                "environment {id:?} references unknown Pixi environment {:?}",
-                environment.pixi_environment
+                "stack {id:?} references unknown Pixi environment {:?}",
+                stack.pixi_environment
             ));
         }
-    }
-    for (id, recipe) in &config.recipes {
-        let profile = config
-            .serve_profiles
-            .get(&recipe.serve_profile)
-            .ok_or_else(|| InferlabError::InvalidConfig {
-                message: format!(
-                    "recipe {id:?} references unknown serve profile {:?}",
-                    recipe.serve_profile
-                ),
-            })?;
-        let environment = config
-            .environments
-            .get(&recipe.environment)
-            .ok_or_else(|| InferlabError::InvalidConfig {
-                message: format!(
-                    "recipe {id:?} references unknown environment {:?}",
-                    recipe.environment
-                ),
-            })?;
-        let package = format!("inferlab-integration-{}", profile.integration);
-        if !pixi_environment_selects_dependency(&manifest, &environment.pixi_environment, &package)
-        {
+        let package = format!("inferlab-integration-{}", stack.integration);
+        if !pixi_environment_selects_dependency(&manifest, &stack.pixi_environment, &package) {
             return invalid(format!(
-                "recipe {id:?} integration {:?} is not selected by Pixi environment {:?} as package {package:?}",
-                profile.integration, environment.pixi_environment,
+                "stack {id:?} integration {:?} is not selected by Pixi environment {:?} as package {package:?}",
+                stack.integration, stack.pixi_environment,
             ));
         }
     }
@@ -1920,12 +2134,12 @@ fn validate_pixi(root: &Path, config: &WorkspaceConfig) -> Result<(), InferlabEr
     let locked_environments = lock
         .get("environments")
         .and_then(yaml_serde::Value::as_mapping);
-    for (id, environment) in &config.environments {
-        let key = yaml_serde::Value::String(environment.pixi_environment.clone());
+    for (id, stack) in &config.stacks {
+        let key = yaml_serde::Value::String(stack.pixi_environment.clone());
         if !locked_environments.is_some_and(|environments| environments.contains_key(&key)) {
             return invalid(format!(
-                "environment {id:?} Pixi environment {:?} is absent from pixi.lock",
-                environment.pixi_environment
+                "stack {id:?} Pixi environment {:?} is absent from pixi.lock",
+                stack.pixi_environment
             ));
         }
     }
@@ -2006,8 +2220,8 @@ fn manifest_declares_pypi_dependency(manifest: &toml::Value, package: &str) -> b
 /// [[RFC-0002:C-WORKSPACE-AUTHORITY]]: every symbolic link effectively
 /// present in the digested worktree must carry a target that resolves to
 /// identity-covered workspace content. The walk covers the whole digested
-/// worktree rather than the declared source-set subtrees because the digest
-/// pathspec covers the root: a link outside every source set still enters
+/// worktree rather than the declared stack source subtrees because the digest
+/// pathspec covers the root: a link outside every stack source still enters
 /// identity as link text, so every intermediate link is enumerated and
 /// judged on its own by construction. The walk reads the filesystem rather
 /// than the git index because untracked and ignored links — and links
@@ -2108,18 +2322,18 @@ fn reject_uncovered_worktree_links(
     reject_ignored_targets(root, ignore_candidates)
 }
 
-/// Rejection evidence names the declaring source set when one covers the
+/// Rejection evidence names the declaring stack when one covers the
 /// link ([[RFC-0002:C-WORKSPACE-AUTHORITY]]).
 fn link_scope(config: &WorkspaceConfig, link: &Path) -> String {
-    let source_set = config.source_sets.iter().find_map(|(name, source_set)| {
-        source_set
-            .paths
+    let stack = config.stacks.iter().find_map(|(name, stack)| {
+        stack
+            .source_paths
             .iter()
             .any(|path| link.starts_with(path))
             .then_some(name)
     });
-    match source_set {
-        Some(name) => format!("source set {name:?} symlink {}", link.display()),
+    match stack {
+        Some(name) => format!("stack {name:?} source symlink {}", link.display()),
         None => format!("workspace symlink {}", link.display()),
     }
 }
@@ -2894,17 +3108,13 @@ fn invalid<T>(message: String) -> Result<T, InferlabError> {
     Err(InferlabError::InvalidConfig { message })
 }
 
-/// Reject a symbolic link anywhere along a declared source-set path
+/// Reject a symbolic link anywhere along a declared stack source path
 /// ([[RFC-0002:C-WORKSPACE-AUTHORITY]]): the source digest walks git's view
 /// of the tree, which records link text rather than target content, so a
 /// linked component would let the served source drift under an unchanged
 /// digest. Symlinks buried deeper inside a source tree share git's own
 /// link-text semantics and stay out of scope here.
-fn reject_symlink_components(
-    root: &Path,
-    source_set: &str,
-    path: &Path,
-) -> Result<(), InferlabError> {
+fn reject_symlink_components(root: &Path, stack: &str, path: &Path) -> Result<(), InferlabError> {
     let mut absolute = root.to_path_buf();
     let mut relative = PathBuf::new();
     for component in path.components() {
@@ -2913,7 +3123,7 @@ fn reject_symlink_components(
         symlink_guard(
             &absolute,
             &format!(
-                "source set {source_set:?} path component {}",
+                "stack {stack:?} source path component {}",
                 relative.display()
             ),
         )?;
@@ -2948,8 +3158,8 @@ mod tests {
     }
 
     #[test]
-    fn role_escapes_merge_into_profile_escapes() {
-        let profile = NsysEscapes {
+    fn role_escapes_merge_into_common_server_escapes() {
+        let common = NsysEscapes {
             executable: Some("nsys".to_owned()),
             launch_options: vec!["--cuda-graph-trace=node".to_owned()],
             start_options: vec!["--nic-metrics=true".to_owned()],
@@ -2957,8 +3167,8 @@ mod tests {
             sampling: Some("cpu".to_owned()),
             context_switch: None,
             env: BTreeMap::from([
-                ("NSYS_SHARED".to_owned(), "profile".to_owned()),
-                ("NSYS_PROFILE_ONLY".to_owned(), "1".to_owned()),
+                ("NSYS_SHARED".to_owned(), "common".to_owned()),
+                ("NSYS_COMMON_ONLY".to_owned(), "1".to_owned()),
             ]),
         };
         let role = NsysEscapes {
@@ -2970,7 +3180,7 @@ mod tests {
             context_switch: Some("system-wide".to_owned()),
             env: BTreeMap::from([("NSYS_SHARED".to_owned(), "role".to_owned())]),
         };
-        let merged = profile.merged_with(&role);
+        let merged = common.merged_with(&role);
         assert_eq!(merged.executable.as_deref(), Some("nsys"));
         assert_eq!(
             merged.launch_options,
@@ -2983,7 +3193,7 @@ mod tests {
         assert_eq!(
             merged.env,
             BTreeMap::from([
-                ("NSYS_PROFILE_ONLY".to_owned(), "1".to_owned()),
+                ("NSYS_COMMON_ONLY".to_owned(), "1".to_owned()),
                 ("NSYS_SHARED".to_owned(), "role".to_owned()),
             ])
         );
@@ -3030,11 +3240,11 @@ mod tests {
                     &mut escapes.nsys.start_options
                 };
                 list.push(option.to_owned());
-                let error = validate_profiler_escapes("serve profile \"pd\"", &escapes)
+                let error = validate_profiler_escapes("server \"pd\"", &escapes)
                     .err()
                     .map(|error| error.to_string());
                 let expected = format!(
-                    "serve profile \"pd\" nsys {field} contains managed option {option:?}; \
+                    "server \"pd\" nsys {field} contains managed option {option:?}; \
                      use the dedicated profiler escape field or the inferlab-managed value"
                 );
                 assert!(
@@ -3063,11 +3273,8 @@ mod tests {
             ..NsysEscapes::default()
         };
         assert!(
-            validate_profiler_escapes(
-                "serve profile \"pd\"",
-                &ProfilerEscapes { nsys: permitted },
-            )
-            .is_ok(),
+            validate_profiler_escapes("server \"pd\"", &ProfilerEscapes { nsys: permitted },)
+                .is_ok(),
             "nsys-owned options that name no managed fact pass the load gate"
         );
     }
@@ -3080,11 +3287,11 @@ mod tests {
         for key in ["--unset", "1BAD", "BAD-KEY", "", "BAD KEY"] {
             let mut escapes = ProfilerEscapes::default();
             escapes.nsys.env.insert(key.to_owned(), "value".to_owned());
-            let error = validate_profiler_escapes("serve profile \"pd\"", &escapes)
+            let error = validate_profiler_escapes("server \"pd\"", &escapes)
                 .err()
                 .map(|error| error.to_string());
             let expected = format!(
-                "serve profile \"pd\" nsys env contains key {key:?}, which is not a POSIX \
+                "server \"pd\" nsys env contains key {key:?}, which is not a POSIX \
                  identifier; environment entries reach the profiler commands as assignments"
             );
             assert!(
@@ -3098,7 +3305,7 @@ mod tests {
             let mut escapes = ProfilerEscapes::default();
             escapes.nsys.env.insert(key.to_owned(), "value".to_owned());
             assert!(
-                validate_profiler_escapes("serve profile \"pd\"", &escapes).is_ok(),
+                validate_profiler_escapes("server \"pd\"", &escapes).is_ok(),
                 "{key:?} is a POSIX identifier and passes the load gate"
             );
         }
@@ -3119,11 +3326,11 @@ mod tests {
                     &mut escapes.nsys.start_options
                 };
                 list.push(option.to_owned());
-                let error = validate_profiler_escapes("serve profile \"pd\"", &escapes)
+                let error = validate_profiler_escapes("server \"pd\"", &escapes)
                     .err()
                     .map(|error| error.to_string());
                 let expected = format!(
-                    "serve profile \"pd\" nsys {field} contains standalone {option:?}, \
+                    "server \"pd\" nsys {field} contains standalone {option:?}, \
                      which ends option parsing and displaces the inferlab-managed argv tail"
                 );
                 assert!(

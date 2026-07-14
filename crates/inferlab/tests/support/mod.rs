@@ -35,6 +35,9 @@
 // Each suite binary compiles its own copy of this module and uses a subset.
 #![allow(dead_code)]
 
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -46,6 +49,259 @@ use std::process::Command;
 use std::sync::{Mutex, Once};
 use std::thread;
 use std::time::Duration;
+
+/// Write the smallest complete current-schema image record that can be
+/// selected by a black-box launch test.
+pub fn write_assembled_image_record(
+    root: &Path,
+    record_id: &str,
+    stack: &str,
+    platform: &str,
+    image_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let record_dir = root.join(".inferlab/records").join(record_id);
+    fs::create_dir_all(&record_dir)?;
+    let digest = "0".repeat(64);
+    let record = serde_json::json!({
+        "schema_version": 2,
+        "inferlab_version": env!("CARGO_PKG_VERSION"),
+        "id": record_id,
+        "status": "succeeded",
+        "started_unix_ms": 1,
+        "finished_unix_ms": 2,
+        "resolved": {
+            "workspace": {
+                "revision": "fixture-revision",
+                "dirty": false,
+                "source_digest": digest,
+                "revision_reproducible": true,
+                "pixi_manifest_sha256": digest,
+                "pixi_lock_sha256": digest,
+            },
+            "image": {
+                "id": "fixture-image",
+                "stack": stack,
+                "pixi_environment": stack,
+                "source_paths": [],
+                "wheel_sources": [],
+                "base_image": "fixture-base@sha256:fixture",
+            },
+            "builder": {
+                "name": "fixture-builder",
+                "kind": "local-docker",
+                "host_platform": platform,
+            },
+            "assemblies": [{
+                "platform": platform,
+                "base_image_digest": "sha256:fixture-base",
+                "content_closure": {},
+                "closure_digest": digest,
+                "validations": [],
+            }],
+            "validations": [],
+            "skipped_platforms": [],
+            "observations": [],
+        },
+        "assemblies": [{
+            "platform": platform,
+            "closure_digest": digest,
+            "base_image_digest": "sha256:fixture-base",
+            "excluded_activation": [],
+            "packages": [],
+            "image_id": image_id,
+            "native_commands": [],
+            "outcome": {
+                "status": "assembled",
+                "image_id": image_id,
+                "tag": "inferlab-fixture:latest",
+            },
+        }],
+        "validations": [],
+    });
+    fs::write(
+        record_dir.join("record.json"),
+        serde_json::to_vec_pretty(&record)?,
+    )?;
+    Ok(())
+}
+
+/// Narrow typed projection of the resolved server hierarchy emitted by the
+/// black-box CLI. Tests keep using the executable boundary without rebuilding
+/// the record schema out of string-keyed `serde_json::Value` traversal.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResolvedRoleProjection {
+    pub id: String,
+    pub replicas: Vec<ResolvedReplicaProjection>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResolvedReplicaProjection {
+    pub id: String,
+    pub ranks: Vec<ResolvedRankProjection>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResolvedRankProjection {
+    pub id: String,
+    pub rank: u32,
+    pub rank_count: u32,
+    pub machine: String,
+    pub launch: LaunchProjection,
+    pub dependencies: Vec<String>,
+    pub devices: Vec<u32>,
+    pub model_locator: Option<String>,
+    pub ports: BTreeMap<String, EndpointAssignmentProjection>,
+    pub runtime_cache: RuntimeCacheProjection,
+    pub communication_interface: Option<String>,
+    pub command: CommandProjection,
+    pub launch_files: Vec<LaunchFileProjection>,
+    pub readiness: ReadinessProjection,
+    pub endpoint: EndpointProjection,
+    pub capture_target: Option<CaptureTargetProjection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum LaunchProjection {
+    Local,
+    Ssh { target: String },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EndpointAssignmentProjection {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RuntimeCacheProjection {
+    pub storage_root: PathBuf,
+    pub storage_root_source: String,
+    pub namespace: RuntimeCacheNamespaceProjection,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RuntimeCacheNamespaceProjection {
+    pub workspace_source_digest: String,
+    pub pixi_environment: String,
+    pub image_id: Option<String>,
+    pub machine: String,
+    pub process: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CommandProjection {
+    pub argv: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub explicit_env: Vec<String>,
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct LaunchFileProjection {
+    pub relative_path: String,
+    pub resolved_path: PathBuf,
+    pub text: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadinessProjection {
+    Http {
+        path: String,
+        timeout_seconds: Option<u64>,
+    },
+    HttpTargetRegistry {
+        readiness_path: String,
+        registry_path: String,
+        targets_field: String,
+        target_url_field: String,
+        target_role_field: String,
+        target_healthy_field: String,
+        target_bootstrap_port_field: String,
+        expected_targets: Vec<TargetRegistryExpectedProjection>,
+        timeout_seconds: Option<u64>,
+    },
+    ProcessAlive,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TargetRegistryExpectedProjection {
+    pub url: String,
+    pub role: String,
+    pub bootstrap_port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct EndpointProjection {
+    pub host: String,
+    pub port: u16,
+    pub protocol: String,
+    pub api_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CaptureTargetProjection {
+    pub control_process_id: String,
+    pub start_path: String,
+    pub stop_path: String,
+    #[serde(default)]
+    pub escapes: NsysEscapesProjection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct NsysEscapesProjection {
+    pub executable: Option<String>,
+    pub launch_options: Vec<String>,
+    pub start_options: Vec<String>,
+    pub trace: Vec<String>,
+    pub sampling: Option<String>,
+    pub context_switch: Option<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedProcessProjection {
+    pub role_id: String,
+    pub replica_id: String,
+    pub rank: ResolvedRankProjection,
+}
+
+pub fn resolved_processes(value: &Value) -> Result<Vec<ResolvedProcessProjection>, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct ServerProjection {
+        roles: Vec<ResolvedRoleProjection>,
+    }
+
+    let server: ServerProjection = serde_json::from_value(value.clone())?;
+    let mut processes = Vec::new();
+    for role in server.roles {
+        for replica in role.replicas {
+            for rank in replica.ranks {
+                processes.push(ResolvedProcessProjection {
+                    role_id: role.id.clone(),
+                    replica_id: replica.id.clone(),
+                    rank,
+                });
+            }
+        }
+    }
+    Ok(processes)
+}
+
+pub fn resolved_process(value: &Value, id: &str) -> Result<ResolvedRankProjection, Box<dyn Error>> {
+    resolved_processes(value)?
+        .into_iter()
+        .find(|process| process.rank.id == id)
+        .map(|process| process.rank)
+        .ok_or_else(|| format!("missing resolved process {id:?}").into())
+}
 
 /// Environment variables carrying the registration channel to fixture shims.
 pub const REAPER_REGISTRY_ENV: &str = "FIXTURE_REAPER_REGISTRY";

@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inferlab-adapter-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "Generated protocol models and runtime helpers for Inferlab adapters"
+readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -17,4 +18,4 @@ Repository = "https://github.com/Infer-Lab/inferlab"
 [tool.hatch.build.targets.wheel]
 packages = ["src/inferlab_adapter_sdk"]
 [tool.hatch.build.targets.sdist]
-only-include = ["src", "tests", "LICENSE"]
+only-include = ["src", "tests", "LICENSE", "README.md"]

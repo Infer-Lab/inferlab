@@ -1,28 +1,41 @@
-schema_version = 1
+schema_version = 2
 
 [models.dsv4]
-weight = "dsv4"
 served_name = "dsv4"
 
-[serve_profiles.vllm-dsv4]
+[stacks.vllm]
 integration = "vllm"
-readiness_timeout_seconds = 900
+pixi_environment = "vllm"
+source_paths = ["vendor/vllm", "vendor/flashinfer"]
 
-[serve_profiles.vllm-dsv4.parallelism.outer]
+[servers.dsv4-qualify]
+stack = "vllm"
+model = "dsv4"
+topology = "single"
+readiness_timeout_seconds = 900
+default_case = "tp2"
+
+[servers.dsv4-qualify.parallelism.outer]
 pipeline_parallel_size = 1
 
-[serve_profiles.vllm-dsv4.settings]
+[servers.dsv4-qualify.settings]
 max_model_len = 65536
 kv_cache_dtype = "fp8"
 gpu_memory_utilization = 0.95
 trust_remote_code = true
 compilation_config = { cudagraph_mode = "FULL_AND_PIECEWISE", custom_ops = ["all"] }
 
-[source_sets.vllm]
-paths = ["vendor/vllm", "vendor/flashinfer"]
+[servers.dsv4-qualify.roles.serve.parallelism.attention]
+context_parallel_size = 1
 
-[environments.vllm]
-pixi_environment = "vllm"
+[servers.dsv4-qualify.roles.serve.settings]
+block_size = 16
+
+[servers.dsv4-qualify.cases.tp2.parallelism.outer]
+tensor_parallel_size = 2
+
+[servers.dsv4-qualify.cases.tp4.parallelism.outer]
+tensor_parallel_size = 4
 
 [evals.smoke]
 kind = "openai-smoke"
@@ -70,20 +83,5 @@ gate = "gsm8k"
 benches = ["c8k1k", "adaptive-c8k1k"]
 
 [recipes.dsv4-qualify]
-model = "dsv4"
-serve_profile = "vllm-dsv4"
-source_set = "vllm"
-environment = "vllm"
+server = "dsv4-qualify"
 workload_suite = "qualify"
-
-[[recipes.dsv4-qualify.cases]]
-id = "tp2"
-
-[recipes.dsv4-qualify.cases.parallelism.outer]
-tensor_parallel_size = 2
-
-[[recipes.dsv4-qualify.cases]]
-id = "tp4"
-
-[recipes.dsv4-qualify.cases.parallelism.outer]
-tensor_parallel_size = 4

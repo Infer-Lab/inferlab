@@ -4,12 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inferlab-integration-tokenspeed"
-version = "0.2.0"
+version = "0.3.0"
 description = "Inferlab adapter integration for TokenSpeed"
+readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["inferlab-adapter-sdk==0.2.0"]
+dependencies = ["inferlab-adapter-sdk==0.3.0"]
 
 [project.scripts]
 inferlab-adapter-tokenspeed = "inferlab_integration_tokenspeed.__main__:main"
@@ -20,4 +21,4 @@ Repository = "https://github.com/Infer-Lab/inferlab"
 [tool.hatch.build.targets.wheel]
 packages = ["src/inferlab_integration_tokenspeed"]
 [tool.hatch.build.targets.sdist]
-only-include = ["src", "tests", "LICENSE"]
+only-include = ["src", "tests", "LICENSE", "README.md"]

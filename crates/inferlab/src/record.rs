@@ -36,8 +36,26 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Infe
     })
 }
 
-pub fn new_record_id(kind: &str) -> Result<String, InferlabError> {
-    record_id_base(kind, now_unix_ms()?)
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecordIdentity<'a> {
+    Serve {
+        server: &'a str,
+        case: Option<&'a str>,
+    },
+    Recipe {
+        recipe: &'a str,
+        case: Option<&'a str>,
+    },
+    Bench {
+        bench: &'a str,
+    },
+    Image {
+        image: &'a str,
+    },
+}
+
+pub(crate) fn new_record_id(identity: RecordIdentity<'_>) -> Result<String, InferlabError> {
+    record_id(identity, now_unix_ms()?)
 }
 
 pub(crate) fn now_unix_ms() -> Result<u64, InferlabError> {
@@ -64,12 +82,24 @@ pub(crate) fn validate_record_id(kind: &str, id: &str) -> Result<(), InferlabErr
     }
 }
 
-pub fn record_id_base(kind: &str, unix_ms: u64) -> Result<String, InferlabError> {
-    Ok(format!(
-        "{}-{kind}-{}",
-        utc_timestamp(unix_ms)?,
-        std::process::id(),
-    ))
+pub(crate) fn record_id(
+    identity: RecordIdentity<'_>,
+    unix_ms: u64,
+) -> Result<String, InferlabError> {
+    let timestamp = utc_timestamp(unix_ms)?;
+    let pid = std::process::id();
+    Ok(match identity {
+        RecordIdentity::Serve { server, case } => case.map_or_else(
+            || format!("{timestamp}-serve-{server}-{pid}"),
+            |case| format!("{timestamp}-serve-{server}-{case}-{pid}"),
+        ),
+        RecordIdentity::Recipe { recipe, case } => case.map_or_else(
+            || format!("{timestamp}-recipe-{recipe}-{pid}"),
+            |case| format!("{timestamp}-recipe-{recipe}-{case}-{pid}"),
+        ),
+        RecordIdentity::Bench { bench } => format!("{timestamp}-bench-{bench}-{pid}"),
+        RecordIdentity::Image { image } => format!("{timestamp}-image-{image}-{pid}"),
+    })
 }
 
 /// UTC timestamp in the record-identifier shape (`YYYY-MM-DDTHH-MM-SS.mmmZ`).

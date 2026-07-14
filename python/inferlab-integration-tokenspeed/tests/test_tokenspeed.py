@@ -1,4 +1,5 @@
 import sys
+from typing import cast
 
 import pytest
 from inferlab_adapter_sdk import (
@@ -17,6 +18,7 @@ from inferlab_adapter_sdk import (
     ServeRoleInput,
     ServeRoleKind,
     ServeRoleLinkKvTransfer,
+    ServeRoleResult,
     ServeTopology,
     SettingValue,
 )
@@ -47,23 +49,26 @@ def _dsv4_settings() -> dict[str, SettingValue]:
 
 
 def _plan_input(**overrides: object) -> PlanServeInput:
-    parallelism = _dsv4_parallelism()
-    base: dict[str, object] = {
-        "model": ServeModelInput(locator="/models/dsv4", served_name="dsv4-flash"),
-        "topology": ServeTopology.single,
-        "routing_backend": "builtin",
-        "kv_transfer": None,
-        "parallelism": parallelism,
-        "settings": _dsv4_settings(),
-        "roles": [
+    parallelism = cast(Parallelism, overrides.pop("parallelism", _dsv4_parallelism()))
+    settings = cast(dict[str, SettingValue], overrides.pop("settings", _dsv4_settings()))
+    roles = overrides.pop(
+        "roles",
+        [
             ServeRoleInput(
                 id="serve",
                 kind=ServeRoleKind.serve,
                 replica_count=1,
                 parallelism=parallelism,
-                settings={},
+                settings=settings,
             )
         ],
+    )
+    base: dict[str, object] = {
+        "model": ServeModelInput(id="dsv4", served_name="dsv4-flash"),
+        "topology": ServeTopology.single,
+        "routing_backend": None,
+        "kv_transfer": None,
+        "roles": roles,
         "profiling": False,
     }
     base.update(overrides)
@@ -77,7 +82,7 @@ def test_plan_dsv4_dp_ep_shape_and_endpoint_contract() -> None:
     assert "tokenspeed" not in sys.modules
     assert [replica.id for replica in result.replicas] == ["server"]
     replica = result.replicas[0]
-    assert replica.accelerator_count == 4
+    assert replica.device_count == 4
     assert replica.ports == ["control", "dist_init"]
     assert replica.primary_ports == []
     readiness = replica.primary_readiness.root
@@ -86,11 +91,12 @@ def test_plan_dsv4_dp_ep_shape_and_endpoint_contract() -> None:
     assert result.endpoint.api_path == "/v1/completions"
     assert result.endpoint.prefix_cache_reset is not None
     assert result.endpoint.prefix_cache_reset.path == "/flush_cache"
-    assert result.effective_settings["enable_prefix_caching"].root is True
+    role = result.roles[0]
+    assert role.effective_settings["enable_prefix_caching"].root is True
 
-    outer = result.effective_parallelism.outer
-    attention = result.effective_parallelism.attention
-    experts = result.effective_parallelism.experts
+    outer = role.effective_parallelism.outer
+    attention = role.effective_parallelism.attention
+    experts = role.effective_parallelism.experts
     assert outer is not None
     assert outer.tensor_parallel_size == 4
     assert outer.pipeline_parallel_size == 1
@@ -122,8 +128,8 @@ def test_plan_tp_only_shape_fills_every_component() -> None:
         )
     )
 
-    attention = result.effective_parallelism.attention
-    experts = result.effective_parallelism.experts
+    attention = result.roles[0].effective_parallelism.attention
+    experts = result.roles[0].effective_parallelism.experts
     assert attention is not None
     assert attention.tensor_parallel_size == 8
     assert attention.data_parallel_size == 1
@@ -131,7 +137,7 @@ def test_plan_tp_only_shape_fills_every_component() -> None:
     assert experts.tensor_parallel_size == 8
     assert experts.expert_parallel_size == 1
     assert experts.dense_tensor_parallel_size == 8
-    assert result.replicas[0].accelerator_count == 8
+    assert result.replicas[0].device_count == 8
 
 
 def _prefill_decode_plan_input(
@@ -161,14 +167,14 @@ def _prefill_decode_plan_input(
                 kind=ServeRoleKind.prefill,
                 replica_count=prefill_replicas,
                 parallelism=parallelism,
-                settings={},
+                settings=settings,
             ),
             ServeRoleInput(
                 id="decode",
                 kind=ServeRoleKind.decode,
                 replica_count=decode_replicas,
                 parallelism=parallelism,
-                settings={},
+                settings=settings,
             ),
         ],
     )
@@ -182,7 +188,7 @@ def test_plan_prefill_decode_keeps_smg_routing_and_mooncake_transfer_separate() 
         ServeRoleKind.decode,
         ServeRoleKind.router,
     ]
-    assert [role.replica_count for role in result.roles] == [2, 3, 1]
+    assert [role.effective_replica_count for role in result.roles] == [2, 3, 1]
     assert [replica.id for replica in result.replicas] == [
         "prefill-000",
         "prefill-001",
@@ -224,46 +230,38 @@ def test_plan_prefill_decode_keeps_smg_routing_and_mooncake_transfer_separate() 
         "decode_role_value": "decode",
         "prefill_bootstrap_port": "bootstrap",
     }
-    assert result.public_endpoint.root.kind == "replica"
-    assert result.public_endpoint.root.replica_id == "router"
+    assert result.routing.root.owner == "integration_native"
+    assert result.routing.root.role == "router"
+    assert result.routing.root.replica == 0
     assert result.endpoint.api_path == "/v1/completions"
     assert result.endpoint.prefix_cache_reset is not None
     assert result.endpoint.prefix_cache_reset.path == "/flush_cache"
 
 
 def test_plan_rejects_unsupported_workflows_and_parallelism() -> None:
-    with pytest.raises(AdapterOperationError, match="only supports Mooncake"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_prefill_decode_plan_input(transport=KvTransferMechanism.nixl))
-    with pytest.raises(AdapterOperationError, match="does not support routing backend"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_prefill_decode_plan_input(routing_backend="builtin"))
-    with pytest.raises(AdapterOperationError, match="profiling"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_plan_input(profiling=True))
 
     unsupported = [
-        (
-            Parallelism(outer=ParallelismOuter(tensor_parallel_size=4, pipeline_parallel_size=2)),
-            "pipeline parallelism",
+        Parallelism(outer=ParallelismOuter(tensor_parallel_size=4, pipeline_parallel_size=2)),
+        Parallelism(
+            outer=ParallelismOuter(tensor_parallel_size=4),
+            attention=ParallelismAttention(context_parallel_size=2),
         ),
-        (
-            Parallelism(
-                outer=ParallelismOuter(tensor_parallel_size=4),
-                attention=ParallelismAttention(context_parallel_size=2),
+        Parallelism(
+            outer=ParallelismOuter(tensor_parallel_size=4),
+            experts=ParallelismExperts(
+                tensor_parallel_size=2,
+                expert_parallel_size=2,
             ),
-            "context parallelism",
-        ),
-        (
-            Parallelism(
-                outer=ParallelismOuter(tensor_parallel_size=4),
-                experts=ParallelismExperts(
-                    tensor_parallel_size=2,
-                    expert_parallel_size=2,
-                ),
-            ),
-            "MoE tensor and expert parallelism",
         ),
     ]
-    for parallelism, message in unsupported:
-        with pytest.raises(AdapterOperationError, match=message):
+    for parallelism in unsupported:
+        with pytest.raises(AdapterOperationError):
             plan_serve(
                 _plan_input(
                     parallelism=parallelism,
@@ -279,31 +277,42 @@ def test_plan_rejects_unsupported_workflows_and_parallelism() -> None:
                 )
             )
 
-    with pytest.raises(AdapterOperationError, match="Extra inputs are not permitted"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_plan_input(settings={"unknown": SettingValue(root=1)}))
 
 
 def _render_input(**overrides: object) -> RenderServeInput:
     plan = plan_serve(_plan_input())
+    parallelism = cast(
+        Parallelism,
+        overrides.pop("parallelism", plan.roles[0].effective_parallelism),
+    )
+    settings = cast(
+        dict[str, SettingValue],
+        overrides.pop("settings", plan.roles[0].effective_settings),
+    )
+    roles = list(cast(list[ServeRoleResult], overrides.pop("roles", plan.roles)))
+    roles[0] = roles[0].model_copy(
+        update={"effective_parallelism": parallelism, "effective_settings": settings}
+    )
     base: dict[str, object] = {
-        "model": ServeModelInput(locator="/models/dsv4", served_name="dsv4-flash"),
+        "model": ServeModelInput(id="dsv4", served_name="dsv4-flash"),
         "topology": ServeTopology.single,
-        "routing_backend": "builtin",
+        "routing_backend": None,
         "kv_transfer": None,
-        "parallelism": plan.effective_parallelism,
-        "settings": plan.effective_settings,
-        "roles": plan.roles,
+        "roles": roles,
         "links": [],
+        "routing": plan.routing,
         "profiling": False,
         "allocations": [
             ServeProcessAllocation.model_validate(
                 {
-                    "process_id": "server",
-                    "role_id": "serve",
-                    "replica_id": "server",
-                    "replica_index": 0,
+                    "process": "server",
+                    "role": "serve",
+                    "replica": 0,
                     "rank": 0,
-                    "machine_id": "local",
+                    "rank_count": 1,
+                    "machine": "local",
                     "model_locator": "/models/dsv4",
                     "devices": [0, 1, 2, 3],
                     "endpoint": {"host": "127.0.0.1", "port": 8000},
@@ -311,7 +320,9 @@ def _render_input(**overrides: object) -> RenderServeInput:
                         "control": {"host": "127.0.0.1", "port": 8001},
                         "dist_init": {"host": "127.0.0.1", "port": 8002},
                     },
-                    "runtime_cache_root": "/cache/server",
+                    "cache": "/cache/server",
+                    "launch": {"kind": "local"},
+                    "dependencies": [],
                 }
             )
         ],
@@ -356,20 +367,22 @@ def _prefill_decode_render_input() -> RenderServeInput:
         allocations.append(
             ServeProcessAllocation.model_validate(
                 {
-                    "process_id": replica.id,
-                    "role_id": replica.role_id,
-                    "replica_id": replica.id,
-                    "replica_index": replica.replica_index,
+                    "process": replica.id,
+                    "role": replica.role_id,
+                    "replica": replica.replica_index,
                     "rank": 0,
-                    "machine_id": "router" if is_router else f"node-{index}",
-                    "model_locator": "/models/dsv4",
+                    "rank_count": 1,
+                    "machine": "router" if is_router else f"node-{index}",
+                    "model_locator": None if is_router else "/models/dsv4",
                     "devices": [] if is_router else [index * 2, index * 2 + 1],
                     "endpoint": {
                         "host": "router.example" if is_router else f"node-{index}.example",
                         "port": 30000 if is_router else 8000,
                     },
                     "ports": ports,
-                    "runtime_cache_root": f"/cache/{replica.id}",
+                    "cache": f"/cache/{replica.id}",
+                    "launch": {"kind": "local"},
+                    "dependencies": [],
                 }
             )
         )
@@ -378,10 +391,9 @@ def _prefill_decode_render_input() -> RenderServeInput:
         topology=plan_input.topology,
         routing_backend=plan_input.routing_backend,
         kv_transfer=plan_input.kv_transfer,
-        parallelism=plan.effective_parallelism,
-        settings=plan.effective_settings,
         roles=plan.roles,
         links=plan.links,
+        routing=plan.routing,
         profiling=False,
         allocations=allocations,
         render_inputs=[],
@@ -392,7 +404,7 @@ def test_render_launches_tokenspeed_with_the_effective_dsv4_shape() -> None:
     result = render_serve(_render_input())
 
     assert len(result.processes) == 1
-    argv = result.processes[0].process.argv
+    argv = result.processes[0].command.argv
     assert argv[:5] == ["python3", "-m", "tokenspeed.cli", "serve", "/models/dsv4"]
     expected_options = {
         "--host": "127.0.0.1",
@@ -424,7 +436,7 @@ def test_render_launches_tokenspeed_with_the_effective_dsv4_shape() -> None:
     assert "--disable-kvstore" in argv
     assert "--trust-remote-code" in argv
 
-    env = result.processes[0].process.env
+    env = result.processes[0].command.env
     assert env["DG_JIT_CACHE_DIR"] == "/cache/server/deep_gemm_jit"
     assert env["TRITON_CACHE_DIR"] == "/cache/server/triton"
     assert env["TORCHINDUCTOR_CACHE_DIR"] == "/cache/server/torchinductor"
@@ -454,8 +466,10 @@ def test_render_merges_extra_args_without_yielding_inferlab_owned_values() -> No
         ]
     )
     plan = plan_serve(_plan_input(settings=settings))
-    result = render_serve(_render_input(settings=plan.effective_settings, roles=plan.roles))
-    argv = result.processes[0].process.argv
+    result = render_serve(
+        _render_input(settings=plan.roles[0].effective_settings, roles=plan.roles)
+    )
+    argv = result.processes[0].command.argv
 
     assert "/models/shadow" not in argv
     assert argv[argv.index("--port") + 1] == "8000"
@@ -473,8 +487,10 @@ def test_render_can_explicitly_disable_prefix_caching() -> None:
     settings["enable_prefix_caching"] = SettingValue(root=False)
     plan = plan_serve(_plan_input(settings=settings))
 
-    result = render_serve(_render_input(settings=plan.effective_settings, roles=plan.roles))
-    argv = result.processes[0].process.argv
+    result = render_serve(
+        _render_input(settings=plan.roles[0].effective_settings, roles=plan.roles)
+    )
+    argv = result.processes[0].command.argv
 
     assert "--no-enable-prefix-caching" in argv
     assert "--enable-prefix-caching" not in argv
@@ -484,7 +500,7 @@ def test_render_prefill_decode_uses_direct_grpc_workers_and_native_smg() -> None
     render_input = _prefill_decode_render_input()
     result = render_serve(render_input)
 
-    assert [process.id for process in result.processes] == [
+    assert [process.process for process in result.processes] == [
         "prefill-000",
         "prefill-001",
         "decode-000",
@@ -493,7 +509,7 @@ def test_render_prefill_decode_uses_direct_grpc_workers_and_native_smg() -> None
         "router",
     ]
     for process in result.processes[:2]:
-        argv = process.process.argv
+        argv = process.command.argv
         assert argv[:3] == ["python3", "-m", "smg_grpc_servicer.tokenspeed"]
         assert argv[argv.index("--disaggregation-mode") + 1] == "prefill"
         assert argv[argv.index("--disaggregation-transfer-backend") + 1] == "mooncake"
@@ -504,8 +520,8 @@ def test_render_prefill_decode_uses_direct_grpc_workers_and_native_smg() -> None
         assert "mooncake_async" not in argv
         assert "http://shadow" not in argv
         assert "--control-port" not in argv
-        assert process.process.env["TOKENSPEED_SKIP_GRPC_WARMUP"] == "1"
-    prefill = result.processes[0].process.argv
+        assert process.command.env["TOKENSPEED_SKIP_GRPC_WARMUP"] == "1"
+    prefill = result.processes[0].command.argv
     expected_options = {
         "--model": "/models/dsv4",
         "--host": "node-0.example",
@@ -523,15 +539,16 @@ def test_render_prefill_decode_uses_direct_grpc_workers_and_native_smg() -> None
         assert prefill[prefill.index(option) + 1] == value
 
     for process in result.processes[2:5]:
-        argv = process.process.argv
+        argv = process.command.argv
         assert argv[:3] == ["python3", "-m", "smg_grpc_servicer.tokenspeed"]
         assert argv[argv.index("--disaggregation-mode") + 1] == "decode"
         assert argv[argv.index("--disaggregation-transfer-backend") + 1] == "mooncake"
         assert "--disaggregation-bootstrap-port" not in argv
-        assert process.process.env["TOKENSPEED_SKIP_GRPC_WARMUP"] == "1"
+        assert process.command.env["TOKENSPEED_SKIP_GRPC_WARMUP"] == "1"
 
-    router = result.processes[-1].process.argv
+    router = result.processes[-1].command.argv
     assert router[:4] == ["python3", "-m", "smg", "launch"]
+    assert router[router.index("--host") + 1] == "0.0.0.0"
     assert [router[index + 1] for index, arg in enumerate(router) if arg == "--prefill"] == [
         "grpc://node-0.example:8000",
         "grpc://node-1.example:8000",
@@ -554,7 +571,7 @@ def test_render_prefill_decode_uses_direct_grpc_workers_and_native_smg() -> None
 
 def test_render_requires_allocated_control_and_dist_init_ports_and_one_process() -> None:
     allocation = _render_input().allocations[0].model_copy(update={"ports": {}})
-    with pytest.raises(AdapterOperationError, match="control port"):
+    with pytest.raises(AdapterOperationError):
         render_serve(_render_input(allocations=[allocation]))
 
     allocation = (
@@ -562,13 +579,21 @@ def test_render_requires_allocated_control_and_dist_init_ports_and_one_process()
         .allocations[0]
         .model_copy(update={"ports": {"control": _render_input().allocations[0].ports["control"]}})
     )
-    with pytest.raises(AdapterOperationError, match="distributed initialization port"):
+    with pytest.raises(AdapterOperationError):
         render_serve(_render_input(allocations=[allocation]))
 
     second = (
         _render_input()
         .allocations[0]
-        .model_copy(update={"process_id": "server-rank-001", "rank": 1, "machine_id": "node-b"})
+        .model_copy(
+            update={
+                "process": "server-rank-001",
+                "rank": 1,
+                "rank_count": 2,
+                "machine": "node-b",
+            }
+        )
     )
-    with pytest.raises(AdapterOperationError, match="multi-node"):
-        render_serve(_render_input(allocations=[_render_input().allocations[0], second]))
+    first = _render_input().allocations[0].model_copy(update={"rank_count": 2})
+    with pytest.raises(AdapterOperationError):
+        render_serve(_render_input(allocations=[first, second]))

@@ -1,15 +1,19 @@
 {
   "status": "ok",
-  "protocol_version": "4",
+  "protocol_version": "5",
   "result": {
     "operation": "render_serve",
     "output": {
-      "integration": {"adapter_id": "inferlab-vllm", "adapter_version": "0.2.0", "framework": "vllm"},
+      "integration": {"adapter_id": "inferlab-vllm", "adapter_version": "0.2.0", "framework": "vllm", "framework_version": "0.10.2"},
       "processes": [
         {
-          "id": "prefill",
+          "process": "prefill",
+          "role": "prefill",
+          "replica": 0,
+          "rank": 0,
+          "rank_count": 1,
           "launch_files": [],
-          "process": {
+          "command": {
             "argv": [
               "python3", "-m", "vllm.entrypoints.cli.main", "serve", "/models/dsv4",
               "--host", "node-a.example", "--port", "8000",
@@ -34,9 +38,13 @@
           }
         },
         {
-          "id": "decode",
+          "process": "decode",
+          "role": "decode",
+          "replica": 0,
+          "rank": 0,
+          "rank_count": 1,
           "launch_files": [],
-          "process": {
+          "command": {
             "argv": [
               "python3", "-m", "vllm.entrypoints.cli.main", "serve", "/models/dsv4",
               "--host", "node-b.example", "--port", "8000",

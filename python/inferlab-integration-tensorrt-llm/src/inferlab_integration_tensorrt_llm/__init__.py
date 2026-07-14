@@ -9,6 +9,7 @@ import yaml  # type: ignore[import-untyped]
 from inferlab_adapter_sdk import (
     AdapterErrorCode,
     AdapterOperationError,
+    BuiltinRouterKind,
     EndpointProtocol,
     EndpointRequirement,
     IntegrationIdentity,
@@ -21,9 +22,6 @@ from inferlab_adapter_sdk import (
     PlanServeInput,
     PlanServeResult,
     ProcessSpec,
-    PublicEndpointRequirement,
-    PublicEndpointRequirementBuiltinProxy,
-    PublicEndpointRequirementReplica,
     ReadinessProbe,
     ReadinessProbeHttp,
     ReadinessProbeProcessAlive,
@@ -31,6 +29,10 @@ from inferlab_adapter_sdk import (
     RenderInputDeclaration,
     RenderServeInput,
     RenderServeResult,
+    RoutingResult,
+    RoutingResultDirect,
+    RoutingResultInferlabBuiltin,
+    RoutingResultIntegrationNative,
     ServeProcessAllocation,
     ServeReplicaRequirement,
     ServeRoleInput,
@@ -55,6 +57,7 @@ _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--config": 1,
     "--context_parallel_size": 1,
     "--cp_size": 1,
+    "--custom_tokenizer": 1,
     "--enable_attention_dp": 0,
     "--enable_chunked_prefill": 0,
     "--ep_size": 1,
@@ -75,6 +78,8 @@ _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--tensor_parallel_size": 1,
     "--tp_size": 1,
     "--trust_remote_code": 0,
+    "--tool_parser": 1,
+    "--reasoning_parser": 1,
 }
 
 _RUNTIME_CACHE_SUBDIRS = {
@@ -91,6 +96,8 @@ _PREFILL_DECODE_OPTION_ARITY = {**_INFERLAB_OPTION_ARITY, "--backend": 1}
 # Inferlab owns readiness; the router's internal guard must not expire first.
 _ROUTER_WORKER_STARTUP_TIMEOUT_SECS = 2_147_483_647
 
+type YamlValue = bool | int | float | str | list[YamlValue] | dict[str, YamlValue]
+
 
 class TrtllmServeSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -102,8 +109,12 @@ class TrtllmServeSettings(BaseModel):
     free_gpu_memory_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
     enable_chunked_prefill: bool = False
     trust_remote_code: bool = False
+    custom_tokenizer: str | None = None
+    tool_parser: str | None = None
+    reasoning_parser: str | None = None
     # Source YAML; P/D composition overrides its transport and cache invariants.
     extra_llm_api_options: str | None = None
+    extra_llm_api_options_patch: dict[str, YamlValue] | None = None
     extra_args: list[str] | None = None
     extra_env: dict[str, str] | None = None
 
@@ -123,14 +134,6 @@ def _settings(values: dict[str, SettingValue]) -> TrtllmServeSettings:
         )
     except ValidationError as error:
         raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
-
-
-def _merged_settings(
-    base: dict[str, SettingValue], overrides: dict[str, SettingValue]
-) -> TrtllmServeSettings:
-    merged = dict(base)
-    merged.update(overrides)
-    return _settings(merged)
 
 
 def _effective_settings(settings: TrtllmServeSettings) -> dict[str, SettingValue]:
@@ -195,18 +198,29 @@ def _nested_mapping(config: dict[str, object], key: str) -> dict[str, object]:
     return nested
 
 
+def _merge_yaml_patch(config: dict[str, object], patch: dict[str, YamlValue]) -> None:
+    for key, value in patch.items():
+        current = config.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            _merge_yaml_patch(_yaml_mapping(current, key), value)
+        else:
+            config[key] = value
+
+
 def _worker_launch_text(
     input: RenderServeInput, settings: TrtllmServeSettings, kind: ServeRoleKind
 ) -> str:
     config = _load_worker_config(input, settings.extra_llm_api_options)
-    config["backend"] = "pytorch"
-    transceiver = _nested_mapping(config, "cache_transceiver_config")
-    transceiver["backend"] = "NIXL"
-    transceiver["transceiver_runtime"] = "PYTHON"
-    kv_cache = _nested_mapping(config, "kv_cache_config")
-    kv_cache["enable_block_reuse"] = False
-    if kind == ServeRoleKind.prefill:
-        config["disable_overlap_scheduler"] = True
+    _merge_yaml_patch(config, settings.extra_llm_api_options_patch or {})
+    if input.topology == ServeTopology.prefill_decode:
+        config["backend"] = "pytorch"
+        transceiver = _nested_mapping(config, "cache_transceiver_config")
+        transceiver["backend"] = "NIXL"
+        transceiver["transceiver_runtime"] = "PYTHON"
+        kv_cache = _nested_mapping(config, "kv_cache_config")
+        kv_cache["enable_block_reuse"] = False
+        if kind == ServeRoleKind.prefill:
+            config["disable_overlap_scheduler"] = True
     return cast(str, yaml.safe_dump(config, sort_keys=False))
 
 
@@ -224,24 +238,29 @@ def _launch_file(
 
 
 def _adapter_version() -> str:
-    try:
-        return version("inferlab-integration-tensorrt-llm")
-    except PackageNotFoundError:
-        # Raw source-tree execution with no installed distribution
-        # metadata: the adjacent pyproject is the version authority.
-        # External-image lowering mounts each package's dist-info beside
-        # its module, so importlib.metadata resolves there instead.
-        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if pyproject.is_file():
         with pyproject.open("rb") as handle:
             project_version: str = tomllib.load(handle)["project"]["version"]
         return project_version
+    try:
+        return version("inferlab-integration-tensorrt-llm")
+    except PackageNotFoundError:
+        # External-image lowering mounts each package's dist-info beside
+        # its module, so importlib.metadata resolves there instead.
+        return "unavailable"
 
 
 def _identity() -> IntegrationIdentity:
+    try:
+        framework_version = version("tensorrt_llm")
+    except PackageNotFoundError:
+        framework_version = "unavailable"
     return IntegrationIdentity(
         adapter_id="inferlab-tensorrt-llm",
         adapter_version=_adapter_version(),
         framework="tensorrt-llm",
+        framework_version=framework_version,
     )
 
 
@@ -347,7 +366,7 @@ def _replica_id(role: ServeRoleInput, replica_index: int) -> str:
     return f"{base}-{replica_index:03d}"
 
 
-def _accelerator_count(parallelism: Parallelism) -> int:
+def _device_count(parallelism: Parallelism) -> int:
     outer = parallelism.outer or ParallelismOuter()
     return (outer.tensor_parallel_size or 1) * (outer.pipeline_parallel_size or 1)
 
@@ -360,14 +379,14 @@ def _plan_role(
             AdapterErrorCode.invalid_settings,
             f"role {role.id!r} replica count must be positive",
         )
-    settings = _merged_settings(input.settings, role.settings)
+    settings = _settings(role.settings)
     parallelism = _effective_parallelism(role.parallelism)
     replicas = [
         ServeReplicaRequirement(
             id=_replica_id(role, replica_index),
             role_id=role.id,
             replica_index=replica_index,
-            accelerator_count=_accelerator_count(parallelism),
+            device_count=_device_count(parallelism),
             ports=[],
             primary_ports=["master"],
             primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/health")),
@@ -379,7 +398,8 @@ def _plan_role(
         ServeRoleResult(
             id=role.id,
             kind=role.kind,
-            replica_count=role.replica_count,
+            declared_replica_count=role.replica_count,
+            effective_replica_count=role.replica_count,
             effective_settings=_effective_settings(settings),
             effective_parallelism=parallelism,
         ),
@@ -400,7 +420,7 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             "single topology does not use a KV-transfer mechanism",
         )
-    if input.routing_backend != "builtin":
+    if input.routing_backend is not None:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
             f"the TensorRT-LLM integration does not support routing backend "
@@ -408,17 +428,23 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
         )
     role = _role_for_kind(input, ServeRoleKind.serve)
     role_result, replicas = _plan_role(input, role)
+    settings = _settings(role_result.effective_settings)
+    render_inputs = []
+    if (
+        settings.extra_llm_api_options_patch is not None
+        and settings.extra_llm_api_options is not None
+    ):
+        render_inputs.append(
+            RenderInputDeclaration(source_path=_render_source_path(settings.extra_llm_api_options))
+        )
     return PlanServeResult(
         integration=_identity(),
-        effective_settings=_effective_settings(_settings(input.settings)),
-        effective_parallelism=_effective_parallelism(input.parallelism),
         roles=[role_result],
         replicas=replicas,
         links=[],
-        public_endpoint=PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id=replicas[0].id)
-        ),
+        routing=RoutingResult(root=RoutingResultDirect(role=role.id, replica=0)),
         endpoint=_endpoint_requirement(),
+        render_inputs=render_inputs,
     )
 
 
@@ -428,7 +454,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             "TensorRT-LLM prefill_decode requires NIXL KV transfer",
         )
-    if input.routing_backend not in {"builtin", _NATIVE_ROUTING_BACKEND}:
+    routing_backend = input.routing_backend or "builtin"
+    if routing_backend not in {"builtin", _NATIVE_ROUTING_BACKEND}:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
             f"TensorRT-LLM does not support routing backend {input.routing_backend!r}",
@@ -459,13 +486,14 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             )
         ),
     ]
-    if input.routing_backend == "builtin":
-        public_endpoint = PublicEndpointRequirement(
-            root=PublicEndpointRequirementBuiltinProxy(
-                process_id="proxy",
-                role_id="router",
+    if routing_backend == "builtin":
+        routing = RoutingResult(
+            root=RoutingResultInferlabBuiltin(
+                implementation=BuiltinRouterKind.trtllm,
+                policy="round_robin",
                 prefill_role=prefill.id,
                 decode_role=decode.id,
+                ports=[],
                 readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/healthcheck")),
             )
         )
@@ -474,7 +502,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             ServeRoleResult(
                 id="router",
                 kind=ServeRoleKind.router,
-                replica_count=1,
+                declared_replica_count=1,
+                effective_replica_count=1,
                 effective_settings={},
                 effective_parallelism=Parallelism(),
             )
@@ -484,24 +513,22 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
                 id="router",
                 role_id="router",
                 replica_index=0,
-                accelerator_count=0,
+                device_count=0,
                 ports=[],
                 primary_ports=[],
                 primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/health")),
                 worker_readiness=ReadinessProbe(root=ReadinessProbeProcessAlive()),
             )
         )
-        public_endpoint = PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id="router")
+        routing = RoutingResult(
+            root=RoutingResultIntegrationNative(role="router", replica=0, policy="context_first")
         )
     return PlanServeResult(
         integration=_identity(),
-        effective_settings=_effective_settings(_settings(input.settings)),
-        effective_parallelism=_effective_parallelism(input.parallelism),
         roles=roles,
         replicas=replicas,
         links=links,
-        public_endpoint=public_endpoint,
+        routing=routing,
         endpoint=_endpoint_requirement(),
         render_inputs=[
             RenderInputDeclaration(source_path=source_path) for source_path in source_paths
@@ -529,6 +556,12 @@ def _render_worker(
     outer = role.effective_parallelism.outer or ParallelismOuter()
     attention = role.effective_parallelism.attention or ParallelismAttention()
     experts = role.effective_parallelism.experts or ParallelismExperts()
+    if allocation.model_locator is None or allocation.endpoint is None:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request,
+            f"serving allocation {allocation.process!r} is missing its model or endpoint",
+        )
+    endpoint = allocation.endpoint
     argv = [
         "python3",
         "-m",
@@ -537,9 +570,9 @@ def _render_worker(
     ]
     inferlab_args = [
         "--host",
-        allocation.endpoint.host,
+        endpoint.host,
         "--port",
-        str(allocation.endpoint.port),
+        str(endpoint.port),
         "--served_model_name",
         input.model.served_name,
         "--tensor_parallel_size",
@@ -556,22 +589,32 @@ def _render_worker(
     append_option(inferlab_args, "--max_seq_len", settings.max_seq_len)
     append_option(inferlab_args, "--kv_cache_dtype", settings.kv_cache_dtype)
     append_option(inferlab_args, "--free_gpu_memory_fraction", settings.free_gpu_memory_fraction)
+    append_option(inferlab_args, "--custom_tokenizer", settings.custom_tokenizer)
+    append_option(inferlab_args, "--tool_parser", settings.tool_parser)
+    append_option(inferlab_args, "--reasoning_parser", settings.reasoning_parser)
     launch_files: list[LaunchFileDeclaration] = []
-    if input.topology == ServeTopology.prefill_decode:
-        if role.kind not in {ServeRoleKind.prefill, ServeRoleKind.decode}:
+    if (
+        input.topology == ServeTopology.prefill_decode
+        or settings.extra_llm_api_options_patch is not None
+    ):
+        if input.topology == ServeTopology.prefill_decode and role.kind not in {
+            ServeRoleKind.prefill,
+            ServeRoleKind.decode,
+        }:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
                 f"prefill_decode allocation has unsupported role {role.id!r}",
             )
         launch_text = _worker_launch_text(input, settings, role.kind)
         launch_file, resolved_path = _launch_file(
-            allocation.runtime_cache_root,
+            allocation.cache,
             "extra-llm-api-options.yaml",
             launch_text,
         )
         launch_files.append(launch_file)
         inferlab_args.extend(["--extra_llm_api_options", resolved_path])
-        inferlab_args.extend(["--backend", "pytorch"])
+        if input.topology == ServeTopology.prefill_decode:
+            inferlab_args.extend(["--backend", "pytorch"])
     else:
         append_option(inferlab_args, "--extra_llm_api_options", settings.extra_llm_api_options)
     if settings.enable_chunked_prefill:
@@ -584,12 +627,16 @@ def _render_worker(
         else _INFERLAB_OPTION_ARITY
     )
     argv.extend(merge_serve_args(settings.extra_args or [], inferlab_args, option_arity))
-    process_env = _runtime_cache_env(allocation.runtime_cache_root)
+    process_env = _runtime_cache_env(allocation.cache)
     process_env.update(settings.extra_env or {})
     return RenderedServeProcess(
-        id=allocation.process_id,
+        process=allocation.process,
+        role=allocation.role,
+        replica=allocation.replica,
+        rank=allocation.rank,
+        rank_count=allocation.rank_count,
         launch_files=launch_files,
-        process=ProcessSpec(argv=argv, env=process_env),
+        command=ProcessSpec(argv=argv, env=process_env),
     )
 
 
@@ -601,44 +648,64 @@ def _rank_zero_allocations(
         [
             allocation
             for allocation in input.allocations
-            if allocation.role_id in role_ids and allocation.rank == 0
+            if allocation.role in role_ids and allocation.rank == 0
         ],
-        key=lambda allocation: (allocation.replica_index, allocation.replica_id),
+        key=lambda allocation: allocation.replica,
     )
 
 
 def _render_native_router(
-    input: RenderServeInput, allocation: ServeProcessAllocation
+    input: RenderServeInput,
+    role: ServeRoleResult,
+    allocation: ServeProcessAllocation,
 ) -> RenderedServeProcess:
     prefill = _rank_zero_allocations(input, ServeRoleKind.prefill)
     decode = _rank_zero_allocations(input, ServeRoleKind.decode)
+    if allocation.endpoint is None or any(item.endpoint is None for item in [*prefill, *decode]):
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request,
+            "TensorRT-LLM disaggregated allocations require public endpoints",
+        )
+    endpoint = allocation.endpoint
     config = {
-        "hostname": allocation.endpoint.host,
-        "port": allocation.endpoint.port,
+        "hostname": endpoint.host,
+        "port": endpoint.port,
         "schedule_style": "context_first",
         "context_servers": {
             "num_instances": len(prefill),
-            "urls": [f"{item.endpoint.host}:{item.endpoint.port}" for item in prefill],
+            "urls": [
+                f"{item.endpoint.host}:{item.endpoint.port}"
+                for item in prefill
+                if item.endpoint is not None
+            ],
             "router": {"type": "round_robin"},
         },
         "generation_servers": {
             "num_instances": len(decode),
-            "urls": [f"{item.endpoint.host}:{item.endpoint.port}" for item in decode],
+            "urls": [
+                f"{item.endpoint.host}:{item.endpoint.port}"
+                for item in decode
+                if item.endpoint is not None
+            ],
             "router": {"type": "round_robin"},
         },
     }
     text = cast(str, yaml.safe_dump(config, sort_keys=False))
     launch_file, resolved_path = _launch_file(
-        allocation.runtime_cache_root,
+        allocation.cache,
         "disaggregated.yaml",
         text,
     )
-    process_env = _runtime_cache_env(allocation.runtime_cache_root)
-    process_env.update(_settings(input.settings).extra_env or {})
+    process_env = _runtime_cache_env(allocation.cache)
+    process_env.update(_settings(role.effective_settings).extra_env or {})
     return RenderedServeProcess(
-        id=allocation.process_id,
+        process=allocation.process,
+        role=allocation.role,
+        replica=allocation.replica,
+        rank=allocation.rank,
+        rank_count=allocation.rank_count,
         launch_files=[launch_file],
-        process=ProcessSpec(
+        command=ProcessSpec(
             argv=[
                 "python3",
                 "-m",
@@ -660,21 +727,18 @@ def render_serve(input: RenderServeInput) -> RenderServeResult:
             AdapterErrorCode.invalid_request, "serve allocation must not be empty"
         )
     roles = {role.id: role for role in input.roles}
-    replica_counts: dict[str, int] = {}
-    for allocation in input.allocations:
-        replica_counts[allocation.replica_id] = replica_counts.get(allocation.replica_id, 0) + 1
     processes: list[RenderedServeProcess] = []
     for allocation in input.allocations:
-        role = roles.get(allocation.role_id)
+        role = roles.get(allocation.role)
         if role is None:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
-                f"allocation references unknown role {allocation.role_id!r}",
+                f"allocation references unknown role {allocation.role!r}",
             )
         if role.kind == ServeRoleKind.router:
-            processes.append(_render_native_router(input, allocation))
+            processes.append(_render_native_router(input, role, allocation))
             continue
-        if replica_counts[allocation.replica_id] > 1:
+        if allocation.rank_count > 1:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
                 "the TensorRT-LLM integration does not support multi-node serving yet",

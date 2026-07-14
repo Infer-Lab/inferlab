@@ -2,9 +2,9 @@ use crate::InferlabError;
 use crate::profiler::CaptureRecord;
 pub(super) use crate::record::write_json;
 use crate::record::{RECORD_FILE, RECORDS_DIR, now_unix_ms, validate_record_id};
+use crate::workload::ResolvedWorkloadPlan;
 use inferlab_protocol::{HttpMethod, RawArtifact};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,13 +101,17 @@ pub struct WorkloadRecord {
     pub status: WorkloadStatus,
     pub started_unix_ms: u64,
     pub finished_unix_ms: Option<u64>,
-    pub resolved: Value,
+    pub resolved: ResolvedWorkloadPlan,
     pub passed: Option<bool>,
     pub skip_reason: Option<String>,
     pub error: Option<String>,
     pub cases: Vec<ClientCaseRecord>,
     pub summary: Option<AdaptiveBenchSummary>,
     pub capture: Option<CaptureRecord>,
+}
+
+impl WorkloadRecord {
+    const SCHEMA_VERSION: u32 = 3;
 }
 
 pub(super) struct WorkloadRecordSession {
@@ -121,7 +125,7 @@ impl WorkloadRecordSession {
         id: &str,
         kind: WorkloadKind,
         definition_id: &str,
-        resolved: Value,
+        resolved: ResolvedWorkloadPlan,
     ) -> Result<Self, InferlabError> {
         validate_record_id("execution record", id)?;
         let record_dir = root.join(RECORDS_DIR).join(id);
@@ -130,7 +134,7 @@ impl WorkloadRecordSession {
             source,
         })?;
         let record = WorkloadRecord {
-            schema_version: 2,
+            schema_version: WorkloadRecord::SCHEMA_VERSION,
             inferlab_version: env!("CARGO_PKG_VERSION").to_owned(),
             id: id.to_owned(),
             kind,

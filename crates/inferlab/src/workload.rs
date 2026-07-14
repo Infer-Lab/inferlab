@@ -3,21 +3,21 @@ mod record;
 mod runtime;
 
 use crate::InferlabError;
-use crate::resolve::current_environment;
+use crate::resolve::{ResolvedExecution, current_environment};
 use crate::server::ServerRecord;
 use crate::toolchain::{
     self, BenchToolchainIdentity, EvalToolchainIdentity, InstalledBenchToolchain,
     InstalledEvalToolchain,
 };
 use crate::workspace::{
-    BenchDefinition, EvalDefinition, LoadedWorkspace, RequestRate, WorkloadSuiteDefinition,
-    WorkspaceSnapshot, validate_bench,
+    BenchDefinition, EvalDefinition, RequestRate, WorkloadSuiteDefinition, WorkspaceConfig,
+    WorkspaceSnapshot, validate_bench, validate_eval,
 };
 use inferlab_protocol::{
-    BenchDefinitionInput, ClientEndpointInput, EvalDefinitionInput, HttpActionSpec, ServeModelInput,
+    BenchDefinitionInput, ClientEndpointInput, EvalDefinitionInput, HttpActionSpec,
+    MeasurementModelInput,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -26,30 +26,61 @@ pub use record::WorkloadStatus;
 pub(crate) use runtime::skip;
 pub use runtime::{run_bench, run_eval};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MeasurementPlan {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
     pub evals: Vec<EvalPlan>,
     pub benches: Vec<BenchPlan>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EvalPlan {
     pub id: String,
     pub capture: bool,
+    pub declared_definition: EvalDefinition,
     pub definition: EvalDefinition,
+    pub overrides: Vec<MeasurementOverridePlan>,
     pub endpoint: ClientEndpointInput,
-    pub model: ServeModelInput,
+    pub model: MeasurementModelInput,
     pub execution: EvalExecutionPlan,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchPlan {
     pub id: String,
     pub capture: bool,
+    pub declared_definition: BenchDefinition,
     pub definition: BenchDefinition,
+    pub overrides: Vec<MeasurementOverridePlan>,
     pub execution: BenchExecutionPlan,
     pub client: BenchClientPlan,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MeasurementOverridePlan {
+    pub invocation_index: usize,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ResolvedWorkloadPlan {
+    Eval(Box<EvalPlan>),
+    Bench(Box<BenchPlan>),
+    ManualBench(Box<ManualBenchPlan>),
+}
+
+impl From<EvalPlan> for ResolvedWorkloadPlan {
+    fn from(plan: EvalPlan) -> Self {
+        Self::Eval(Box::new(plan))
+    }
+}
+
+impl From<BenchPlan> for ResolvedWorkloadPlan {
+    fn from(plan: BenchPlan) -> Self {
+        Self::Bench(Box::new(plan))
+    }
 }
 
 pub enum WorkloadServerAccess<'a> {
@@ -65,14 +96,14 @@ impl WorkloadServerAccess<'_> {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ManualBenchTarget {
     pub server_record_id: String,
     pub producing_inferlab_version: String,
-    pub serving_snapshot: Value,
+    pub serving_snapshot: ResolvedExecution,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ManualBenchPlan {
     pub invoking_inferlab_version: String,
     pub target: ManualBenchTarget,
@@ -104,7 +135,7 @@ impl ManualBenchPlan {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvalExecutionPlan {
     #[serde(rename = "native_openai_smoke")]
@@ -115,24 +146,25 @@ pub enum EvalExecutionPlan {
     },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchClientPlan {
     pub toolchain: BenchToolchainIdentity,
     pub endpoint: ClientEndpointInput,
-    pub model: ServeModelInput,
+    pub model: MeasurementModelInput,
     pub effective_definition: BenchDefinitionInput,
     pub command: ClientCommandPlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_reset: Option<inferlab_protocol::HttpActionSpec>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientCommandPlan {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum BenchExecutionPlan {
     Matrix {
@@ -144,20 +176,23 @@ pub enum BenchExecutionPlan {
         target_metric: String,
         target_threshold: f64,
         max_refinement_steps: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
         min_rate_resolution: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         request_count: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         duration_seconds: Option<u64>,
     },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchCasePlan {
     pub id: String,
     pub load_shape: LoadShape,
     pub request_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum LoadShape {
     ConcurrencyLimited {
@@ -172,47 +207,23 @@ pub enum LoadShape {
 
 pub struct MeasurementResolveContext<'a> {
     pub endpoint: ClientEndpointInput,
-    pub model: ServeModelInput,
+    pub model: MeasurementModelInput,
     pub prefix_cache_reset: Option<HttpActionSpec>,
     pub capture_ids: &'a [String],
     pub command_env: &'a BTreeMap<String, String>,
     pub command_cwd: &'a Path,
 }
 
-#[derive(Deserialize)]
-struct RecordedExecution {
-    server: RecordedServer,
-}
-
-#[derive(Deserialize)]
-struct RecordedServer {
-    model: RecordedModel,
-    endpoint: RecordedEndpoint,
-}
-
-#[derive(Deserialize)]
-struct RecordedModel {
-    served_name: String,
-    locator: String,
-}
-
-#[derive(Deserialize)]
-struct RecordedEndpoint {
-    host: String,
-    port: u16,
-    protocol: inferlab_protocol::EndpointProtocol,
-    api_path: String,
-    prefix_cache_reset: Option<HttpActionSpec>,
-}
-
 pub fn resolve_manual_bench(
-    workspace: &LoadedWorkspace,
+    root: &Path,
+    config: &WorkspaceConfig,
+    snapshot: &WorkspaceSnapshot,
     server: &ServerRecord,
     bench_id: &str,
     overrides: &[String],
     capture: bool,
 ) -> Result<ManualBenchPlan, InferlabError> {
-    if server.schema_version != 1 {
+    if server.schema_version != ServerRecord::SCHEMA_VERSION {
         return Err(InferlabError::InvalidConfig {
             message: format!(
                 "server record {:?} has unsupported schema version {}",
@@ -222,8 +233,8 @@ pub fn resolve_manual_bench(
     }
     if capture
         && !server
-            .processes
-            .iter()
+            .process_evidence
+            .values()
             .any(|process| process.profiler.is_some())
     {
         return Err(InferlabError::InvalidConfig {
@@ -233,24 +244,33 @@ pub fn resolve_manual_bench(
             ),
         });
     }
-    let recorded: RecordedExecution =
-        serde_json::from_value(server.resolved.clone()).map_err(|error| {
-            InferlabError::InvalidConfig {
-                message: format!(
-                    "server record {:?} does not preserve a compatible serving snapshot: {error}",
-                    server.id
-                ),
-            }
-        })?;
-    let definition = workspace
-        .config
-        .benches
-        .get(bench_id)
-        .cloned()
+    let recorded = &server.resolved;
+    let declared_definition =
+        config
+            .benches
+            .get(bench_id)
+            .cloned()
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: format!("unknown selected bench {bench_id:?}"),
+            })?;
+    let indexed = indexed_overrides(overrides)?;
+    let (definition, override_plan) =
+        apply_bench_overrides(bench_id, declared_definition.clone(), &indexed)?;
+    let model_locator = recorded
+        .server
+        .roles
+        .iter()
+        .filter(|role| role.id != "router")
+        .flat_map(|role| &role.replicas)
+        .flat_map(|replica| &replica.ranks)
+        .filter(|rank| rank.rank == 0)
+        .find_map(|rank| rank.allocation.model_locator.clone())
         .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("unknown selected bench {bench_id:?}"),
+            message: format!(
+                "server record {:?} has no model locator usable by measurements",
+                server.id
+            ),
         })?;
-    let definition = apply_bench_overrides(bench_id, definition, overrides)?;
     let toolchain = toolchain::require_bench()?;
     let command_env = current_environment()?;
     let capture_ids = if capture {
@@ -261,18 +281,18 @@ pub fn resolve_manual_bench(
     let context = MeasurementResolveContext {
         endpoint: ClientEndpointInput {
             protocol: recorded.server.endpoint.protocol,
-            host: recorded.server.endpoint.host,
+            host: recorded.server.endpoint.host.clone(),
             port: recorded.server.endpoint.port,
-            api_path: recorded.server.endpoint.api_path,
+            api_path: recorded.server.endpoint.api_path.clone(),
         },
-        model: ServeModelInput {
-            locator: recorded.server.model.locator,
-            served_name: recorded.server.model.served_name,
+        model: MeasurementModelInput {
+            locator: model_locator,
+            served_name: recorded.server.model.served_name.clone(),
         },
-        prefix_cache_reset: recorded.server.endpoint.prefix_cache_reset,
+        prefix_cache_reset: recorded.server.endpoint.prefix_cache_reset.clone(),
         capture_ids: &capture_ids,
         command_env: &command_env,
-        command_cwd: &workspace.root.join(".inferlab"),
+        command_cwd: &root.join(".inferlab"),
     };
     Ok(ManualBenchPlan {
         invoking_inferlab_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -281,9 +301,16 @@ pub fn resolve_manual_bench(
             producing_inferlab_version: server.inferlab_version.clone(),
             serving_snapshot: server.resolved.clone(),
         },
-        measurement_workspace: workspace.snapshot.clone(),
+        measurement_workspace: snapshot.clone(),
         overrides: overrides.to_vec(),
-        bench: build_bench_plan(bench_id, definition, &context, &toolchain)?,
+        bench: build_bench_plan(
+            bench_id,
+            declared_definition,
+            definition,
+            override_plan,
+            &context,
+            &toolchain,
+        )?,
     })
 }
 
@@ -291,8 +318,10 @@ pub fn resolve_measurements(
     suite: &WorkloadSuiteDefinition,
     evals: &BTreeMap<String, EvalDefinition>,
     benches: &BTreeMap<String, BenchDefinition>,
+    overrides: &[String],
     context: &MeasurementResolveContext<'_>,
 ) -> Result<MeasurementPlan, InferlabError> {
+    validate_recipe_measurement_overrides(suite, evals, benches, overrides)?;
     for id in context.capture_ids {
         if !suite.evals.contains(id) && !suite.benches.contains(id) {
             return Err(InferlabError::InvalidConfig {
@@ -321,7 +350,15 @@ pub fn resolve_measurements(
         evals: suite
             .evals
             .iter()
-            .map(|id| resolve_eval(id, evals, context, eval_toolchain.as_ref()))
+            .map(|id| {
+                resolve_eval(
+                    id,
+                    evals,
+                    &recipe_measurement_overrides("evals", id, overrides),
+                    context,
+                    eval_toolchain.as_ref(),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?,
         benches: suite
             .benches
@@ -330,6 +367,7 @@ pub fn resolve_measurements(
                 resolve_bench(
                     id,
                     benches,
+                    &recipe_measurement_overrides("benches", id, overrides),
                     context,
                     bench_toolchain
                         .as_ref()
@@ -345,21 +383,34 @@ pub fn resolve_measurements(
 fn resolve_bench(
     id: &str,
     definitions: &BTreeMap<String, BenchDefinition>,
+    overrides: &[IndexedMeasurementOverride],
     context: &MeasurementResolveContext<'_>,
     toolchain: &InstalledBenchToolchain,
 ) -> Result<BenchPlan, InferlabError> {
-    let definition = definitions
-        .get(id)
-        .cloned()
-        .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("unknown selected bench {id:?}"),
-        })?;
-    build_bench_plan(id, definition, context, toolchain)
+    let declared_definition =
+        definitions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: format!("unknown selected bench {id:?}"),
+            })?;
+    let (definition, override_plan) =
+        apply_bench_overrides(id, declared_definition.clone(), overrides)?;
+    build_bench_plan(
+        id,
+        declared_definition,
+        definition,
+        override_plan,
+        context,
+        toolchain,
+    )
 }
 
 fn build_bench_plan(
     id: &str,
+    declared_definition: BenchDefinition,
     definition: BenchDefinition,
+    overrides: Vec<MeasurementOverridePlan>,
     context: &MeasurementResolveContext<'_>,
     toolchain: &InstalledBenchToolchain,
 ) -> Result<BenchPlan, InferlabError> {
@@ -388,8 +439,10 @@ fn build_bench_plan(
     Ok(BenchPlan {
         id: id.to_owned(),
         capture: context.capture_ids.iter().any(|capture| capture == id),
+        declared_definition,
         execution: resolve_bench_execution(id, &definition)?,
         definition,
+        overrides,
         client: BenchClientPlan {
             toolchain: toolchain.identity.clone(),
             endpoint: context.endpoint.clone(),
@@ -411,53 +464,49 @@ fn build_bench_plan(
 fn apply_bench_overrides(
     id: &str,
     definition: BenchDefinition,
-    overrides: &[String],
-) -> Result<BenchDefinition, InferlabError> {
+    overrides: &[IndexedMeasurementOverride],
+) -> Result<(BenchDefinition, Vec<MeasurementOverridePlan>), InferlabError> {
     let mut value =
         toml::Value::try_from(definition).map_err(|error| InferlabError::InvalidConfig {
             message: format!("failed to prepare bench {id:?} for overrides: {error}"),
         })?;
-    for override_value in overrides {
-        apply_bench_override(&mut value, override_value)?;
+    for item in overrides {
+        apply_definition_override(&mut value, item)?;
     }
     let definition = value
         .try_into()
         .map_err(|error| InferlabError::InvalidOverride {
-            value: overrides.join(", "),
+            value: overrides
+                .iter()
+                .map(|item| item.raw.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
             message: format!("invalid effective Bench definition: {error}"),
         })?;
     validate_bench(id, &definition)?;
-    Ok(definition)
+    Ok((definition, override_plan(overrides)))
 }
 
-fn apply_bench_override(
+fn apply_definition_override(
     definition: &mut toml::Value,
-    override_value: &str,
+    item: &IndexedMeasurementOverride,
 ) -> Result<(), InferlabError> {
-    let (path, raw_value) =
-        override_value
-            .split_once('=')
-            .ok_or_else(|| InferlabError::InvalidOverride {
-                value: override_value.to_owned(),
-                message: "expected PATH=<TOML-value>".to_owned(),
-            })?;
-    let segments = path.split('.').collect::<Vec<_>>();
-    if segments.iter().any(|segment| segment.is_empty()) {
+    let path: toml::Table = toml::from_str(&format!("{} = 0", item.path)).map_err(|error| {
+        InferlabError::InvalidOverride {
+            value: item.raw.clone(),
+            message: format!("invalid TOML key path: {error}"),
+        }
+    })?;
+    if path.contains_key("kind") {
         return Err(InferlabError::InvalidOverride {
-            value: override_value.to_owned(),
-            message: "Bench path contains an empty segment".to_owned(),
-        });
-    }
-    if segments.first() == Some(&"kind") {
-        return Err(InferlabError::InvalidOverride {
-            value: override_value.to_owned(),
-            message: "Bench kind cannot be overridden".to_owned(),
+            value: item.raw.clone(),
+            message: "measurement kind cannot be overridden".to_owned(),
         });
     }
     let document: toml::Table =
-        toml::from_str(&format!("value = {raw_value}")).map_err(|error| {
+        toml::from_str(&format!("value = {}", item.raw_value)).map_err(|error| {
             InferlabError::InvalidOverride {
-                value: override_value.to_owned(),
+                value: item.raw.clone(),
                 message: format!("invalid TOML value: {error}"),
             }
         })?;
@@ -466,51 +515,218 @@ fn apply_bench_override(
             .get("value")
             .cloned()
             .ok_or_else(|| InferlabError::InvalidOverride {
-                value: override_value.to_owned(),
+                value: item.raw.clone(),
                 message: "missing override value".to_owned(),
             })?;
-    replace_existing_value(definition, &segments, replacement).map_err(|message| {
+    let mut patch = toml::Value::Table(path);
+    replace_override_leaf(&mut patch, replacement).map_err(|message| {
         InferlabError::InvalidOverride {
-            value: override_value.to_owned(),
+            value: item.raw.clone(),
             message,
         }
+    })?;
+    merge_definition_patch(definition, patch).map_err(|message| InferlabError::InvalidOverride {
+        value: item.raw.clone(),
+        message,
     })
 }
 
-fn replace_existing_value(
+fn replace_override_leaf(
     current: &mut toml::Value,
-    path: &[&str],
     replacement: toml::Value,
 ) -> Result<(), String> {
-    let (segment, remaining) = path
-        .split_first()
-        .ok_or_else(|| "Bench override path is empty".to_owned())?;
-    let table = current
-        .as_table_mut()
-        .ok_or_else(|| format!("Bench path parent for {segment:?} is not a table"))?;
-    let value = table
-        .get_mut(*segment)
-        .ok_or_else(|| format!("Bench field {segment:?} does not exist"))?;
-    if remaining.is_empty() {
-        *value = replacement;
-        Ok(())
+    if let toml::Value::Table(table) = current {
+        if table.len() != 1 {
+            return Err("measurement path must contain exactly one TOML key path".to_owned());
+        }
+        let (_, child) = table
+            .iter_mut()
+            .next()
+            .ok_or_else(|| "measurement path must not be empty".to_owned())?;
+        replace_override_leaf(child, replacement)
     } else {
-        replace_existing_value(value, remaining, replacement)
+        *current = replacement;
+        Ok(())
     }
+}
+
+fn merge_definition_patch(current: &mut toml::Value, patch: toml::Value) -> Result<(), String> {
+    match (current, patch) {
+        (toml::Value::Table(current), toml::Value::Table(patch)) => {
+            for (key, value) in patch {
+                if let Some(existing) = current.get_mut(&key)
+                    && existing.is_table()
+                    && value.is_table()
+                {
+                    merge_definition_patch(existing, value)?;
+                } else {
+                    current.insert(key, value);
+                }
+            }
+            Ok(())
+        }
+        _ => Err("measurement path parent is not a table".to_owned()),
+    }
+}
+
+fn apply_eval_overrides(
+    id: &str,
+    definition: EvalDefinition,
+    overrides: &[IndexedMeasurementOverride],
+) -> Result<(EvalDefinition, Vec<MeasurementOverridePlan>), InferlabError> {
+    let mut value =
+        toml::Value::try_from(definition).map_err(|error| InferlabError::InvalidConfig {
+            message: format!("failed to prepare eval {id:?} for overrides: {error}"),
+        })?;
+    for item in overrides {
+        apply_definition_override(&mut value, item)?;
+    }
+    let definition = value
+        .try_into()
+        .map_err(|error| InferlabError::InvalidOverride {
+            value: overrides
+                .iter()
+                .map(|item| item.raw.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            message: format!("invalid effective Eval definition: {error}"),
+        })?;
+    validate_eval(id, &definition)?;
+    Ok((definition, override_plan(overrides)))
+}
+
+#[derive(Clone)]
+struct IndexedMeasurementOverride {
+    index: usize,
+    raw: String,
+    path: String,
+    raw_value: String,
+}
+
+fn indexed_overrides(
+    overrides: &[String],
+) -> Result<Vec<IndexedMeasurementOverride>, InferlabError> {
+    overrides
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            raw.split_once('=')
+                .map(|(path, raw_value)| IndexedMeasurementOverride {
+                    index,
+                    raw: raw.clone(),
+                    path: path.to_owned(),
+                    raw_value: raw_value.to_owned(),
+                })
+                .ok_or_else(|| InferlabError::InvalidOverride {
+                    value: raw.clone(),
+                    message: "expected PATH=<TOML-value>".to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn recipe_measurement_overrides(
+    section: &str,
+    id: &str,
+    overrides: &[String],
+) -> Vec<IndexedMeasurementOverride> {
+    let prefix = format!("{section}.{id}.");
+    overrides
+        .iter()
+        .enumerate()
+        .filter_map(|(index, raw)| {
+            let (path, raw_value) = raw.split_once('=')?;
+            path.strip_prefix(&prefix)
+                .map(|path| IndexedMeasurementOverride {
+                    index,
+                    raw: raw.clone(),
+                    path: path.to_owned(),
+                    raw_value: raw_value.to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn validate_recipe_measurement_overrides(
+    suite: &WorkloadSuiteDefinition,
+    evals: &BTreeMap<String, EvalDefinition>,
+    benches: &BTreeMap<String, BenchDefinition>,
+    overrides: &[String],
+) -> Result<(), InferlabError> {
+    for raw in overrides {
+        let Some((path, _)) = raw.split_once('=') else {
+            return Err(InferlabError::InvalidOverride {
+                value: raw.clone(),
+                message: "expected PATH=<TOML-value>".to_owned(),
+            });
+        };
+        if path.starts_with("server.") {
+            continue;
+        }
+        let (section, remaining, selected) = if let Some(remaining) = path.strip_prefix("evals.") {
+            ("evals", remaining, &suite.evals)
+        } else if let Some(remaining) = path.strip_prefix("benches.") {
+            ("benches", remaining, &suite.benches)
+        } else {
+            return Err(InferlabError::InvalidOverride {
+                value: raw.clone(),
+                message: "recipe override must be under server., evals.<id>., or benches.<id>."
+                    .to_owned(),
+            });
+        };
+        let Some((id, field)) = remaining.split_once('.') else {
+            return Err(InferlabError::InvalidOverride {
+                value: raw.clone(),
+                message: format!("expected {section}.<id>.<field>=<TOML-value>"),
+            });
+        };
+        let declared = match section {
+            "evals" => evals.contains_key(id),
+            "benches" => benches.contains_key(id),
+            _ => false,
+        };
+        if id.is_empty()
+            || field.is_empty()
+            || !declared
+            || !selected.iter().any(|selected| selected == id)
+        {
+            return Err(InferlabError::InvalidOverride {
+                value: raw.clone(),
+                message: format!(
+                    "{section} override must name a definition selected by the recipe's workload suite"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn override_plan(overrides: &[IndexedMeasurementOverride]) -> Vec<MeasurementOverridePlan> {
+    overrides
+        .iter()
+        .map(|item| MeasurementOverridePlan {
+            invocation_index: item.index,
+            value: item.raw.clone(),
+        })
+        .collect()
 }
 
 fn resolve_eval(
     id: &str,
     definitions: &BTreeMap<String, EvalDefinition>,
+    overrides: &[IndexedMeasurementOverride],
     context: &MeasurementResolveContext<'_>,
     toolchain: Option<&InstalledEvalToolchain>,
 ) -> Result<EvalPlan, InferlabError> {
-    let definition = definitions
-        .get(id)
-        .cloned()
-        .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("unknown selected eval definition {id:?}"),
-        })?;
+    let declared_definition =
+        definitions
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: format!("unknown selected eval definition {id:?}"),
+            })?;
+    let (definition, override_plan) =
+        apply_eval_overrides(id, declared_definition.clone(), overrides)?;
     let execution = match &definition {
         EvalDefinition::OpenAiSmoke { .. } => EvalExecutionPlan::NativeOpenAiSmoke,
         EvalDefinition::LmEval { .. } => {
@@ -539,7 +755,9 @@ fn resolve_eval(
     Ok(EvalPlan {
         id: id.to_owned(),
         capture: context.capture_ids.iter().any(|capture| capture == id),
+        declared_definition,
         definition,
+        overrides: override_plan,
         endpoint: context.endpoint.clone(),
         model: context.model.clone(),
         execution,

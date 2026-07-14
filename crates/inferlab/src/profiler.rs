@@ -83,10 +83,14 @@ pub(crate) struct PreparedProcess {
     pub target: Option<ProfilerTargetRecord>,
 }
 
-pub(crate) fn prepare_process(
+pub(crate) fn prepare_process<'a>(
     record_id: &str,
+    role_id: &str,
+    replica_id: &str,
+    replica_index: u32,
     process: &ProcessPlan,
-    processes: &[ProcessPlan],
+    processes: impl IntoIterator<Item = &'a ProcessPlan>,
+    control_deadline_seconds: u64,
 ) -> Result<PreparedProcess, InferlabError> {
     let Some(requirement) = &process.capture_target else {
         return Ok(PreparedProcess {
@@ -123,7 +127,7 @@ pub(crate) fn prepare_process(
     argv.extend(process.command.argv.iter().cloned());
     let supported_window_controls = vec![WindowControlKind::FrameworkRange];
     let control_process = processes
-        .iter()
+        .into_iter()
         .find(|candidate| candidate.id == requirement.control_process_id)
         .ok_or_else(|| InferlabError::Profiling {
             message: format!(
@@ -139,7 +143,7 @@ pub(crate) fn prepare_process(
         },
         start_path: requirement.start_path.clone(),
         stop_path: requirement.stop_path.clone(),
-        deadline_seconds: requirement.control_deadline_seconds,
+        deadline_seconds: control_deadline_seconds,
     };
     Ok(PreparedProcess {
         command: CommandPlan {
@@ -151,9 +155,9 @@ pub(crate) fn prepare_process(
         },
         target: Some(ProfilerTargetRecord {
             process_id: process.id.clone(),
-            role_id: process.role_id.clone(),
-            replica_id: process.replica_id.clone(),
-            replica_index: process.replica_index,
+            role_id: role_id.to_owned(),
+            replica_id: replica_id.to_owned(),
+            replica_index,
             rank: process.rank,
             session,
             executable,
@@ -446,8 +450,8 @@ impl CaptureSession {
             .map_err(|error| Box::new(CaptureRecord::failed(error.to_string())))?;
         let targets = status
             .record
-            .processes
-            .into_iter()
+            .process_evidence
+            .into_values()
             .filter_map(|process| process.profiler)
             .collect::<Vec<_>>();
         let plan = compile_plan(server_record_id, workload_id, window_ids, &targets)
@@ -1063,7 +1067,7 @@ mod tests {
     use super::*;
     use crate::resolve::{
         AllocationPlan, CaptureTargetPlan, EndpointPlan, ReadinessPlan, RuntimeCacheNamespacePlan,
-        RuntimeCachePlan, RuntimeCacheRootSource, SettingSource,
+        RuntimeCachePlan, RuntimeCacheRootSource,
     };
     use inferlab_protocol::EndpointProtocol;
     use std::collections::BTreeMap;
@@ -1072,18 +1076,15 @@ mod tests {
     fn process() -> ProcessPlan {
         ProcessPlan {
             id: "prefill-0".to_owned(),
-            role_id: "prefill".to_owned(),
-            replica_id: "prefill".to_owned(),
-            replica_index: 0,
             rank: 0,
+            rank_count: 1,
             machine: "local".to_owned(),
             launch: LaunchPlan::Local,
             launch_dependencies: Vec::new(),
             allocation: AllocationPlan {
-                machine_binding: "local".to_owned(),
-                accelerator_count: 1,
                 devices: vec![0],
-                model_locator: "/models/dsv4".to_owned(),
+                model_locator: Some("/models/dsv4".to_owned()),
+                model_locator_source: Some(crate::resolve::ModelLocatorSource::Fallback),
                 ports: BTreeMap::new(),
                 runtime_cache: RuntimeCachePlan {
                     storage_root: PathBuf::from("/cache"),
@@ -1110,9 +1111,6 @@ mod tests {
             readiness: ReadinessPlan::Http {
                 path: "/v1/models".to_owned(),
                 timeout_seconds: Some(60),
-                timeout_source: SettingSource::ServeProfile {
-                    id: "pd".to_owned(),
-                },
             },
             endpoint: EndpointPlan {
                 host: "127.0.0.1".to_owned(),
@@ -1121,11 +1119,11 @@ mod tests {
                 api_path: "/v1".to_owned(),
                 prefix_cache_reset: None,
             },
+            container: None,
             capture_target: Some(CaptureTargetPlan {
                 control_process_id: "prefill-0".to_owned(),
                 start_path: "/start_profile".to_owned(),
                 stop_path: "/stop_profile".to_owned(),
-                control_deadline_seconds: 60,
                 escapes: NsysEscapes::default(),
             }),
         }
@@ -1137,8 +1135,12 @@ mod tests {
         let process = process();
         let prepared = prepare_process(
             "20260701-120000-serve",
+            "prefill",
+            "prefill",
+            0,
             &process,
             std::slice::from_ref(&process),
+            60,
         )?;
         let target = prepared.target.ok_or("missing profiler target")?;
         assert_eq!(target.role_id, "prefill");
@@ -1178,9 +1180,17 @@ mod tests {
             .as_mut()
             .ok_or("process has no capture target")?
             .escapes = escapes();
-        let target = prepare_process("serve", &process, std::slice::from_ref(&process))?
-            .target
-            .ok_or("missing profiler target")?;
+        let target = prepare_process(
+            "serve",
+            "prefill",
+            "prefill",
+            0,
+            &process,
+            std::slice::from_ref(&process),
+            60,
+        )?
+        .target
+        .ok_or("missing profiler target")?;
         assert_eq!(
             target.launch_prefix,
             [
@@ -1209,9 +1219,17 @@ mod tests {
             .as_mut()
             .ok_or("process has no capture target")?
             .escapes = escapes();
-        let target = prepare_process("serve", &process, std::slice::from_ref(&process))?
-            .target
-            .ok_or("missing profiler target")?;
+        let target = prepare_process(
+            "serve",
+            "prefill",
+            "prefill",
+            0,
+            &process,
+            std::slice::from_ref(&process),
+            60,
+        )?
+        .target
+        .ok_or("missing profiler target")?;
         assert_eq!(
             nsys_start_argv(&target, Path::new("/profiles/trace"), 2),
             [
@@ -1257,9 +1275,17 @@ mod tests {
     #[test]
     fn static_range_plan_maps_windows_to_one_based_reports() -> Result<(), Box<dyn Error>> {
         let process = process();
-        let target = prepare_process("serve", &process, std::slice::from_ref(&process))?
-            .target
-            .ok_or("missing profiler target")?;
+        let target = prepare_process(
+            "serve",
+            "prefill",
+            "prefill",
+            0,
+            &process,
+            std::slice::from_ref(&process),
+            60,
+        )?
+        .target
+        .ok_or("missing profiler target")?;
         let plan = compile_plan(
             "serve",
             "bench-c8k1k",

@@ -174,16 +174,16 @@ fn start_with_runtime<R: ProcessRuntime>(
     // [[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]): declared checks run before
     // any process launches. Image-backed launches skip this — their
     // realization was checked during assembly.
-    let environment = &resolved.server.environment;
-    if environment.realization == crate::environment::CheckRealization::LocalWorkspace
-        && !environment.checks.is_empty()
+    let stack = &resolved.stack;
+    if stack.realization == crate::environment::CheckRealization::LocalWorkspace
+        && !stack.checks.is_empty()
     {
         // Even an infrastructure failure (Pixi unavailable) must finalize
         // the record rather than leave it Starting.
         let (evidence, failure) = match crate::environment::run_local_checks(
             root,
-            &environment.pixi_environment,
-            &environment.checks,
+            &stack.pixi_environment,
+            &stack.checks,
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -200,7 +200,7 @@ fn start_with_runtime<R: ProcessRuntime>(
         session.record_mut().environment_checks = evidence;
         session.rewrite()?;
         if let Some(failure) = failure {
-            let message = failure.message(&environment.pixi_environment);
+            let message = failure.message(&stack.pixi_environment);
             session.record_mut().failure = Some(FailureEvidence {
                 phase: FailurePhase::Preflight,
                 process_id: None,
@@ -216,7 +216,7 @@ fn start_with_runtime<R: ProcessRuntime>(
         // preflight already proved revision equality, so the committed
         // scripts exist in the remote checkout.
         let mut checked_machines = std::collections::BTreeSet::new();
-        for process in &resolved.server.processes {
+        for process in resolved.server.processes() {
             let crate::resolve::LaunchPlan::Ssh { target } = &process.launch else {
                 continue;
             };
@@ -236,8 +236,8 @@ fn start_with_runtime<R: ProcessRuntime>(
                         target,
                         &remote_root,
                         pixi,
-                        &environment.pixi_environment,
-                        &environment.checks,
+                        &stack.pixi_environment,
+                        &stack.checks,
                         &process.machine,
                     )
                 });
@@ -270,7 +270,7 @@ fn start_with_runtime<R: ProcessRuntime>(
                      environment {:?}: {}{repair}",
                     failure.id,
                     process.machine,
-                    environment.pixi_environment,
+                    stack.pixi_environment,
                     failure.output.trim(),
                 );
                 session.record_mut().failure = Some(FailureEvidence {
@@ -284,11 +284,11 @@ fn start_with_runtime<R: ProcessRuntime>(
         }
     }
 
-    // GPU hardware identity is probed once per hosting machine through the
+    // Device hardware identity is probed once per hosting machine through the
     // same launch path as its serving processes, and a failed probe fails
     // the launch before any process starts ([[RFC-0005:C-EVIDENCE]]).
     let mut probe_targets = std::collections::BTreeMap::new();
-    for process in &resolved.server.processes {
+    for process in resolved.server.processes() {
         let entry = probe_targets
             .entry(process.machine.clone())
             .or_insert_with(|| (&process.launch, std::collections::BTreeSet::new()));
@@ -297,9 +297,12 @@ fn start_with_runtime<R: ProcessRuntime>(
     for (machine, (launch, devices)) in probe_targets {
         let devices = devices.into_iter().collect::<Vec<_>>();
         match runtime.probe_hardware(launch, &machine, &devices) {
-            Ok(evidence) => session.record_mut().hardware.push(evidence),
+            Ok(evidence) => {
+                session.record_mut().hardware.insert(machine, evidence);
+            }
             Err(error) => {
-                let message = format!("GPU hardware probe failed on machine {machine:?}: {error}");
+                let message =
+                    format!("device hardware probe failed on machine {machine:?}: {error}");
                 session.record_mut().failure = Some(FailureEvidence {
                     phase: FailurePhase::Preflight,
                     process_id: None,
@@ -312,17 +315,23 @@ fn start_with_runtime<R: ProcessRuntime>(
     }
     session.rewrite()?;
 
+    let process_contexts = resolved.server.process_contexts().collect::<Vec<_>>();
     let mut started = Vec::new();
-    let mut handles = Vec::with_capacity(resolved.server.processes.len());
-    for (index, process) in resolved.server.processes.iter().enumerate() {
+    let mut handles = Vec::with_capacity(process_contexts.len());
+    for context in &process_contexts {
+        let process = context.process;
         fail_if_startup_interrupted(&mut session, runtime, &started, Some(&process.id))?;
-        let stdout = session.absolute_stdout(index);
-        let stderr = session.absolute_stderr(index);
+        let stdout = session.absolute_stdout(&process.id)?;
+        let stderr = session.absolute_stderr(&process.id)?;
         let remote_dir = remote_runtime_dir(process, session.record());
         let prepared = match crate::profiler::prepare_process(
             session.record().id.as_str(),
+            context.role_id,
+            context.replica_id,
+            context.replica_index,
             process,
-            &resolved.server.processes,
+            process_contexts.iter().map(|context| context.process),
+            resolved.server.capture_control_deadline_seconds,
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -332,12 +341,12 @@ fn start_with_runtime<R: ProcessRuntime>(
                     process_id: Some(process.id.clone()),
                     message: message.clone(),
                 });
-                let cleanup_verified = rollback_started(&mut session, runtime, &started);
+                let cleanup_verified = rollback_started(&mut session, runtime, &started)?;
                 persist_failed(&mut session, cleanup_verified)?;
                 return Err(lifecycle_error(&session, message));
             }
         };
-        session.record_mut().processes[index].profiler = prepared.target;
+        session.process_mut(&process.id)?.profiler = prepared.target;
         let handle = match runtime.spawn(ProcessSpec {
             launch: &process.launch,
             command: &prepared.command,
@@ -346,7 +355,10 @@ fn start_with_runtime<R: ProcessRuntime>(
             stdout: &stdout,
             stderr: &stderr,
             remote_dir: &remote_dir,
-            container: container_name(&prepared.command.argv),
+            container: process
+                .container
+                .as_ref()
+                .map(|container| container.name.as_str()),
         }) {
             Ok(handle) => handle,
             Err(failure) => {
@@ -363,7 +375,7 @@ fn start_with_runtime<R: ProcessRuntime>(
                     // the removal are confirmed — ownership_unknown already
                     // carries that conjunction ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
                     let verified = !failure.ownership_unknown;
-                    session.record_mut().processes[index].cleanup.push(
+                    session.process_mut(&process.id)?.cleanup.push(
                         CleanupEvidence::from_launch_removal(
                             CleanupTrigger::StartupRollback,
                             verified,
@@ -372,24 +384,25 @@ fn start_with_runtime<R: ProcessRuntime>(
                         ),
                     );
                 } else if failure.ownership_unknown {
-                    session.record_mut().processes[index].cleanup.push(
-                        CleanupEvidence::unavailable(
+                    session
+                        .process_mut(&process.id)?
+                        .cleanup
+                        .push(CleanupEvidence::unavailable(
                             CleanupTrigger::StartupRollback,
                             "SSH launch may have started a process before its handle was returned"
                                 .to_owned(),
-                        ),
-                    );
+                        ));
                 }
-                let profiler_cleaned = cleanup_profiler_process(&mut session, index);
-                let cleanup_verified = rollback_started(&mut session, runtime, &started)
+                let profiler_cleaned = cleanup_profiler_process(&mut session, &process.id)?;
+                let cleanup_verified = rollback_started(&mut session, runtime, &started)?
                     && profiler_cleaned
                     && !failure.ownership_unknown;
                 persist_failed(&mut session, cleanup_verified)?;
                 return Err(lifecycle_error(&session, message));
             }
         };
-        session.record_mut().processes[index].handle = Some(handle.clone());
-        started.push(index);
+        session.process_mut(&process.id)?.handle = Some(handle.clone());
+        started.push(process.id.clone());
         handles.push(handle);
         if let Err(error) = session.rewrite() {
             let message = format!(
@@ -401,18 +414,19 @@ fn start_with_runtime<R: ProcessRuntime>(
                 process_id: Some(process.id.clone()),
                 message: message.clone(),
             });
-            let cleanup_verified = rollback_started(&mut session, runtime, &started);
+            let cleanup_verified = rollback_started(&mut session, runtime, &started)?;
             let _ = persist_failed(&mut session, cleanup_verified);
             return Err(lifecycle_error(&session, message));
         }
         fail_if_startup_interrupted(&mut session, runtime, &started, Some(&process.id))?;
     }
 
-    for (index, (process, handle)) in resolved.server.processes.iter().zip(&handles).enumerate() {
+    for (context, handle) in process_contexts.iter().zip(&handles) {
+        let process = context.process;
         fail_if_startup_interrupted(&mut session, runtime, &started, Some(&process.id))?;
         match runtime.wait_ready(handle, &process.endpoint, &process.readiness) {
             Ok(readiness) => {
-                session.record_mut().processes[index].readiness = Some(readiness);
+                session.process_mut(&process.id)?.readiness = Some(readiness);
                 if let Err(error) = session.rewrite() {
                     let message = format!(
                         "failed to persist readiness for process {:?}: {error}",
@@ -423,7 +437,7 @@ fn start_with_runtime<R: ProcessRuntime>(
                         process_id: Some(process.id.clone()),
                         message: message.clone(),
                     });
-                    let cleanup_verified = rollback_started(&mut session, runtime, &started);
+                    let cleanup_verified = rollback_started(&mut session, runtime, &started)?;
                     let _ = persist_failed(&mut session, cleanup_verified);
                     return Err(lifecycle_error(&session, message));
                 }
@@ -441,7 +455,7 @@ fn start_with_runtime<R: ProcessRuntime>(
                     process_id: Some(process.id.clone()),
                     message: failure.message.clone(),
                 });
-                let cleanup_verified = rollback_started(&mut session, runtime, &started);
+                let cleanup_verified = rollback_started(&mut session, runtime, &started)?;
                 persist_failed(&mut session, cleanup_verified)?;
                 return Err(lifecycle_error(&session, failure.message));
             }
@@ -457,7 +471,7 @@ fn start_with_runtime<R: ProcessRuntime>(
             process_id: None,
             message: message.clone(),
         });
-        let cleanup_verified = rollback_started(&mut session, runtime, &started);
+        let cleanup_verified = rollback_started(&mut session, runtime, &started)?;
         let _ = persist_failed(&mut session, cleanup_verified);
         return Err(lifecycle_error(&session, message));
     }
@@ -467,7 +481,7 @@ fn start_with_runtime<R: ProcessRuntime>(
 fn fail_if_startup_interrupted<R: ProcessRuntime>(
     session: &mut ServerRecordSession,
     runtime: &R,
-    started: &[usize],
+    started: &[String],
     process_id: Option<&str>,
 ) -> Result<(), InferlabError> {
     if !crate::interrupt::received() {
@@ -478,22 +492,9 @@ fn fail_if_startup_interrupted<R: ProcessRuntime>(
         process_id: process_id.map(str::to_owned),
         message: STARTUP_INTERRUPTED.to_owned(),
     });
-    let cleanup_verified = rollback_started(session, runtime, started);
+    let cleanup_verified = rollback_started(session, runtime, started)?;
     persist_failed(session, cleanup_verified)?;
     Err(lifecycle_error(session, STARTUP_INTERRUPTED.to_owned()))
-}
-
-/// The resolver-assigned container name of a containerized substitution
-/// command: the cleanup handle for the daemon-owned container the
-/// process-group kill cannot reach ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
-fn container_name(argv: &[String]) -> Option<&str> {
-    if argv.first().map(String::as_str) != Some("docker") {
-        return None;
-    }
-    argv.iter()
-        .position(|arg| arg == "--name")
-        .and_then(|index| argv.get(index + 1))
-        .map(String::as_str)
 }
 
 fn remote_runtime_dir(process: &ProcessPlan, record: &ServerRecord) -> PathBuf {
@@ -508,33 +509,34 @@ fn remote_runtime_dir(process: &ProcessPlan, record: &ServerRecord) -> PathBuf {
 fn rollback_started<R: ProcessRuntime>(
     session: &mut ServerRecordSession,
     runtime: &R,
-    started: &[usize],
-) -> bool {
+    started: &[String],
+) -> Result<bool, InferlabError> {
     let mut verified = true;
-    for index in started.iter().rev().copied() {
-        verified &= finalize_profiler_process(session, index);
-        let handle = session.record().processes[index].handle.clone();
+    for process_id in started.iter().rev() {
+        verified &= finalize_profiler_process(session, process_id)?;
+        let handle = session.process(process_id)?.handle.clone();
         if let Some(handle) = handle {
             let cleanup = runtime.terminate(&handle, CleanupTrigger::StartupRollback);
             verified &= cleanup.verified;
-            sync_logs_for_process(session, runtime, index, &handle);
-            session.record_mut().processes[index].cleanup.push(cleanup);
+            sync_logs_for_process(session, runtime, process_id, &handle)?;
+            session.process_mut(process_id)?.cleanup.push(cleanup);
         }
-        verified &= cleanup_profiler_process(session, index);
+        verified &= cleanup_profiler_process(session, process_id)?;
     }
-    verified
+    Ok(verified)
 }
 
 fn sync_logs_for_process<R: ProcessRuntime>(
     session: &mut ServerRecordSession,
     runtime: &R,
-    index: usize,
+    process_id: &str,
     handle: &runtime::ProcessHandle,
-) {
-    let stdout = session.absolute_stdout(index);
-    let stderr = session.absolute_stderr(index);
-    session.record_mut().processes[index].log_sync_error =
+) -> Result<(), InferlabError> {
+    let stdout = session.absolute_stdout(process_id)?;
+    let stderr = session.absolute_stderr(process_id)?;
+    session.process_mut(process_id)?.log_sync_error =
         runtime.sync_logs(handle, &stdout, &stderr).err();
+    Ok(())
 }
 
 fn persist_failed(
@@ -563,16 +565,21 @@ fn status_with_runtime<R: ProcessRuntime>(
 ) -> Result<ServerStatusReport, InferlabError> {
     let record = load_record(root, id)?;
     let finalized = record.finished_unix_ms.is_some();
-    let mut processes = Vec::with_capacity(record.processes.len());
-    for process in &record.processes {
+    let process_order = record.process_order()?;
+    let mut processes = Vec::with_capacity(process_order.len());
+    for process_id in process_order {
+        let evidence = record.process(&process_id)?;
         let process_status = if finalized {
             None
         } else {
-            process.handle.as_ref().map(|handle| runtime.status(handle))
+            evidence
+                .handle
+                .as_ref()
+                .map(|handle| runtime.status(handle))
         };
         let observed_alive = process_status.as_ref().is_some_and(|status| status.alive);
         processes.push(ServerProcessStatusReport {
-            id: process.id.clone(),
+            id: process_id,
             observed_alive,
             process_status,
         });
@@ -592,24 +599,26 @@ fn logs_with_runtime<R: ProcessRuntime>(
     runtime: &R,
 ) -> Result<ServerLogsReport, InferlabError> {
     let record = load_record(root, id)?;
-    let mut processes = Vec::with_capacity(record.processes.len());
-    for process in &record.processes {
-        let stdout = root.join(&process.stdout);
-        let stderr = root.join(&process.stderr);
+    let process_order = record.process_order()?;
+    let mut processes = Vec::with_capacity(process_order.len());
+    for process_id in process_order {
+        let evidence = record.process(&process_id)?;
+        let stdout = root.join(&evidence.stdout);
+        let stderr = root.join(&evidence.stderr);
         if record.finished_unix_ms.is_none()
-            && let Some(handle) = &process.handle
+            && let Some(handle) = &evidence.handle
         {
             runtime
                 .sync_logs(handle, &stdout, &stderr)
                 .map_err(|message| InferlabError::ServerLifecycle {
                     message: format!(
                         "failed to synchronize logs for process {:?}: {message}; record {id}",
-                        process.id
+                        process_id
                     ),
                 })?;
         }
         processes.push(ServerProcessLogsReport {
-            id: process.id.clone(),
+            id: process_id,
             stdout,
             stderr,
         });
@@ -630,34 +639,39 @@ fn stop_with_runtime<R: ProcessRuntime>(
     if record.finished_unix_ms.is_some() {
         return Ok(record);
     }
+    let process_order = record.process_order()?;
     let mut session = ServerRecordSession::from_record(root, record);
     let mut all_verified = true;
     let mut first_error = None;
-    for index in (0..session.record().processes.len()).rev() {
-        let process_id = session.record().processes[index].id.clone();
-        if !finalize_profiler_process(&mut session, index) {
+    for process_id in process_order.iter().rev() {
+        if !finalize_profiler_process(&mut session, process_id)? {
             all_verified = false;
-            first_error.get_or_insert_with(|| {
-                session.record().processes[index]
-                    .profiler_finalization
-                    .as_ref()
-                    .and_then(crate::profiler::CaptureActionRecord::error)
-                    .unwrap_or_else(|| {
-                        format!("failed to finalize profiler for process {process_id:?}")
-                    })
-            });
+            let error = session
+                .process(process_id)?
+                .profiler_finalization
+                .as_ref()
+                .and_then(crate::profiler::CaptureActionRecord::error);
+            if first_error.is_none() {
+                first_error = Some(match error {
+                    Some(error) => error,
+                    None => format!("failed to finalize profiler for process {process_id:?}"),
+                });
+            }
         }
-        let Some(handle) = session.record().processes[index].handle.clone() else {
+        let Some(handle) = session.process(process_id)?.handle.clone() else {
             let message = format!("unfinished process {process_id:?} has no typed runtime handle");
-            session.record_mut().processes[index]
+            session
+                .process_mut(process_id)?
                 .cleanup
                 .push(CleanupEvidence::unavailable(
                     CleanupTrigger::Recovery,
                     message.clone(),
                 ));
             all_verified = false;
-            first_error.get_or_insert(message);
-            if !cleanup_profiler_process(&mut session, index) {
+            if first_error.is_none() {
+                first_error = Some(message);
+            }
+            if !cleanup_profiler_process(&mut session, process_id)? {
                 all_verified = false;
             }
             continue;
@@ -665,26 +679,28 @@ fn stop_with_runtime<R: ProcessRuntime>(
         let cleanup = runtime.terminate(&handle, CleanupTrigger::Stop);
         if !cleanup.verified {
             all_verified = false;
-            first_error.get_or_insert_with(|| {
-                cleanup
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| format!("failed to stop process {process_id:?}"))
-            });
+            if first_error.is_none() {
+                first_error = Some(match cleanup.error.clone() {
+                    Some(error) => error,
+                    None => format!("failed to stop process {process_id:?}"),
+                });
+            }
         }
-        sync_logs_for_process(&mut session, runtime, index, &handle);
-        session.record_mut().processes[index].cleanup.push(cleanup);
-        if !cleanup_profiler_process(&mut session, index) {
+        sync_logs_for_process(&mut session, runtime, process_id, &handle)?;
+        session.process_mut(process_id)?.cleanup.push(cleanup);
+        if !cleanup_profiler_process(&mut session, process_id)? {
             all_verified = false;
-            first_error.get_or_insert_with(|| {
-                session.record().processes[index]
-                    .profiler_cleanup
-                    .as_ref()
-                    .and_then(|cleanup| cleanup.error.clone())
-                    .unwrap_or_else(|| {
-                        format!("failed to clean profiler for process {process_id:?}")
-                    })
-            });
+            let error = session
+                .process(process_id)?
+                .profiler_cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.error.clone());
+            if first_error.is_none() {
+                first_error = Some(match error {
+                    Some(error) => error,
+                    None => format!("failed to clean profiler for process {process_id:?}"),
+                });
+            }
         }
     }
     if all_verified {
@@ -696,7 +712,10 @@ fn stop_with_runtime<R: ProcessRuntime>(
         session.finish(status)?;
         Ok(session.into_record())
     } else {
-        let message = first_error.unwrap_or_else(|| "server cleanup was not verified".to_owned());
+        let message = match first_error {
+            Some(message) => message,
+            None => "server cleanup was not verified".to_owned(),
+        };
         if session.record().failure.is_none() {
             session.record_mut().failure = Some(FailureEvidence {
                 phase: FailurePhase::Recovery,
@@ -711,24 +730,30 @@ fn stop_with_runtime<R: ProcessRuntime>(
     }
 }
 
-fn finalize_profiler_process(session: &mut ServerRecordSession, index: usize) -> bool {
-    let Some(target) = session.record().processes[index].profiler.clone() else {
-        return true;
+fn finalize_profiler_process(
+    session: &mut ServerRecordSession,
+    process_id: &str,
+) -> Result<bool, InferlabError> {
+    let Some(target) = session.process(process_id)?.profiler.clone() else {
+        return Ok(true);
     };
     let action = crate::profiler::finalize_target(&target);
     let succeeded = crate::profiler::finalization_succeeded(&action);
-    session.record_mut().processes[index].profiler_finalization = Some(action);
-    succeeded
+    session.process_mut(process_id)?.profiler_finalization = Some(action);
+    Ok(succeeded)
 }
 
-fn cleanup_profiler_process(session: &mut ServerRecordSession, index: usize) -> bool {
-    let Some(target) = session.record().processes[index].profiler.clone() else {
-        return true;
+fn cleanup_profiler_process(
+    session: &mut ServerRecordSession,
+    process_id: &str,
+) -> Result<bool, InferlabError> {
+    let Some(target) = session.process(process_id)?.profiler.clone() else {
+        return Ok(true);
     };
     let cleanup = crate::profiler::cleanup_target_agent(&target);
     let verified = cleanup.verified;
-    session.record_mut().processes[index].profiler_cleanup = Some(cleanup);
-    verified
+    session.process_mut(process_id)?.profiler_cleanup = Some(cleanup);
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -736,11 +761,11 @@ mod tests {
     use super::runtime::LaunchFailure;
     use super::*;
     use crate::resolve::{
-        AllocationPlan, CasePlan, CommandPlan, EndpointPlan, EnvironmentPlan, IntegrationPlan,
-        LaunchPlan, ModelPlan, ParallelismPlan, PlacementPlan, ProcessPlan, ReadinessPlan,
-        RecipePlan, RecipeReferences, ResourcePlan, RolePlan, RoleReplicaPlan,
+        AllocationPlan, CasePlan, CaseSelectionSource, CommandPlan, EndpointPlan, IntegrationPlan,
+        LaunchPlan, ModelLocatorSource, ModelPlan, PlacementPlan, PlacementSelectionSource,
+        ProcessPlan, ReadinessPlan, ResourcePlan, RolePlan, RoleReplicaPlan,
         RoutingImplementationPlan, RoutingPlan, RuntimeCacheNamespacePlan, RuntimeCachePlan,
-        RuntimeCacheRootSource, ServerPlan, SettingSource, SourcePlan, Workflow,
+        RuntimeCacheRootSource, ServerPlan, StackPlan, Workflow,
     };
     use crate::workspace::WorkspaceSnapshot;
     use inferlab_protocol::{
@@ -769,15 +794,14 @@ mod tests {
         fn probe_hardware(
             &self,
             _launch: &LaunchPlan,
-            machine: &str,
+            _machine: &str,
             devices: &[u32],
         ) -> Result<record::MachineHardwareEvidence, String> {
             Ok(record::MachineHardwareEvidence {
-                machine: machine.to_owned(),
                 driver_version: "999.99".to_owned(),
-                gpus: devices
+                devices: devices
                     .iter()
-                    .map(|&index| record::GpuHardwareEvidence {
+                    .map(|&index| record::DeviceHardwareEvidence {
                         index,
                         model: "Fake GPU".to_owned(),
                         memory_total_mib: 96_000,
@@ -844,6 +868,68 @@ mod tests {
     }
 
     #[test]
+    fn resolved_server_serializes_one_role_replica_rank_hierarchy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_value(resolved())?;
+        let server = &value["server"];
+
+        assert!(server.get("processes").is_none());
+        let prefill = &server["roles"][0];
+        let rank = &prefill["replicas"][0]["ranks"][0];
+        assert_eq!(prefill["id"], "prefill");
+        assert_eq!(rank["id"], "rank-000");
+        assert_eq!(rank["rank"], 0);
+        assert_eq!(rank["rank_count"], 1);
+        assert_eq!(rank["machine"], "node-0");
+        assert_eq!(rank["devices"], serde_json::json!([0]));
+        assert!(rank.get("role_id").is_none());
+        assert!(rank.get("replica_id").is_none());
+        assert!(rank.get("allocation").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_execution_round_trips_as_a_typed_hierarchy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = serde_json::to_vec(&resolved())?;
+        let decoded: ResolvedExecution = serde_json::from_slice(&encoded)?;
+        let contexts = decoded.server.process_contexts().collect::<Vec<_>>();
+
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].role_id, "prefill");
+        assert_eq!(contexts[0].replica_id, "prefill");
+        assert_eq!(contexts[0].process.id, "rank-000");
+        assert_eq!(contexts[0].process.allocation.devices, [0]);
+        assert_eq!(contexts[1].role_id, "decode");
+        assert_eq!(contexts[1].process.id, "rank-001");
+        Ok(())
+    }
+
+    #[test]
+    fn server_record_keys_runtime_evidence_without_repeating_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let record = ServerRecordSession::begin(root.path(), &resolved(), None)?.into_record();
+        let value = serde_json::to_value(record)?;
+
+        assert_eq!(value["schema_version"], 2);
+        assert!(value.get("processes").is_none());
+        let evidence = value["process_evidence"]
+            .as_object()
+            .ok_or("missing process evidence")?;
+        assert_eq!(evidence.len(), 2);
+        let first = evidence.get("rank-000").ok_or("missing rank evidence")?;
+        assert!(first.get("id").is_none());
+        assert!(first.get("role_id").is_none());
+        assert!(first.get("replica_id").is_none());
+        assert!(first.get("rank").is_none());
+        assert!(first.get("machine").is_none());
+        assert!(first["stdout"].as_str().is_some());
+        assert!(first["stderr"].as_str().is_some());
+        Ok(())
+    }
+
+    #[test]
     fn multi_role_launch_failure_rolls_back_the_first_role()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
@@ -857,7 +943,7 @@ mod tests {
             terminated: RefCell::new(Vec::new()),
         };
 
-        let result = start_with_runtime(root.path(), resolved(2), None, &runtime);
+        let result = start_with_runtime(root.path(), resolved(), None, &runtime);
 
         assert!(result.is_err());
         assert_eq!(*runtime.terminated.borrow(), vec![41]);
@@ -868,81 +954,80 @@ mod tests {
         let record: ServerRecord =
             serde_json::from_slice(&std::fs::read(record_dir.join("record.json"))?)?;
         assert_eq!(record.status, ServerStatus::Failed);
-        assert_eq!(record.processes[0].role_id, "prefill");
-        assert_eq!(record.processes[1].role_id, "decode");
+        assert!(record.process_evidence.contains_key("rank-000"));
+        assert!(record.process_evidence.contains_key("rank-001"));
         // The probe ran per hosting machine before any spawn, so even this
         // failed multi-role launch carries per-role hardware evidence keyed
-        // to each role's assigned GPU ([[RFC-0005:C-EVIDENCE]]).
+        // to each role's assigned device ([[RFC-0005:C-EVIDENCE]]).
         let probed: Vec<(&str, Vec<u32>)> = record
             .hardware
             .iter()
-            .map(|entry| {
+            .map(|(machine, entry)| {
                 (
-                    entry.machine.as_str(),
-                    entry.gpus.iter().map(|gpu| gpu.index).collect(),
+                    machine.as_str(),
+                    entry.devices.iter().map(|device| device.index).collect(),
                 )
             })
             .collect();
         assert_eq!(probed, [("node-0", vec![0]), ("node-1", vec![1])]);
-        assert_eq!(record.processes[0].cleanup.len(), 1);
-        assert!(record.processes[1].handle.is_none());
-        assert!(!record.processes[1].cleanup[0].verified);
+        assert_eq!(record.process_evidence["rank-000"].cleanup.len(), 1);
+        assert!(record.process_evidence["rank-001"].handle.is_none());
+        assert!(!record.process_evidence["rank-001"].cleanup[0].verified);
         assert!(record.finished_unix_ms.is_none());
         Ok(())
     }
 
-    fn resolved(process_count: usize) -> ResolvedExecution {
-        let processes = (0..process_count)
-            .map(|index| ProcessPlan {
-                id: format!("rank-{index:03}"),
-                role_id: if index == 0 { "prefill" } else { "decode" }.to_owned(),
-                replica_id: if index == 0 { "prefill" } else { "decode" }.to_owned(),
-                replica_index: 0,
-                rank: 0,
-                machine: format!("node-{index}"),
-                launch: LaunchPlan::Local,
-                launch_dependencies: Vec::new(),
-                allocation: AllocationPlan {
-                    machine_binding: format!("node-{index}"),
-                    accelerator_count: 1,
-                    devices: vec![index as u32],
-                    model_locator: "/model".to_owned(),
-                    ports: BTreeMap::new(),
-                    runtime_cache: RuntimeCachePlan {
-                        storage_root: std::env::temp_dir(),
-                        storage_root_source: RuntimeCacheRootSource::WorkspaceDefault,
-                        namespace: RuntimeCacheNamespacePlan {
-                            workspace_source_digest: "source".to_owned(),
-                            pixi_environment: "env".to_owned(),
-                            image_id: None,
-                            machine: format!("node-{index}"),
-                            process: format!("rank-{index:03}"),
-                        },
-                        path: std::env::temp_dir()
-                            .join("inferlab-test-cache")
-                            .join(format!("rank-{index:03}")),
+    fn process(index: usize) -> ProcessPlan {
+        ProcessPlan {
+            id: format!("rank-{index:03}"),
+            rank: 0,
+            rank_count: 1,
+            machine: format!("node-{index}"),
+            launch: LaunchPlan::Local,
+            launch_dependencies: Vec::new(),
+            allocation: AllocationPlan {
+                devices: vec![index as u32],
+                model_locator: Some("/model".to_owned()),
+                model_locator_source: Some(ModelLocatorSource::Fallback),
+                ports: BTreeMap::new(),
+                runtime_cache: RuntimeCachePlan {
+                    storage_root: std::env::temp_dir(),
+                    storage_root_source: RuntimeCacheRootSource::WorkspaceDefault,
+                    namespace: RuntimeCacheNamespacePlan {
+                        workspace_source_digest: "source".to_owned(),
+                        pixi_environment: "env".to_owned(),
+                        image_id: None,
+                        machine: format!("node-{index}"),
+                        process: format!("rank-{index:03}"),
                     },
-                    communication_interface: None,
+                    path: std::env::temp_dir()
+                        .join("inferlab-test-cache")
+                        .join(format!("rank-{index:03}")),
                 },
-                command: CommandPlan {
-                    argv: vec!["true".to_owned()],
-                    env: BTreeMap::new(),
-                    explicit_env: Vec::new(),
-                    pass_env: Vec::new(),
-                    cwd: std::env::temp_dir(),
-                },
-                launch_files: Vec::new(),
-                readiness: ReadinessPlan::ProcessAlive,
-                endpoint: EndpointPlan {
-                    host: "127.0.0.1".to_owned(),
-                    port: 8000 + index as u16,
-                    protocol: EndpointProtocol::Http,
-                    api_path: "/v1/completions".to_owned(),
-                    prefix_cache_reset: None,
-                },
-                capture_target: None,
-            })
-            .collect();
+                communication_interface: None,
+            },
+            command: CommandPlan {
+                argv: vec!["true".to_owned()],
+                env: BTreeMap::new(),
+                explicit_env: Vec::new(),
+                pass_env: Vec::new(),
+                cwd: std::env::temp_dir(),
+            },
+            launch_files: Vec::new(),
+            readiness: ReadinessPlan::ProcessAlive,
+            endpoint: EndpointPlan {
+                host: "127.0.0.1".to_owned(),
+                port: 8000 + index as u16,
+                protocol: EndpointProtocol::Http,
+                api_path: "/v1/completions".to_owned(),
+                prefix_cache_reset: None,
+            },
+            container: None,
+            capture_target: None,
+        }
+    }
+
+    fn resolved() -> ResolvedExecution {
         ResolvedExecution {
             workflow: Workflow::ServeStart,
             workspace: WorkspaceSnapshot {
@@ -954,61 +1039,38 @@ mod tests {
                 pixi_manifest_sha256: "manifest".to_owned(),
                 pixi_lock_sha256: "lock".to_owned(),
             },
-            recipe: RecipePlan {
-                id: "recipe".to_owned(),
-                case: CasePlan {
-                    id: "default".to_owned(),
-                    index: 0,
-                    default: true,
-                },
-                references: RecipeReferences {
-                    model: "model".to_owned(),
-                    serve_profile: "serve".to_owned(),
-                    source_set: "source".to_owned(),
-                    environment: "env".to_owned(),
-                    workload_suite: "suite".to_owned(),
-                },
-            },
-            source: SourcePlan {
-                id: "source".to_owned(),
-                paths: Vec::new(),
+            recipe: None,
+            stack: StackPlan {
+                id: "stack".to_owned(),
+                integration: "fixture".to_owned(),
+                pixi_environment: "env".to_owned(),
+                source_paths: Vec::new(),
+                realization: crate::environment::CheckRealization::LocalWorkspace,
+                checks: Vec::new(),
             },
             server: ServerPlan {
+                id: "server".to_owned(),
+                case: Some(CasePlan {
+                    id: "default".to_owned(),
+                    selection: CaseSelectionSource::Default,
+                }),
                 explicit_overrides: Vec::new(),
+                declarations: Vec::new(),
                 topology: ServeTopology::PrefillDecode,
+                readiness_timeout_seconds: 60,
+                profiling: false,
+                capture_control_deadline_seconds: 60,
                 routing: RoutingPlan {
-                    backend: "builtin".to_owned(),
+                    backend: Some("builtin".to_owned()),
+                    kv_transfer: None,
                     public_process: "rank-000".to_owned(),
                     policy: "direct".to_owned(),
                     implementation: RoutingImplementationPlan::Direct,
                 },
-                parallelism: ParallelismPlan {
-                    declared: Parallelism::default(),
-                    effective: Parallelism::default(),
-                    declared_sources: BTreeMap::new(),
-                },
-                settings: BTreeMap::new(),
-                setting_sources: BTreeMap::from([(
-                    "x".to_owned(),
-                    crate::resolve::SettingProvenance {
-                        source: SettingSource::IntegrationDefault {
-                            integration: "fixture".to_owned(),
-                        },
-                        adjusted_by_integration: None,
-                    },
-                )]),
                 profiler_escapes: None,
                 model: ModelPlan {
                     id: "model".to_owned(),
                     served_name: "model".to_owned(),
-                    weight_binding: "weight".to_owned(),
-                    locator: "/model".to_owned(),
-                },
-                environment: EnvironmentPlan {
-                    id: "env".to_owned(),
-                    pixi_environment: "env".to_owned(),
-                    realization: crate::environment::CheckRealization::LocalWorkspace,
-                    checks: Vec::new(),
                 },
                 image: None,
                 external_image: None,
@@ -1017,21 +1079,19 @@ mod tests {
                     adapter_id: "fixture".to_owned(),
                     adapter_version: "1".to_owned(),
                     framework: "fixture".to_owned(),
+                    framework_version: "test".to_owned(),
                     executable: "fixture".to_owned(),
-                    protocol_version: ProtocolVersion::V4,
+                    protocol_version: ProtocolVersion::V5,
                     plan_request_sha256: "request".to_owned(),
                     plan_response_sha256: "response".to_owned(),
                     render_request_sha256: "request".to_owned(),
                     render_response_sha256: "response".to_owned(),
                 },
-                resources: ResourcePlan {
-                    accelerator_count: process_count as u32,
-                },
+                resources: ResourcePlan { device_count: 2 },
                 placement: PlacementPlan {
                     id: "placement".to_owned(),
-                    machines: (0..process_count)
-                        .map(|index| format!("node-{index}"))
-                        .collect(),
+                    selection: PlacementSelectionSource::Explicit,
+                    machines: (0..2).map(|index| format!("node-{index}")).collect(),
                     remote_workspaces: BTreeMap::new(),
                     remote_containers: BTreeMap::new(),
                 },
@@ -1042,14 +1102,21 @@ mod tests {
                         kind: ServeRoleKind::Prefill,
                         declared_replica_count: 1,
                         effective_replica_count: 1,
+                        declared_parallelism: Parallelism::default(),
                         effective_parallelism: Parallelism::default(),
-                        parallelism_sources: BTreeMap::new(),
+                        declared_settings: BTreeMap::new(),
                         effective_settings: BTreeMap::new(),
-                        setting_sources: BTreeMap::new(),
                         replicas: vec![RoleReplicaPlan {
                             id: "prefill".to_owned(),
                             index: 0,
-                            processes: vec!["rank-000".to_owned()],
+                            device_count: 1,
+                            ports: Vec::new(),
+                            primary_ports: Vec::new(),
+                            primary_readiness: inferlab_protocol::ReadinessProbe::ProcessAlive,
+                            worker_readiness: inferlab_protocol::ReadinessProbe::ProcessAlive,
+                            capture_target: None,
+                            entry_process: "rank-000".to_owned(),
+                            ranks: vec![process(0)],
                         }],
                     },
                     RolePlan {
@@ -1057,19 +1124,25 @@ mod tests {
                         kind: ServeRoleKind::Decode,
                         declared_replica_count: 1,
                         effective_replica_count: 1,
+                        declared_parallelism: Parallelism::default(),
                         effective_parallelism: Parallelism::default(),
-                        parallelism_sources: BTreeMap::new(),
+                        declared_settings: BTreeMap::new(),
                         effective_settings: BTreeMap::new(),
-                        setting_sources: BTreeMap::new(),
                         replicas: vec![RoleReplicaPlan {
                             id: "decode".to_owned(),
                             index: 0,
-                            processes: vec!["rank-001".to_owned()],
+                            device_count: 1,
+                            ports: Vec::new(),
+                            primary_ports: Vec::new(),
+                            primary_readiness: inferlab_protocol::ReadinessProbe::ProcessAlive,
+                            worker_readiness: inferlab_protocol::ReadinessProbe::ProcessAlive,
+                            capture_target: None,
+                            entry_process: "rank-001".to_owned(),
+                            ranks: vec![process(1)],
                         }],
                     },
                 ],
                 links: Vec::new(),
-                processes,
                 endpoint: EndpointPlan {
                     host: "127.0.0.1".to_owned(),
                     port: 8000,

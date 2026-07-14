@@ -1,4 +1,4 @@
-use super::record::{GpuHardwareEvidence, MachineHardwareEvidence};
+use super::record::{DeviceHardwareEvidence, MachineHardwareEvidence};
 use crate::interrupt;
 use crate::resolve::{
     CommandPlan, EndpointPlan, LaunchFilePlan, LaunchPlan, ProcessPlan, ReadinessPlan,
@@ -319,7 +319,7 @@ impl LaunchFailure {
 
 pub(super) trait ProcessRuntime {
     fn spawn(&self, spec: ProcessSpec<'_>) -> Result<ProcessHandle, LaunchFailure>;
-    /// Probe the GPU hardware assigned on one machine through its launch
+    /// Probe the device hardware assigned on one machine through its launch
     /// path, before any serving process starts ([[RFC-0005:C-EVIDENCE]]).
     fn probe_hardware(
         &self,
@@ -923,14 +923,17 @@ fn publish_local_launch_file(launch_file: &LaunchFilePlan) -> Result<(), String>
 
     match staged.persist_noclobber(target) {
         Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_existing_launch_file(target, &launch_file.sha256)
+        Err(failure) => {
+            let source = failure.error;
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                verify_existing_launch_file(target, &launch_file.sha256)
+            } else {
+                Err(format!(
+                    "failed to publish launch file {}: {source}",
+                    target.display()
+                ))
+            }
         }
-        Err(error) => Err(format!(
-            "failed to publish launch file {}: {}",
-            target.display(),
-            error.error
-        )),
     }
 }
 
@@ -2024,10 +2027,10 @@ fn nvidia_smi_script(devices: &[u32]) -> String {
 
 fn parse_hardware_output(
     machine: &str,
-    devices: &[u32],
+    assigned_devices: &[u32],
     stdout: &str,
 ) -> Result<MachineHardwareEvidence, String> {
-    let mut gpus = Vec::new();
+    let mut observed_devices = Vec::new();
     let mut driver_version: Option<String> = None;
     for line in stdout.lines() {
         let Some(row) = line.strip_prefix(HARDWARE_MARKER) else {
@@ -2048,7 +2051,7 @@ fn parse_hardware_output(
             .parse::<u64>()
             .map_err(|error| format!("machine {machine:?} probe row memory {memory:?}: {error}"))?;
         driver_version.get_or_insert_with(|| driver.trim().to_owned());
-        gpus.push(GpuHardwareEvidence {
+        observed_devices.push(DeviceHardwareEvidence {
             index,
             model: model.trim().to_owned(),
             memory_total_mib,
@@ -2057,31 +2060,33 @@ fn parse_hardware_output(
     }
     let Some(driver_version) = driver_version else {
         return Err(format!(
-            "machine {machine:?} returned no probe rows for devices {devices:?}"
+            "machine {machine:?} returned no probe rows for devices {assigned_devices:?}"
         ));
     };
-    gpus.sort_by_key(|gpu| gpu.index);
-    if devices.is_empty() {
+    observed_devices.sort_by_key(|device| device.index);
+    if assigned_devices.is_empty() {
         // A machine hosting only zero-device processes (a proxy-only host)
-        // assigns no GPUs: the probe proves the driver is present, and
+        // assigns no devices: the probe proves the driver is present, and
         // recording the machine's full inventory would over-claim it as
         // assigned ([[RFC-0005:C-EVIDENCE]]).
-        gpus.clear();
+        observed_devices.clear();
     } else {
-        let probed = gpus.iter().map(|gpu| gpu.index).collect::<Vec<_>>();
-        let mut requested = devices.to_vec();
+        let probed = observed_devices
+            .iter()
+            .map(|device| device.index)
+            .collect::<Vec<_>>();
+        let mut requested = assigned_devices.to_vec();
         requested.sort_unstable();
         requested.dedup();
         if probed != requested {
             return Err(format!(
-                "machine {machine:?} probe covered GPUs {probed:?} but the placement assigns {requested:?}"
+                "machine {machine:?} probe covered devices {probed:?} but the placement assigns {requested:?}"
             ));
         }
     }
     Ok(MachineHardwareEvidence {
-        machine: machine.to_owned(),
         driver_version,
-        gpus,
+        devices: observed_devices,
     })
 }
 
@@ -2533,13 +2538,12 @@ mod tests {
                       INFERLAB_HARDWARE\t1, Fixture GPU, 97871, GPU-bbb, 580.65.06\n\
                       INFERLAB_HARDWARE\t0, Fixture GPU, 97871, GPU-aaa, 580.65.06\n";
         let evidence = parse_hardware_output("node-a", &[1, 0], stdout)?;
-        assert_eq!(evidence.machine, "node-a");
         assert_eq!(evidence.driver_version, "580.65.06");
-        let indices: Vec<u32> = evidence.gpus.iter().map(|gpu| gpu.index).collect();
+        let indices: Vec<u32> = evidence.devices.iter().map(|device| device.index).collect();
         assert_eq!(indices, [0, 1]);
-        assert_eq!(evidence.gpus[0].uuid, "GPU-aaa");
-        assert_eq!(evidence.gpus[0].model, "Fixture GPU");
-        assert_eq!(evidence.gpus[0].memory_total_mib, 97871);
+        assert_eq!(evidence.devices[0].uuid, "GPU-aaa");
+        assert_eq!(evidence.devices[0].model, "Fixture GPU");
+        assert_eq!(evidence.devices[0].memory_total_mib, 97871);
         Ok(())
     }
 
@@ -2565,12 +2569,12 @@ mod tests {
     #[test]
     fn zero_assigned_devices_record_the_driver_without_claiming_inventory() -> Result<(), String> {
         // A proxy-only host enumerates its full inventory (no `-i`), but
-        // nothing is assigned there, so no GPU may be recorded as assigned.
+        // nothing is assigned there, so no device may be recorded as assigned.
         let stdout = "INFERLAB_HARDWARE\t0, Fixture GPU, 97871, GPU-aaa, 580.65.06\n\
                       INFERLAB_HARDWARE\t1, Fixture GPU, 97871, GPU-bbb, 580.65.06\n";
         let evidence = parse_hardware_output("proxy-host", &[], stdout)?;
         assert_eq!(evidence.driver_version, "580.65.06");
-        assert!(evidence.gpus.is_empty(), "{evidence:?}");
+        assert!(evidence.devices.is_empty(), "{evidence:?}");
         Ok(())
     }
 

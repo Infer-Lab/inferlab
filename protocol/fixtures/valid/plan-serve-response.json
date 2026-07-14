@@ -1,27 +1,21 @@
 {
   "status": "ok",
-  "protocol_version": "4",
+  "protocol_version": "5",
   "result": {
     "operation": "plan_serve",
     "output": {
       "integration": {
         "adapter_id": "inferlab-vllm",
         "adapter_version": "0.2.0",
-        "framework": "vllm"
-      },
-      "effective_settings": {
-        "trust_remote_code": true
-      },
-      "effective_parallelism": {
-        "outer": {"tensor_parallel_size": 1, "pipeline_parallel_size": 1},
-        "attention": {"tensor_parallel_size": 1, "data_parallel_size": 1, "context_parallel_size": 1},
-        "experts": {"tensor_parallel_size": 1, "data_parallel_size": 1, "expert_parallel_size": 1, "dense_tensor_parallel_size": 1}
+        "framework": "vllm",
+        "framework_version": "0.10.2"
       },
       "roles": [
         {
           "id": "prefill",
           "kind": "prefill",
-          "replica_count": 1,
+          "declared_replica_count": 1,
+          "effective_replica_count": 1,
           "effective_settings": {"trust_remote_code": true},
           "effective_parallelism": {
             "outer": {"tensor_parallel_size": 2, "pipeline_parallel_size": 1},
@@ -32,7 +26,8 @@
         {
           "id": "decode",
           "kind": "decode",
-          "replica_count": 1,
+          "declared_replica_count": 1,
+          "effective_replica_count": 1,
           "effective_settings": {"trust_remote_code": true},
           "effective_parallelism": {
             "outer": {"tensor_parallel_size": 2, "pipeline_parallel_size": 1},
@@ -46,7 +41,7 @@
           "id": "prefill",
           "role_id": "prefill",
           "replica_index": 0,
-          "accelerator_count": 2,
+          "device_count": 2,
           "ports": ["bootstrap"],
           "primary_ports": ["master"],
           "primary_readiness": {"kind": "http", "path": "/v1/models"},
@@ -59,7 +54,7 @@
           "id": "decode",
           "role_id": "decode",
           "replica_index": 0,
-          "accelerator_count": 2,
+          "device_count": 2,
           "ports": [],
           "primary_ports": ["master"],
           "primary_readiness": {"kind": "http", "path": "/v1/models"},
@@ -74,12 +69,13 @@
         {"kind": "kv_transfer", "source": "prefill", "target": "decode", "mechanism": "mooncake"},
         {"kind": "bootstrap", "source": "router", "target": "prefill", "port": "bootstrap"}
       ],
-      "public_endpoint": {
-        "kind": "builtin_proxy",
-        "process_id": "proxy",
-        "role_id": "router",
+      "routing": {
+        "owner": "inferlab_builtin",
+        "implementation": "vllm_mooncake",
+        "policy": "round_robin",
         "prefill_role": "prefill",
         "decode_role": "decode",
+        "ports": [],
         "readiness": {"kind": "http", "path": "/healthcheck"}
       },
       "endpoint": {

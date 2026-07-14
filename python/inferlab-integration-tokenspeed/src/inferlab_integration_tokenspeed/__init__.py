@@ -18,8 +18,6 @@ from inferlab_adapter_sdk import (
     PlanServeInput,
     PlanServeResult,
     ProcessSpec,
-    PublicEndpointRequirement,
-    PublicEndpointRequirementReplica,
     ReadinessProbe,
     ReadinessProbeHttp,
     ReadinessProbeHttpTargetRegistry,
@@ -27,6 +25,9 @@ from inferlab_adapter_sdk import (
     RenderedServeProcess,
     RenderServeInput,
     RenderServeResult,
+    RoutingResult,
+    RoutingResultDirect,
+    RoutingResultIntegrationNative,
     ServeProcessAllocation,
     ServeReplicaRequirement,
     ServeRoleInput,
@@ -145,14 +146,6 @@ def _settings(values: dict[str, SettingValue]) -> TokenspeedServeSettings:
         raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
 
 
-def _merged_settings(
-    base: dict[str, SettingValue], overrides: dict[str, SettingValue]
-) -> TokenspeedServeSettings:
-    merged = dict(base)
-    merged.update(overrides)
-    return _settings(merged)
-
-
 def _effective_settings(settings: TokenspeedServeSettings) -> dict[str, SettingValue]:
     return {
         key: SettingValue(root=value)
@@ -161,20 +154,27 @@ def _effective_settings(settings: TokenspeedServeSettings) -> dict[str, SettingV
 
 
 def _adapter_version() -> str:
-    try:
-        return version("inferlab-integration-tokenspeed")
-    except PackageNotFoundError:
-        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if pyproject.is_file():
         with pyproject.open("rb") as handle:
             project_version: str = tomllib.load(handle)["project"]["version"]
         return project_version
+    try:
+        return version("inferlab-integration-tokenspeed")
+    except PackageNotFoundError:
+        return "unavailable"
 
 
 def _identity() -> IntegrationIdentity:
+    try:
+        framework_version = version("tokenspeed")
+    except PackageNotFoundError:
+        framework_version = "unavailable"
     return IntegrationIdentity(
         adapter_id="inferlab-tokenspeed",
         adapter_version=_adapter_version(),
         framework="tokenspeed",
+        framework_version=framework_version,
     )
 
 
@@ -292,7 +292,7 @@ def _plan_role(
     ports: list[str],
     primary_readiness: ReadinessProbe,
 ) -> tuple[ServeRoleResult, list[ServeReplicaRequirement]]:
-    settings = _merged_settings(input.settings, role.settings)
+    settings = _settings(role.settings)
     parallelism = _effective_parallelism(role.parallelism)
     outer = parallelism.outer or ParallelismOuter()
     replicas = [
@@ -300,7 +300,7 @@ def _plan_role(
             id=_replica_id(role, replica_index),
             role_id=role.id,
             replica_index=replica_index,
-            accelerator_count=outer.tensor_parallel_size or 1,
+            device_count=outer.tensor_parallel_size or 1,
             ports=list(ports),
             primary_ports=[],
             primary_readiness=primary_readiness,
@@ -312,7 +312,8 @@ def _plan_role(
         ServeRoleResult(
             id=role.id,
             kind=role.kind,
-            replica_count=role.replica_count,
+            declared_replica_count=role.replica_count,
+            effective_replica_count=role.replica_count,
             effective_settings=_effective_settings(settings),
             effective_parallelism=parallelism,
         ),
@@ -337,7 +338,7 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             "single topology does not use a KV-transfer mechanism",
         )
-    if input.routing_backend != "builtin":
+    if input.routing_backend is not None:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
             f"TokenSpeed single topology does not support routing backend "
@@ -357,14 +358,10 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
     )
     return PlanServeResult(
         integration=_identity(),
-        effective_settings=_effective_settings(_settings(input.settings)),
-        effective_parallelism=_effective_parallelism(input.parallelism),
         roles=[role_result],
         replicas=replicas,
         links=[],
-        public_endpoint=PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id=replicas[0].id)
-        ),
+        routing=RoutingResult(root=RoutingResultDirect(role=role.id, replica=0)),
         endpoint=_endpoint_requirement(),
     )
 
@@ -398,7 +395,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
     router_role = ServeRoleResult(
         id="router",
         kind=ServeRoleKind.router,
-        replica_count=1,
+        declared_replica_count=1,
+        effective_replica_count=1,
         effective_settings={},
         effective_parallelism=Parallelism(),
     )
@@ -406,7 +404,7 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
         id="router",
         role_id="router",
         replica_index=0,
-        accelerator_count=0,
+        device_count=0,
         ports=["prometheus"],
         primary_ports=[],
         primary_readiness=ReadinessProbe(
@@ -450,13 +448,11 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
     ]
     return PlanServeResult(
         integration=_identity(),
-        effective_settings=_effective_settings(_settings(input.settings)),
-        effective_parallelism=_effective_parallelism(input.parallelism),
         roles=[prefill_result, decode_result, router_role],
         replicas=[*prefill_replicas, *decode_replicas, router_replica],
         links=links,
-        public_endpoint=PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id=router_replica.id)
+        routing=RoutingResult(
+            root=RoutingResultIntegrationNative(role="router", replica=0, policy="round_robin")
         ),
         endpoint=_endpoint_requirement(),
     )
@@ -482,6 +478,12 @@ def _render_worker(
     outer = role.effective_parallelism.outer or ParallelismOuter()
     attention = role.effective_parallelism.attention or ParallelismAttention()
     experts = role.effective_parallelism.experts or ParallelismExperts()
+    if allocation.model_locator is None or allocation.endpoint is None:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request,
+            f"serving allocation {allocation.process!r} is missing its model or endpoint",
+        )
+    endpoint = allocation.endpoint
     world_size = outer.tensor_parallel_size or 1
     if input.topology == ServeTopology.single:
         control_endpoint = allocation.ports.get("control")
@@ -520,9 +522,9 @@ def _render_worker(
         )
     inferlab_args = [
         "--host",
-        allocation.endpoint.host,
+        endpoint.host,
         "--port",
-        str(allocation.endpoint.port),
+        str(endpoint.port),
         *endpoint_args,
         "--dist-init-addr",
         f"{dist_init_endpoint.host}:{dist_init_endpoint.port}",
@@ -561,7 +563,7 @@ def _render_worker(
             if bootstrap is None:
                 raise AdapterOperationError(
                     AdapterErrorCode.invalid_request,
-                    f"prefill process {allocation.process_id!r} is missing its bootstrap port",
+                    f"prefill process {allocation.process!r} is missing its bootstrap port",
                 )
             inferlab_args.extend(["--disaggregation-bootstrap-port", str(bootstrap.port)])
     append_option(inferlab_args, "--max-model-len", settings.max_model_len)
@@ -589,14 +591,18 @@ def _render_worker(
         inferlab_args.append("--trust-remote-code")
     argv.extend(merge_serve_args(settings.extra_args or [], inferlab_args, _INFERLAB_OPTION_ARITY))
 
-    process_env = _runtime_cache_env(allocation.runtime_cache_root)
+    process_env = _runtime_cache_env(allocation.cache)
     process_env.update(settings.extra_env or {})
     if input.topology == ServeTopology.prefill_decode:
         process_env["TOKENSPEED_SKIP_GRPC_WARMUP"] = "1"
     return RenderedServeProcess(
-        id=allocation.process_id,
+        process=allocation.process,
+        role=allocation.role,
+        replica=allocation.replica,
+        rank=allocation.rank,
+        rank_count=allocation.rank_count,
         launch_files=[],
-        process=ProcessSpec(argv=argv, env=process_env),
+        command=ProcessSpec(argv=argv, env=process_env),
     )
 
 
@@ -612,27 +618,35 @@ def _render_router(
         )
     prefill_roles = {role.id for role in input.roles if role.kind == ServeRoleKind.prefill}
     decode_roles = {role.id for role in input.roles if role.kind == ServeRoleKind.decode}
-    prefill = [
-        item for item in input.allocations if item.role_id in prefill_roles and item.rank == 0
-    ]
-    decode = [item for item in input.allocations if item.role_id in decode_roles and item.rank == 0]
+    prefill = [item for item in input.allocations if item.role in prefill_roles and item.rank == 0]
+    decode = [item for item in input.allocations if item.role in decode_roles and item.rank == 0]
+    model_locator = next(
+        (item.model_locator for item in [*prefill, *decode] if item.model_locator is not None),
+        None,
+    )
+    if allocation.endpoint is None or model_locator is None:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request,
+            "TokenSpeed SMG requires a public endpoint and one serving model locator",
+        )
+    endpoint = allocation.endpoint
     argv = [
         "python3",
         "-m",
         "smg",
         "launch",
         "--host",
-        allocation.endpoint.host,
+        "0.0.0.0",
         "--port",
-        str(allocation.endpoint.port),
+        str(endpoint.port),
         "--prometheus-port",
         str(prometheus.port),
         "--worker-startup-timeout-secs",
         str(_ROUTER_WORKER_STARTUP_TIMEOUT_SECS),
         "--model-path",
-        allocation.model_locator,
+        model_locator,
         "--tokenizer-path",
-        allocation.model_locator,
+        model_locator,
         "--pd-disaggregation",
     ]
     for item in prefill:
@@ -640,7 +654,12 @@ def _render_router(
         if bootstrap is None:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
-                f"prefill replica {item.replica_id!r} is missing its bootstrap port",
+                f"prefill replica {item.replica!r} is missing its bootstrap port",
+            )
+        if item.endpoint is None:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                f"prefill allocation {item.process!r} has no endpoint",
             )
         argv.extend(
             [
@@ -650,6 +669,11 @@ def _render_router(
             ]
         )
     for item in decode:
+        if item.endpoint is None:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                f"decode allocation {item.process!r} has no endpoint",
+            )
         argv.extend(["--decode", f"grpc://{item.endpoint.host}:{item.endpoint.port}"])
     argv.extend(
         [
@@ -664,9 +688,13 @@ def _render_router(
         ]
     )
     return RenderedServeProcess(
-        id=allocation.process_id,
+        process=allocation.process,
+        role=allocation.role,
+        replica=allocation.replica,
+        rank=allocation.rank,
+        rank_count=allocation.rank_count,
         launch_files=[],
-        process=ProcessSpec(argv=argv, env={}),
+        command=ProcessSpec(argv=argv, env={}),
     )
 
 
@@ -676,29 +704,26 @@ def render_serve(input: RenderServeInput) -> RenderServeResult:
             AdapterErrorCode.invalid_request, "serve allocation must not be empty"
         )
     roles = {role.id: role for role in input.roles}
-    replica_counts: dict[str, int] = {}
-    for allocation in input.allocations:
-        replica_counts[allocation.replica_id] = replica_counts.get(allocation.replica_id, 0) + 1
     if input.topology == ServeTopology.single and len(input.allocations) != 1:
         message = (
             "the TokenSpeed integration does not support multi-node serving yet"
-            if any(count > 1 for count in replica_counts.values())
+            if any(allocation.rank_count > 1 for allocation in input.allocations)
             else "the TokenSpeed single topology supports exactly one process"
         )
         raise AdapterOperationError(AdapterErrorCode.invalid_request, message)
 
     processes = []
     for allocation in input.allocations:
-        role = roles.get(allocation.role_id)
+        role = roles.get(allocation.role)
         if role is None:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
-                f"allocation references unknown role {allocation.role_id!r}",
+                f"allocation references unknown role {allocation.role!r}",
             )
         if role.kind == ServeRoleKind.router:
             processes.append(_render_router(input, allocation))
             continue
-        if replica_counts[allocation.replica_id] > 1:
+        if allocation.rank_count > 1:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
                 "the TokenSpeed integration does not support multi-node serving yet",

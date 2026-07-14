@@ -1,6 +1,6 @@
 use crate::InferlabError;
 use crate::interrupt;
-use crate::workspace::EnvironmentDefinition;
+use crate::workspace::StackDefinition;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -109,7 +109,7 @@ impl LocalCheckFailure {
 /// identities, failing when a declared script is missing.
 pub fn plan_environment_checks(
     root: &Path,
-    definition: &EnvironmentDefinition,
+    definition: &StackDefinition,
 ) -> Result<(Vec<PlannedEnvironmentCheck>, Vec<PlannedEnvironmentScript>), InferlabError> {
     let digest_of = |script: &Path| -> Result<String, InferlabError> {
         let bytes = fs::read(root.join(script)).map_err(|source| InferlabError::Read {
@@ -391,11 +391,11 @@ fn write_confirmation_marker(
     atomic_write(&path, &bytes, None)
 }
 
-/// One declared environment's confirmation state, reported by `env status`
+/// One declared stack's local realization state, reported by `stack status`
 /// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]).
 #[derive(Debug, Serialize)]
 pub struct EnvironmentStatusReport {
-    pub environment: String,
+    pub stack: String,
     pub pixi_environment: String,
     pub status: EnvironmentStatusKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -412,17 +412,17 @@ pub enum EnvironmentStatusKind {
     NotUsable,
 }
 
-/// Report each named environment's confirmation state without installing
+/// Report each named stack's confirmation state without installing
 /// packages or updating the manifest or lock
-/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]). `environments` pairs a
-/// workspace environment identifier with the Pixi environment it selects.
+/// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]). `stacks` pairs a workspace
+/// stack identifier with the Pixi environment it selects.
 pub fn status(
     root: &Path,
-    environments: &[(String, String)],
+    stacks: &[(String, String)],
 ) -> Result<Vec<EnvironmentStatusReport>, InferlabError> {
-    environments
+    stacks
         .iter()
-        .map(|(id, pixi_environment)| {
+        .map(|(stack, pixi_environment)| {
             let install_command = format!("pixi install --locked --environment {pixi_environment}");
             let (status, diagnostics, install_command) =
                 match check_environment(root, pixi_environment)? {
@@ -439,7 +439,7 @@ pub fn status(
                     ),
                 };
             Ok(EnvironmentStatusReport {
-                environment: id.clone(),
+                stack: stack.clone(),
                 pixi_environment: pixi_environment.clone(),
                 status,
                 diagnostics,
@@ -719,10 +719,10 @@ fn atomic_write(
     }
     temporary
         .persist(path)
-        .map_err(|error| InferlabError::EnvironmentIo {
+        .map_err(|failure| InferlabError::EnvironmentIo {
             path: path.to_path_buf(),
             operation: "replace workspace file",
-            source: error.error,
+            source: failure.error,
         })?;
     Ok(())
 }

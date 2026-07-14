@@ -25,7 +25,7 @@ pub enum ImageStatus {
     Failed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum AssemblyOutcome {
     Pending,
@@ -33,7 +33,7 @@ pub enum AssemblyOutcome {
     Failed { message: String },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum ValidationOutcome {
     Pending,
@@ -51,7 +51,7 @@ pub enum ValidationOutcome {
     },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PackageEvidence {
     pub package: String,
     pub filename: String,
@@ -61,7 +61,7 @@ pub struct PackageEvidence {
     pub cached: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AssemblyEvidence {
     pub platform: String,
     pub closure_digest: String,
@@ -74,7 +74,7 @@ pub struct AssemblyEvidence {
     /// Checks executed inside this assembly's image build
     /// ([[RFC-0002:C-ENVIRONMENT-CHECKS]]); their output lives in the
     /// referenced builder log.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_checks: Vec<crate::environment::EnvironmentCheckEvidence>,
     /// The immutable identity the builder returned, recorded the moment
     /// assembly produced it — preserved even when a later step (cleanup,
@@ -89,23 +89,24 @@ pub struct AssemblyEvidence {
     pub outcome: AssemblyOutcome,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExportEvidence {
     pub path: PathBuf,
     pub archive_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ValidationEvidence {
     pub recipe: String,
-    pub case: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_case: Option<String>,
     pub model: String,
     pub platform: String,
     pub closure_digest: String,
     pub outcome: ValidationOutcome,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImageRecord {
     pub schema_version: u32,
     pub inferlab_version: String,
@@ -116,10 +117,14 @@ pub struct ImageRecord {
     pub resolved: ResolvedImageBuild,
     /// Entry checks against the local workspace realization, executed before
     /// any package build ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_checks: Vec<crate::environment::EnvironmentCheckEvidence>,
     pub assemblies: Vec<AssemblyEvidence>,
     pub validations: Vec<ValidationEvidence>,
+}
+
+impl ImageRecord {
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 /// The shareable-shaped mapping the workflow stops at. Artifact locations are
@@ -158,7 +163,8 @@ pub struct ManifestAssembly {
 #[derive(Clone, Debug, Serialize)]
 pub struct ManifestValidation {
     pub recipe: String,
-    pub case: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_case: Option<String>,
     pub model: String,
     pub platform: String,
     pub closure_digest: String,
@@ -209,7 +215,7 @@ impl ImageRecordStore {
             .iter()
             .map(|validation| ValidationEvidence {
                 recipe: validation.recipe.clone(),
-                case: validation.case.clone(),
+                server_case: validation.server_case.clone(),
                 model: validation.model.clone(),
                 platform: validation.platform.clone(),
                 closure_digest: validation.closure_digest.clone(),
@@ -219,7 +225,7 @@ impl ImageRecordStore {
         let store = Self {
             dir,
             record: ImageRecord {
-                schema_version: 1,
+                schema_version: ImageRecord::SCHEMA_VERSION,
                 inferlab_version: env!("CARGO_PKG_VERSION").to_owned(),
                 id,
                 status: ImageStatus::Running,
@@ -320,7 +326,7 @@ impl ImageRecordStore {
                 .iter()
                 .map(|validation| ManifestValidation {
                     recipe: validation.recipe.clone(),
-                    case: validation.case.clone(),
+                    server_case: validation.server_case.clone(),
                     model: validation.model.clone(),
                     platform: validation.platform.clone(),
                     closure_digest: validation.closure_digest.clone(),

@@ -6,7 +6,7 @@ use super::record::{
 };
 use super::{
     BenchCasePlan, BenchExecutionPlan, BenchPlan, ClientCommandPlan, EvalExecutionPlan, EvalPlan,
-    LoadShape, WorkloadServerAccess, resolved_request_count,
+    LoadShape, ResolvedWorkloadPlan, WorkloadServerAccess, resolved_request_count,
 };
 use crate::InferlabError;
 use crate::interrupt;
@@ -43,8 +43,7 @@ pub fn run_eval(
     // terminate identity-matching survivors before this run launches its
     // own clients ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     sweep_stale_client_groups(root);
-    let resolved =
-        serde_json::to_value(plan).map_err(|source| InferlabError::RecordEncode { source })?;
+    let resolved = ResolvedWorkloadPlan::Eval(Box::new(plan.clone()));
     let mut session =
         WorkloadRecordSession::begin(root, record_id, WorkloadKind::Eval, &plan.id, resolved)?;
     let passed = match execute_eval(root, server_record_id, plan, &mut session) {
@@ -183,7 +182,7 @@ fn run_eval_operation(
         EvalExecutionPlan::NativeOpenAiSmoke => run_openai_smoke(plan, session, paths),
         EvalExecutionPlan::LmEval { command, .. } => {
             let request = EvalClientRequest {
-                protocol_version: ProtocolVersion::V4,
+                protocol_version: ProtocolVersion::V5,
                 endpoint: plan.endpoint.clone(),
                 model: plan.model.clone(),
                 definition: super::eval_input(&plan.definition),
@@ -205,16 +204,19 @@ pub fn run_bench(
     record_id: &str,
     plan: &BenchPlan,
     server_access: WorkloadServerAccess<'_>,
-    record_evidence: &impl Serialize,
+    record_evidence: ResolvedWorkloadPlan,
 ) -> Result<WorkloadRecord, InferlabError> {
     // Earlier runs' unclean exits leave recorded client groups behind;
     // terminate identity-matching survivors before this run launches its
     // own clients ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     sweep_stale_client_groups(root);
-    let resolved = serde_json::to_value(record_evidence)
-        .map_err(|source| InferlabError::RecordEncode { source })?;
-    let mut session =
-        WorkloadRecordSession::begin(root, record_id, WorkloadKind::Bench, &plan.id, resolved)?;
+    let mut session = WorkloadRecordSession::begin(
+        root,
+        record_id,
+        WorkloadKind::Bench,
+        &plan.id,
+        record_evidence,
+    )?;
     let server_record_id = server_access.record_id().to_owned();
     match server_access {
         WorkloadServerAccess::RecipeOwned { .. } => {
@@ -345,16 +347,18 @@ fn finish_failed_bench(
     session.finish(WorkloadStatus::Failed)
 }
 
-pub(crate) fn skip<T: Serialize>(
+pub(crate) fn skip<T>(
     root: &Path,
     record_id: &str,
     kind: WorkloadKind,
     definition_id: &str,
     plan: &T,
     reason: &str,
-) -> Result<WorkloadRecord, InferlabError> {
-    let resolved =
-        serde_json::to_value(plan).map_err(|source| InferlabError::RecordEncode { source })?;
+) -> Result<WorkloadRecord, InferlabError>
+where
+    T: Clone + Into<ResolvedWorkloadPlan>,
+{
+    let resolved = plan.clone().into();
     let mut session = WorkloadRecordSession::begin(root, record_id, kind, definition_id, resolved)?;
     session.record_mut().skip_reason = Some(reason.to_owned());
     session.finish(WorkloadStatus::Skipped)?;
@@ -472,7 +476,7 @@ fn run_bench_case(
         return Ok(failed_case(case, paths, reset, "prefix-cache reset failed"));
     }
     let request = BenchClientRequest {
-        protocol_version: ProtocolVersion::V4,
+        protocol_version: ProtocolVersion::V5,
         endpoint: plan.client.endpoint.clone(),
         model: plan.client.model.clone(),
         definition: plan.client.effective_definition.clone(),

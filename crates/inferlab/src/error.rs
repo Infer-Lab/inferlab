@@ -108,8 +108,8 @@ pub enum InferlabError {
         diagnostics: String,
     },
 
-    #[error("one or more serving environments are not confirmed usable; see the status report")]
-    EnvironmentStatusUnconfirmed,
+    #[error("one or more stacks are not confirmed usable; see the status report")]
+    StackStatusUnconfirmed,
 
     #[error("the Inferlab measurement toolchain does not support this host platform: {platform}")]
     UnsupportedToolchainPlatform { platform: String },
@@ -316,7 +316,7 @@ impl InferlabError {
             | Self::EnvironmentIo { .. }
             | Self::EnvironmentRestore { .. }
             | Self::PixiEnvironmentUnavailable { .. }
-            | Self::EnvironmentStatusUnconfirmed => "E1007",
+            | Self::StackStatusUnconfirmed => "E1007",
             Self::UnsupportedToolchainPlatform { .. }
             | Self::ToolchainIo { .. }
             | Self::ToolchainHeld { .. }

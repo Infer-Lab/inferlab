@@ -16,7 +16,7 @@ from inferlab_bench_runner.bench_client import (
 def request(tmp_path: Path, load_shape: dict[str, object]) -> BenchClientRequest:
     return BenchClientRequest.model_validate(
         {
-            "protocol_version": "4",
+            "protocol_version": "5",
             "endpoint": {
                 "protocol": "http",
                 "host": "127.0.0.1",

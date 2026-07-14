@@ -86,7 +86,7 @@ impl AdapterClient for ProcessAdapterClient {
         input: PlanServeInput,
     ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
         let request = AdapterRequest::PlanServe {
-            protocol_version: ProtocolVersion::V4,
+            protocol_version: ProtocolVersion::V5,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
@@ -101,7 +101,7 @@ impl AdapterClient for ProcessAdapterClient {
         input: RenderServeInput,
     ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
         let request = AdapterRequest::RenderServe {
-            protocol_version: ProtocolVersion::V4,
+            protocol_version: ProtocolVersion::V5,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
@@ -122,7 +122,7 @@ impl AdapterClient for ProcessAdapterClient {
 #[derive(Clone, Debug)]
 pub struct ImageAdapterClient {
     pub image_id: String,
-    /// The integration computes on no accelerator, so no device is requested
+    /// The integration computes on no devices, so no device is requested
     /// by default. A host whose container runtime rejects device-less
     /// creation (measured: some NVIDIA-runtime sites enumerate every host
     /// device and fail outright when one is unhealthy) declares one
@@ -166,7 +166,7 @@ impl ImageAdapterClient {
             cidfile.display().to_string(),
         ];
         if let Some(device) = self.device {
-            launcher.extend(crate::container::gpu_device_args(&device.to_string()));
+            launcher.extend(crate::container::docker_device_args(&device.to_string()));
         }
         if self.explicit_entrypoint {
             // An external image carries no workspace-side packages, so lowering
@@ -261,7 +261,7 @@ pub(crate) fn probe_external_framework(
         cidfile.display().to_string(),
     ];
     if let Some(device) = device {
-        launcher.extend(crate::container::gpu_device_args(&device.to_string()));
+        launcher.extend(crate::container::docker_device_args(&device.to_string()));
     }
     launcher.extend([
         "--entrypoint".to_owned(),
@@ -349,7 +349,7 @@ impl AdapterClient for ImageAdapterClient {
         input: PlanServeInput,
     ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
         let request = AdapterRequest::PlanServe {
-            protocol_version: ProtocolVersion::V4,
+            protocol_version: ProtocolVersion::V5,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, request)?;
@@ -364,7 +364,7 @@ impl AdapterClient for ImageAdapterClient {
         input: RenderServeInput,
     ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
         let request = AdapterRequest::RenderServe {
-            protocol_version: ProtocolVersion::V4,
+            protocol_version: ProtocolVersion::V5,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, request)?;
@@ -522,7 +522,7 @@ fn invoke_adapter(
 }
 
 /// The protocol version this binary speaks, as its wire string.
-const PROTOCOL_VERSION: &str = "4";
+const PROTOCOL_VERSION: &str = "5";
 
 /// The raw `protocol_version` string an adapter answered, read without
 /// committing to the full versioned response shape. Absent when the field is

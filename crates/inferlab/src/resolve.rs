@@ -2,14 +2,16 @@ use crate::InferlabError;
 use crate::adapter::{AdapterClient, executable_name};
 use crate::workload::{MeasurementPlan, MeasurementResolveContext, resolve_measurements};
 use crate::workspace::{
-    LaunchBinding, LoadedWorkspace, NsysEscapes, PlacementBinding, RecipeCase,
-    ServeProfileDefinition, WorkspaceSnapshot,
+    DEFAULT_CAPTURE_CONTROL_DEADLINE_SECONDS, LaunchBinding, LoadedWorkspace, NsysEscapes,
+    PlacementBinding, PlacementRoleBinding, ServerCaseDefinition, ServerDefinition,
+    WorkspaceSnapshot,
 };
 use inferlab_protocol::{
-    ClientEndpointInput, EndpointAssignment, EndpointProtocol, KvTransferMechanism,
-    LaunchFileDeclaration, Parallelism, PlanServeInput, PlanServeResult, ProcessSpec,
-    ProtocolVersion, PublicEndpointRequirement, ReadinessProbe, RenderInputDeclaration,
-    RenderServeInput, RenderedServeProcess, ServeModelInput, ServeProcessAllocation,
+    AllocationLaunch, BuiltinRouterKind, CaptureTargetRequirement, ClientEndpointInput,
+    EndpointAssignment, EndpointProtocol, KvTransferMechanism, LaunchFileDeclaration,
+    MeasurementModelInput, Parallelism, PlanServeInput, PlanServeResult, ProcessSpec,
+    ProtocolVersion, ReadinessProbe, RenderInputDeclaration, RenderServeInput,
+    RenderedServeProcess, RoutingResult, ServeModelInput, ServeProcessAllocation,
     ServeReplicaRequirement, ServeRoleInput, ServeRoleKind, ServeRoleLink, ServeRoleResult,
     ServeTopology, SettingValue, SuppliedRenderInput, TargetEndpointScheme,
 };
@@ -18,17 +20,24 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Workflow {
     ServeStart,
     RecipeRun,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ExecutionTarget<'a> {
+    Server(&'a str),
+    Recipe(&'a str),
+}
+
 pub struct ResolveRequest<'a> {
     pub workflow: Workflow,
-    pub recipe: &'a str,
+    pub target: ExecutionTarget<'a>,
     pub case: Option<&'a str>,
+    pub placement: Option<&'a str>,
     pub overrides: &'a [String],
     pub captures: &'a [String],
     /// A validated image selection ([[RFC-0003:C-RUNTIME-WORKFLOWS]]):
@@ -43,12 +52,13 @@ pub struct ResolveRequest<'a> {
     pub external: Option<&'a crate::image::launch::ExternalImagePlan>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResolvedExecution {
     pub workflow: Workflow,
     pub workspace: WorkspaceSnapshot,
-    pub recipe: RecipePlan,
-    pub source: SourcePlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<RecipePlan>,
+    pub stack: StackPlan,
     pub server: ServerPlan,
     pub measurements: Option<MeasurementPlan>,
 }
@@ -58,8 +68,9 @@ pub struct DryRunPlan<'a> {
     pub workflow: Workflow,
     pub dry_run: bool,
     pub workspace: &'a WorkspaceSnapshot,
-    pub recipe: &'a RecipePlan,
-    pub source: &'a SourcePlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: &'a Option<RecipePlan>,
+    pub stack: &'a StackPlan,
     pub server: &'a ServerPlan,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measurements: &'a Option<MeasurementPlan>,
@@ -72,57 +83,62 @@ impl ResolvedExecution {
             dry_run: true,
             workspace: &self.workspace,
             recipe: &self.recipe,
-            source: &self.source,
+            stack: &self.stack,
             server: &self.server,
             measurements: &self.measurements,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecipePlan {
     pub id: String,
-    pub case: CasePlan,
-    pub references: RecipeReferences,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CasePlan {
-    pub id: String,
-    pub index: usize,
-    pub default: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct RecipeReferences {
-    pub model: String,
-    pub serve_profile: String,
-    pub source_set: String,
-    pub environment: String,
     pub workload_suite: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct SourcePlan {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CasePlan {
     pub id: String,
-    pub paths: Vec<PathBuf>,
+    pub selection: CaseSelectionSource,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseSelectionSource {
+    Explicit,
+    Default,
+    Sole,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StackPlan {
+    pub id: String,
+    pub integration: String,
+    pub pixi_environment: String,
+    pub source_paths: Vec<PathBuf>,
+    pub realization: crate::environment::CheckRealization,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<crate::environment::PlannedEnvironmentCheck>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServerPlan {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub case: Option<CasePlan>,
     pub explicit_overrides: Vec<String>,
+    pub declarations: Vec<ServerDeclarationPlan>,
     pub topology: ServeTopology,
+    pub profiling: bool,
+    pub readiness_timeout_seconds: u64,
+    pub capture_control_deadline_seconds: u64,
     pub routing: RoutingPlan,
-    pub parallelism: ParallelismPlan,
-    pub settings: BTreeMap<String, SettingValue>,
-    pub setting_sources: BTreeMap<String, SettingProvenance>,
-    /// The raw profiler escape declaration as written on the profile and
+    /// The raw profiler escape declaration as written on the server and
     /// its roles ([[RFC-0004:C-WORKLOAD-PROFILING]]); the merged, effective
     /// inputs ride each capture target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profiler_escapes: Option<ProfilerEscapesPlan>,
     pub model: ModelPlan,
-    pub environment: EnvironmentPlan,
     /// The image substitution consuming this launch, when the operator
     /// selected an image build record ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,19 +155,106 @@ pub struct ServerPlan {
     pub network: Option<NetworkPlan>,
     pub roles: Vec<RolePlan>,
     pub links: Vec<ServeRoleLink>,
-    pub processes: Vec<ProcessPlan>,
     pub endpoint: EndpointPlan,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// One ordered behavior declaration consumed while resolving a server.
+/// Framework settings remain adapter-owned structured data; each role's
+/// declared and effective values remain the execution authorities.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ServerDeclarationPlan {
+    pub source: DeclarationSource,
+    pub common: CommonDeclarationPlan,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, RoleDeclarationPlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeclarationSource {
+    Server { id: String },
+    Case { id: String },
+    Invocation { index: usize },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CommonDeclarationPlan {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer: Option<KvTransferMechanism>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiling: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_control_deadline_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "parallelism_is_empty")]
+    pub parallelism: Parallelism,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, SettingValue>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RoleDeclarationPlan {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
+    #[serde(default, skip_serializing_if = "parallelism_is_empty")]
+    pub parallelism: Parallelism,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, SettingValue>,
+}
+
+fn parallelism_is_empty(parallelism: &Parallelism) -> bool {
+    parallelism == &Parallelism::default()
+}
+
+impl ServerPlan {
+    pub fn processes(&self) -> impl Iterator<Item = &ProcessPlan> {
+        self.roles
+            .iter()
+            .flat_map(|role| &role.replicas)
+            .flat_map(|replica| &replica.ranks)
+    }
+
+    pub fn process_count(&self) -> usize {
+        self.processes().count()
+    }
+
+    pub fn process_contexts(&self) -> impl Iterator<Item = ProcessContext<'_>> {
+        self.roles.iter().flat_map(|role| {
+            role.replicas.iter().flat_map(move |replica| {
+                replica.ranks.iter().map(move |process| ProcessContext {
+                    role_id: &role.id,
+                    replica_id: &replica.id,
+                    replica_index: replica.index,
+                    process,
+                })
+            })
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ProcessContext<'a> {
+    pub role_id: &'a str,
+    pub replica_id: &'a str,
+    pub replica_index: u32,
+    pub process: &'a ProcessPlan,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RoutingPlan {
-    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer: Option<KvTransferMechanism>,
     pub public_process: String,
     pub policy: String,
     pub implementation: RoutingImplementationPlan,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "owner", rename_all = "kebab-case")]
 pub enum RoutingImplementationPlan {
     Direct,
@@ -159,62 +262,66 @@ pub enum RoutingImplementationPlan {
     Integration { id: String, adapter_version: String },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RolePlan {
     pub id: String,
     pub kind: ServeRoleKind,
     pub declared_replica_count: u32,
     pub effective_replica_count: u32,
+    pub declared_parallelism: Parallelism,
     pub effective_parallelism: Parallelism,
-    pub parallelism_sources: BTreeMap<String, SettingSource>,
+    pub declared_settings: BTreeMap<String, SettingValue>,
     pub effective_settings: BTreeMap<String, SettingValue>,
-    pub setting_sources: BTreeMap<String, SettingProvenance>,
     pub replicas: Vec<RoleReplicaPlan>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RoleReplicaPlan {
     pub id: String,
     pub index: u32,
-    pub processes: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ParallelismPlan {
-    pub declared: Parallelism,
-    pub effective: Parallelism,
-    pub declared_sources: BTreeMap<String, SettingSource>,
+    pub device_count: u32,
+    pub ports: Vec<String>,
+    pub primary_ports: Vec<String>,
+    pub primary_readiness: ReadinessProbe,
+    pub worker_readiness: ReadinessProbe,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_target: Option<CaptureTargetRequirement>,
+    pub entry_process: String,
+    pub ranks: Vec<ProcessPlan>,
 }
 
 #[derive(Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ServerOverridePatch {
     topology: Option<ServeTopology>,
+    readiness_timeout_seconds: Option<u64>,
     routing_backend: Option<String>,
     kv_transfer: Option<KvTransferMechanism>,
     profiling: Option<bool>,
     parallelism: Parallelism,
     roles: BTreeMap<String, ServerRoleOverridePatch>,
-    #[serde(flatten)]
     settings: BTreeMap<String, toml::Value>,
 }
 
+struct IndexedServerOverride {
+    index: usize,
+    raw: String,
+    patch: ServerOverridePatch,
+}
+
 #[derive(Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ServerRoleOverridePatch {
     replicas: Option<u32>,
     parallelism: Parallelism,
-    #[serde(flatten)]
     settings: BTreeMap<String, toml::Value>,
 }
 
 struct ResolvedRoleInput {
     input: ServeRoleInput,
-    parallelism_sources: BTreeMap<String, SettingSource>,
-    setting_sources: BTreeMap<String, SettingProvenance>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadinessPlan {
     Http {
@@ -222,7 +329,6 @@ pub enum ReadinessPlan {
         /// `None` when the server is capture-armed: the readiness wait is
         /// unbounded per [[RFC-0004:C-WORKLOAD-PROFILING]].
         timeout_seconds: Option<u64>,
-        timeout_source: SettingSource,
     },
     HttpTargetRegistry {
         readiness_path: String,
@@ -234,12 +340,11 @@ pub enum ReadinessPlan {
         target_bootstrap_port_field: String,
         expected_targets: Vec<TargetRegistryExpectedTarget>,
         timeout_seconds: Option<u64>,
-        timeout_source: SettingSource,
     },
     ProcessAlive,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TargetRegistryExpectedTarget {
     pub url: String,
     pub role: String,
@@ -247,54 +352,19 @@ pub struct TargetRegistryExpectedTarget {
     pub bootstrap_port: Option<u16>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct SettingProvenance {
-    pub source: SettingSource,
-    pub adjusted_by_integration: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum SettingSource {
-    ServeProfile { id: String },
-    Case { id: String },
-    Invocation,
-    IntegrationDefault { integration: String },
-}
-
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelPlan {
     pub id: String,
     pub served_name: String,
-    pub weight_binding: String,
-    pub locator: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct EnvironmentPlan {
-    pub id: String,
-    pub pixi_environment: String,
-    /// The realization serving launches from: the locally installed
-    /// workspace environment, or a built image whose realization was already
-    /// checked during assembly ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
-    #[serde(skip_serializing_if = "realization_is_local")]
-    pub realization: crate::environment::CheckRealization,
-    /// Declared environment checks executed as launch preflight against the
-    /// local workspace realization.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<crate::environment::PlannedEnvironmentCheck>,
-}
-
-fn realization_is_local(realization: &crate::environment::CheckRealization) -> bool {
-    *realization == crate::environment::CheckRealization::LocalWorkspace
-}
-
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IntegrationPlan {
     pub id: String,
     pub adapter_id: String,
     pub adapter_version: String,
     pub framework: String,
+    pub framework_version: String,
     pub executable: String,
     pub protocol_version: ProtocolVersion,
     pub plan_request_sha256: String,
@@ -303,19 +373,28 @@ pub struct IntegrationPlan {
     pub render_response_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResourcePlan {
-    pub accelerator_count: u32,
+    pub device_count: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlacementPlan {
     pub id: String,
+    pub selection: PlacementSelectionSource,
     pub machines: Vec<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_workspaces: BTreeMap<String, RemoteWorkspacePlan>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_containers: BTreeMap<String, RemoteContainerFacts>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementSelectionSource {
+    Explicit,
+    Default,
+    Sole,
 }
 
 /// Machine-scoped launch facts a remote containerized launch consumed
@@ -323,7 +402,7 @@ pub struct PlacementPlan {
 /// present, and the container user identity comes from that machine's
 /// realization rather than controller filesystem metadata. No workspace
 /// realization is checked — the image replaces the serving environment.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RemoteContainerFacts {
     pub target: String,
     pub user: String,
@@ -338,14 +417,14 @@ pub struct RemoteContainerFacts {
     pub environment: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NetworkPlan {
     pub selected_interface: String,
     pub reason: NetworkSelectionReason,
     pub machines: BTreeMap<String, NetworkMachinePlan>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum NetworkSelectionReason {
     #[serde(rename = "common-default-route-rdma-interface")]
     RdmaDefaultRoute,
@@ -357,7 +436,7 @@ pub enum NetworkSelectionReason {
     Routable,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NetworkMachinePlan {
     pub default_route_interface: Option<String>,
     pub addresses: BTreeMap<String, Vec<String>>,
@@ -365,32 +444,40 @@ pub struct NetworkMachinePlan {
     pub candidates: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActiveRdmaInterfacePlan {
     pub interface: String,
     pub device: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProcessPlan {
     pub id: String,
-    pub role_id: String,
-    pub replica_id: String,
-    pub replica_index: u32,
     pub rank: u32,
+    pub rank_count: u32,
     pub machine: String,
     pub launch: LaunchPlan,
+    #[serde(rename = "dependencies")]
     pub launch_dependencies: Vec<String>,
+    #[serde(flatten)]
     pub allocation: AllocationPlan,
     pub command: CommandPlan,
     pub launch_files: Vec<LaunchFilePlan>,
     pub readiness: ReadinessPlan,
     pub endpoint: EndpointPlan,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_target: Option<CaptureTargetPlan>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContainerPlan {
+    pub name: String,
+    pub image: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LaunchFilePlan {
     pub relative_path: String,
     pub resolved_path: PathBuf,
@@ -398,28 +485,27 @@ pub struct LaunchFilePlan {
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProfilerEscapesPlan {
-    #[serde(skip_serializing_if = "NsysEscapes::is_empty")]
-    pub profile: NsysEscapes,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "NsysEscapes::is_empty")]
+    pub common: NsysEscapes,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, NsysEscapes>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CaptureTargetPlan {
     pub control_process_id: String,
     pub start_path: String,
     pub stop_path: String,
-    pub control_deadline_seconds: u64,
     /// The merged escape inputs for this target's role
-    /// ([[RFC-0004:C-WORKLOAD-PROFILING]]); the raw profile and role
+    /// ([[RFC-0004:C-WORKLOAD-PROFILING]]); the raw common and role
     /// declarations live on the server plan.
-    #[serde(skip_serializing_if = "NsysEscapes::is_empty")]
+    #[serde(default, skip_serializing_if = "NsysEscapes::is_empty")]
     pub escapes: NsysEscapes,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RemoteWorkspacePlan {
     pub target: String,
     pub path: PathBuf,
@@ -433,26 +519,34 @@ pub struct RemoteWorkspacePlan {
     pub environment: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum LaunchPlan {
     Local,
     Ssh { target: String },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AllocationPlan {
-    pub machine_binding: String,
-    pub accelerator_count: u32,
     pub devices: Vec<u32>,
-    pub model_locator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_locator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_locator_source: Option<ModelLocatorSource>,
     pub ports: BTreeMap<String, EndpointAssignment>,
     pub runtime_cache: RuntimeCachePlan,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub communication_interface: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelLocatorSource {
+    Machine,
+    Fallback,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeCachePlan {
     pub storage_root: PathBuf,
     pub storage_root_source: RuntimeCacheRootSource,
@@ -460,14 +554,14 @@ pub struct RuntimeCachePlan {
     pub path: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeCacheRootSource {
     WorkspaceDefault,
     MachineBinding,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeCacheNamespacePlan {
     pub workspace_source_digest: String,
     pub pixi_environment: String,
@@ -483,6 +577,7 @@ pub struct RuntimeCacheNamespacePlan {
 struct ResolvedProcessAllocation {
     wire: ServeProcessAllocation,
     runtime_cache: RuntimeCachePlan,
+    model_locator_source: Option<ModelLocatorSource>,
 }
 
 #[derive(Clone)]
@@ -492,21 +587,22 @@ struct ProcessRequirement {
     replica_id: String,
     replica_index: u32,
     rank: u32,
-    accelerator_count: u32,
+    device_count: u32,
     ports: Vec<String>,
     readiness: ReadinessProbe,
     launch_dependencies: Vec<String>,
     capture_target: Option<CaptureTargetPlan>,
-    fixed_gpus: Option<FixedGpuAssignment>,
+    fixed_devices: Option<FixedDeviceAssignment>,
 }
 
 #[derive(Clone)]
-struct FixedGpuAssignment {
+struct FixedDeviceAssignment {
     machine: String,
-    gpus: Vec<u32>,
+    devices: Vec<u32>,
+    endpoint_port: Option<u16>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommandPlan {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -528,7 +624,7 @@ pub struct CommandPlan {
     pub cwd: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EndpointPlan {
     pub host: String,
     pub port: u16,
@@ -539,44 +635,24 @@ pub struct EndpointPlan {
 }
 
 fn role_declarations(
-    profile: &ServeProfileDefinition,
+    server: &ServerDefinition,
     topology: ServeTopology,
 ) -> Result<Vec<(String, ServeRoleKind)>, InferlabError> {
-    if let Some((id, _)) = profile
-        .roles
-        .iter()
-        .find(|(_, role)| role.kind == ServeRoleKind::Router)
-    {
-        return Err(InferlabError::InvalidConfig {
-            message: format!(
-                "serve profile router role {id:?} is integration-owned; select it with routing_backend"
-            ),
-        });
-    }
     let required = match topology {
         ServeTopology::Single => [ServeRoleKind::Serve].as_slice(),
         ServeTopology::PrefillDecode => [ServeRoleKind::Prefill, ServeRoleKind::Decode].as_slice(),
     };
-    let mut declarations = Vec::new();
-    for kind in required {
-        let matches = profile
-            .roles
-            .iter()
-            .filter(|(_, role)| role.kind == *kind)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [id] => declarations.push((id.clone(), *kind)),
-            [] => declarations.push((kind_name(*kind).to_owned(), *kind)),
-            _ => {
-                return Err(InferlabError::InvalidConfig {
-                    message: format!(
-                        "serve profile declares multiple {} roles: {}",
-                        kind_name(*kind),
-                        matches.join(", ")
-                    ),
-                });
-            }
+    let declarations = required
+        .iter()
+        .map(|kind| (kind_name(*kind).to_owned(), *kind))
+        .collect::<Vec<_>>();
+    for role in server.roles.keys() {
+        if !declarations.iter().any(|(id, _)| id == role) {
+            return Err(InferlabError::InvalidConfig {
+                message: format!(
+                    "server role {role:?} is not valid for topology {topology:?}; roles are canonical"
+                ),
+            });
         }
     }
     Ok(declarations)
@@ -592,28 +668,31 @@ const fn kind_name(kind: ServeRoleKind) -> &'static str {
 }
 
 fn resolve_role_inputs(
-    profile_id: &str,
-    profile: &ServeProfileDefinition,
-    case: &RecipeCase,
-    overrides: &[ServerOverridePatch],
+    server: &ServerDefinition,
+    case_id: Option<&str>,
+    case: Option<&ServerCaseDefinition>,
+    overrides: &[IndexedServerOverride],
     topology: ServeTopology,
 ) -> Result<Vec<ResolvedRoleInput>, InferlabError> {
-    let declarations = role_declarations(profile, topology)?;
+    let declarations = role_declarations(server, topology)?;
     let selected = declarations
         .iter()
         .map(|(id, _)| id.as_str())
         .collect::<BTreeSet<_>>();
-    for id in case.roles.keys() {
-        if !selected.contains(id.as_str()) {
-            return Err(InferlabError::InvalidConfig {
-                message: format!(
-                    "recipe case {:?} configures role {id:?}, which is not part of the selected topology",
-                    case.id
-                ),
-            });
+    if let Some(case) = case {
+        for id in case.roles.keys() {
+            if !selected.contains(id.as_str()) {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "server case {:?} configures role {id:?}, which is not part of the selected topology",
+                        case_id.unwrap_or("")
+                    ),
+                });
+            }
         }
     }
-    for patch in overrides {
+    for item in overrides {
+        let patch = &item.patch;
         for id in patch.roles.keys() {
             if !selected.contains(id.as_str()) {
                 return Err(InferlabError::InvalidConfig {
@@ -624,101 +703,57 @@ fn resolve_role_inputs(
             }
         }
     }
+    let empty_case = ServerCaseDefinition::default();
+    let case = case.unwrap_or(&empty_case);
     declarations
         .into_iter()
         .map(|(id, kind)| {
             let mut parallelism = Parallelism::default();
-            let mut parallelism_sources = BTreeMap::new();
-            let profile_source = SettingSource::ServeProfile {
-                id: profile_id.to_owned(),
-            };
-            merge_parallelism(
-                &mut parallelism,
-                &mut parallelism_sources,
-                &profile.parallelism,
-                &profile_source,
-            );
-            if let Some(role) = profile.roles.get(&id) {
-                merge_parallelism(
-                    &mut parallelism,
-                    &mut parallelism_sources,
-                    &role.parallelism,
-                    &profile_source,
-                );
+            merge_parallelism(&mut parallelism, &server.parallelism);
+            if let Some(role) = server.roles.get(&id) {
+                merge_parallelism(&mut parallelism, &role.parallelism);
             }
-            let case_source = SettingSource::Case {
-                id: case.id.clone(),
-            };
-            merge_parallelism(
-                &mut parallelism,
-                &mut parallelism_sources,
-                &case.parallelism,
-                &case_source,
-            );
+            merge_parallelism(&mut parallelism, &case.parallelism);
             if let Some(role) = case.roles.get(&id) {
-                merge_parallelism(
-                    &mut parallelism,
-                    &mut parallelism_sources,
-                    &role.parallelism,
-                    &case_source,
-                );
+                merge_parallelism(&mut parallelism, &role.parallelism);
             }
-            for patch in overrides {
-                merge_parallelism(
-                    &mut parallelism,
-                    &mut parallelism_sources,
-                    &patch.parallelism,
-                    &SettingSource::Invocation,
-                );
+            for item in overrides {
+                let patch = &item.patch;
+                merge_parallelism(&mut parallelism, &patch.parallelism);
                 if let Some(role) = patch.roles.get(&id) {
-                    merge_parallelism(
-                        &mut parallelism,
-                        &mut parallelism_sources,
-                        &role.parallelism,
-                        &SettingSource::Invocation,
-                    );
+                    merge_parallelism(&mut parallelism, &role.parallelism);
                 }
             }
 
             let mut settings = BTreeMap::new();
-            let mut sources = BTreeMap::new();
-            merge_toml_settings(
-                &mut settings,
-                &mut sources,
-                &profile.settings,
-                &profile_source,
-            )?;
-            if let Some(role) = profile.roles.get(&id) {
-                merge_toml_settings(&mut settings, &mut sources, &role.settings, &profile_source)?;
+            merge_toml_settings(&mut settings, &server.settings)?;
+            if let Some(role) = server.roles.get(&id) {
+                merge_toml_settings(&mut settings, &role.settings)?;
             }
-            merge_toml_settings(&mut settings, &mut sources, &case.settings, &case_source)?;
+            merge_toml_settings(&mut settings, &case.settings)?;
             if let Some(role) = case.roles.get(&id) {
-                merge_toml_settings(&mut settings, &mut sources, &role.settings, &case_source)?;
+                merge_toml_settings(&mut settings, &role.settings)?;
             }
-            for patch in overrides {
-                merge_toml_settings(
-                    &mut settings,
-                    &mut sources,
-                    &patch.settings,
-                    &SettingSource::Invocation,
-                )?;
+            for item in overrides {
+                let patch = &item.patch;
+                merge_toml_settings(&mut settings, &patch.settings)?;
                 if let Some(role) = patch.roles.get(&id) {
-                    merge_toml_settings(
-                        &mut settings,
-                        &mut sources,
-                        &role.settings,
-                        &SettingSource::Invocation,
-                    )?;
+                    merge_toml_settings(&mut settings, &role.settings)?;
                 }
             }
-            let profile_role = profile.roles.get(&id);
-            let mut replica_count = profile_role.map_or(1, |role| role.replicas);
-            if let Some(role) = case.roles.get(&id) {
-                replica_count = role.replicas.unwrap_or(replica_count);
+            let server_role = server.roles.get(&id);
+            let mut replica_count = server_role.and_then(|role| role.replicas).unwrap_or(1);
+            if let Some(role) = case.roles.get(&id)
+                && let Some(replicas) = role.replicas
+            {
+                replica_count = replicas;
             }
-            for patch in overrides {
-                if let Some(role) = patch.roles.get(&id) {
-                    replica_count = role.replicas.unwrap_or(replica_count);
+            for item in overrides {
+                let patch = &item.patch;
+                if let Some(role) = patch.roles.get(&id)
+                    && let Some(replicas) = role.replicas
+                {
+                    replica_count = replicas;
                 }
             }
             if replica_count == 0 {
@@ -734,9 +769,131 @@ fn resolve_role_inputs(
                     parallelism,
                     settings,
                 },
-                parallelism_sources,
-                setting_sources: sources,
             })
+        })
+        .collect()
+}
+
+fn server_declarations(
+    server_id: &str,
+    server: &ServerDefinition,
+    case_id: Option<&str>,
+    case: Option<&ServerCaseDefinition>,
+    overrides: &[IndexedServerOverride],
+) -> Result<Vec<ServerDeclarationPlan>, InferlabError> {
+    let mut declarations = vec![ServerDeclarationPlan {
+        source: DeclarationSource::Server {
+            id: server_id.to_owned(),
+        },
+        common: CommonDeclarationPlan {
+            readiness_timeout_seconds: Some(server.readiness_timeout_seconds),
+            routing_backend: server.routing_backend.clone(),
+            kv_transfer: server.kv_transfer,
+            profiling: server.profiling,
+            capture_control_deadline_seconds: server.capture_control_deadline_seconds,
+            parallelism: server.parallelism.clone(),
+            settings: declaration_settings("server common", &server.settings)?,
+        },
+        roles: server
+            .roles
+            .iter()
+            .map(|(id, role)| {
+                Ok((
+                    id.clone(),
+                    RoleDeclarationPlan {
+                        replicas: role.replicas,
+                        parallelism: role.parallelism.clone(),
+                        settings: declaration_settings(
+                            &format!("server role {id:?}"),
+                            &role.settings,
+                        )?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, InferlabError>>()?,
+    }];
+
+    if let Some(case) = case {
+        let case_id = case_id.ok_or_else(|| InferlabError::InvalidConfig {
+            message: "selected server case has no identity".to_owned(),
+        })?;
+        declarations.push(ServerDeclarationPlan {
+            source: DeclarationSource::Case {
+                id: case_id.to_owned(),
+            },
+            common: CommonDeclarationPlan {
+                readiness_timeout_seconds: case.readiness_timeout_seconds,
+                routing_backend: case.routing_backend.clone(),
+                kv_transfer: case.kv_transfer,
+                profiling: case.profiling,
+                capture_control_deadline_seconds: None,
+                parallelism: case.parallelism.clone(),
+                settings: declaration_settings("case common", &case.settings)?,
+            },
+            roles: case
+                .roles
+                .iter()
+                .map(|(id, role)| {
+                    Ok((
+                        id.clone(),
+                        RoleDeclarationPlan {
+                            replicas: role.replicas,
+                            parallelism: role.parallelism.clone(),
+                            settings: declaration_settings(
+                                &format!("case role {id:?}"),
+                                &role.settings,
+                            )?,
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, InferlabError>>()?,
+        });
+    }
+
+    for item in overrides {
+        let index = item.index;
+        let patch = &item.patch;
+        declarations.push(ServerDeclarationPlan {
+            source: DeclarationSource::Invocation { index },
+            common: CommonDeclarationPlan {
+                readiness_timeout_seconds: patch.readiness_timeout_seconds,
+                routing_backend: patch.routing_backend.clone(),
+                kv_transfer: patch.kv_transfer,
+                profiling: patch.profiling,
+                capture_control_deadline_seconds: None,
+                parallelism: patch.parallelism.clone(),
+                settings: declaration_settings("invocation common", &patch.settings)?,
+            },
+            roles: patch
+                .roles
+                .iter()
+                .map(|(id, role)| {
+                    Ok((
+                        id.clone(),
+                        RoleDeclarationPlan {
+                            replicas: role.replicas,
+                            parallelism: role.parallelism.clone(),
+                            settings: declaration_settings(
+                                &format!("invocation role {id:?}"),
+                                &role.settings,
+                            )?,
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, InferlabError>>()?,
+        });
+    }
+    Ok(declarations)
+}
+
+fn declaration_settings(
+    scope: &str,
+    settings: &BTreeMap<String, toml::Value>,
+) -> Result<BTreeMap<String, SettingValue>, InferlabError> {
+    settings
+        .iter()
+        .map(|(key, value)| {
+            setting_value(value, &format!("{scope}.{key}")).map(|value| (key.clone(), value))
         })
         .collect()
 }
@@ -792,35 +949,36 @@ fn builtin_proxy_kind(
 }
 
 fn render_builtin_proxy(
-    requirement: &PublicEndpointRequirement,
+    requirement: &RoutingResult,
     framework: &str,
     transport: Option<KvTransferMechanism>,
     allocations: &[ResolvedProcessAllocation],
 ) -> Result<RenderedServeProcess, InferlabError> {
-    let PublicEndpointRequirement::BuiltinProxy {
-        process_id,
+    let RoutingResult::InferlabBuiltin {
+        implementation,
         prefill_role,
         decode_role,
         ..
     } = requirement
     else {
         return Err(InferlabError::InvalidConfig {
-            message: "expected a built-in proxy endpoint requirement".to_owned(),
+            message: "expected an Inferlab-owned routing result".to_owned(),
         });
     };
+    let process_id = "router";
     let proxy = allocations
         .iter()
-        .find(|allocation| allocation.wire.process_id == *process_id)
+        .find(|allocation| allocation.wire.process == process_id)
         .ok_or_else(|| InferlabError::InvalidConfig {
             message: format!("built-in proxy process {process_id:?} was not allocated"),
         })?;
     let prefill = allocations
         .iter()
-        .filter(|allocation| allocation.wire.role_id == *prefill_role && allocation.wire.rank == 0)
+        .filter(|allocation| allocation.wire.role == *prefill_role && allocation.wire.rank == 0)
         .collect::<Vec<_>>();
     let decode = allocations
         .iter()
-        .filter(|allocation| allocation.wire.role_id == *decode_role && allocation.wire.rank == 0)
+        .filter(|allocation| allocation.wire.role == *decode_role && allocation.wire.rank == 0)
         .collect::<Vec<_>>();
     if prefill.is_empty() || decode.is_empty() {
         return Err(InferlabError::InvalidConfig {
@@ -828,6 +986,27 @@ fn render_builtin_proxy(
         });
     }
     let proxy_kind = builtin_proxy_kind(framework, transport)?;
+    let declared_kind = match implementation {
+        BuiltinRouterKind::VllmMooncake => BuiltinProxyKind::VllmMooncake,
+        BuiltinRouterKind::VllmNixl => BuiltinProxyKind::VllmNixl,
+        BuiltinRouterKind::Sglang => BuiltinProxyKind::Sglang,
+        BuiltinRouterKind::Trtllm => BuiltinProxyKind::Trtllm,
+    };
+    if proxy_kind != declared_kind {
+        return Err(InferlabError::InvalidConfig {
+            message: format!(
+                "integration returned built-in router {implementation:?}, which is incompatible with framework {framework:?} and transport {transport:?}"
+            ),
+        });
+    }
+    let proxy_endpoint =
+        proxy
+            .wire
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: "built-in router allocation has no endpoint".to_owned(),
+            })?;
     let executable = std::env::current_exe().map_err(|source| InferlabError::Read {
         path: PathBuf::from("/proc/self/exe"),
         source,
@@ -838,12 +1017,23 @@ fn render_builtin_proxy(
         "proxy".to_owned(),
         proxy_kind.command_name().to_owned(),
         "--host".to_owned(),
-        proxy.wire.endpoint.host.clone(),
+        proxy_endpoint.host.clone(),
         "--port".to_owned(),
-        proxy.wire.endpoint.port.to_string(),
+        proxy_endpoint.port.to_string(),
     ];
     for replica in prefill {
-        argv.extend(["--prefill".to_owned(), endpoint_url(&replica.wire.endpoint)]);
+        let endpoint =
+            replica
+                .wire
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!(
+                        "prefill allocation {:?} has no endpoint",
+                        replica.wire.process
+                    ),
+                })?;
+        argv.extend(["--prefill".to_owned(), endpoint_url(endpoint)]);
         if matches!(
             proxy_kind,
             BuiltinProxyKind::VllmMooncake | BuiltinProxyKind::Sglang
@@ -852,7 +1042,7 @@ fn render_builtin_proxy(
                 InferlabError::InvalidConfig {
                     message: format!(
                         "prefill replica {:?} has no bootstrap endpoint",
-                        replica.wire.replica_id
+                        replica.wire.replica
                     ),
                 }
             })?;
@@ -866,11 +1056,26 @@ fn render_builtin_proxy(
         }
     }
     for replica in decode {
-        argv.extend(["--decode".to_owned(), endpoint_url(&replica.wire.endpoint)]);
+        let endpoint =
+            replica
+                .wire
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!(
+                        "decode allocation {:?} has no endpoint",
+                        replica.wire.process
+                    ),
+                })?;
+        argv.extend(["--decode".to_owned(), endpoint_url(endpoint)]);
     }
     Ok(RenderedServeProcess {
-        id: process_id.clone(),
-        process: ProcessSpec {
+        process: process_id.to_owned(),
+        role: "router".to_owned(),
+        replica: 0,
+        rank: 0,
+        rank_count: 1,
+        command: ProcessSpec {
             argv,
             env: BTreeMap::new(),
         },
@@ -1025,126 +1230,156 @@ pub fn resolve<C: AdapterClient>(
     request: &ResolveRequest<'_>,
     adapter: &C,
 ) -> Result<ResolvedExecution, InferlabError> {
-    let recipe = workspace
-        .config
-        .recipes
-        .get(request.recipe)
-        .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("unknown recipe {:?}", request.recipe),
-        })?;
-    let case_index = match request.case {
-        Some(selected) => recipe
-            .cases
-            .iter()
-            .position(|case| case.id == selected)
-            .ok_or_else(|| InferlabError::InvalidConfig {
-                message: format!("unknown case {selected:?} for recipe {:?}", request.recipe),
-            })?,
-        None => 0,
+    let (server_id, recipe_selection) = match request.target {
+        ExecutionTarget::Server(server) if matches!(request.workflow, Workflow::ServeStart) => {
+            (server, None)
+        }
+        ExecutionTarget::Recipe(recipe) if matches!(request.workflow, Workflow::RecipeRun) => {
+            let definition = lookup("recipe", recipe, &workspace.config.recipes)?;
+            (definition.server.as_str(), Some((recipe, definition)))
+        }
+        ExecutionTarget::Server(_) => {
+            return Err(InferlabError::InvalidConfig {
+                message: "recipe run requires a recipe target".to_owned(),
+            });
+        }
+        ExecutionTarget::Recipe(_) => {
+            return Err(InferlabError::InvalidConfig {
+                message: "serve start requires a server target".to_owned(),
+            });
+        }
     };
-    let case = recipe
-        .cases
-        .get(case_index)
-        .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("recipe {:?} has no default case", request.recipe),
-        })?;
-    let profile = lookup(
-        "serve profile",
-        &recipe.serve_profile,
-        &workspace.config.serve_profiles,
-    )?;
-    let model = lookup("model", &recipe.model, &workspace.config.models)?;
-    let source_set = lookup(
-        "source set",
-        &recipe.source_set,
-        &workspace.config.source_sets,
-    )?;
-    let environment = lookup(
-        "environment",
-        &recipe.environment,
-        &workspace.config.environments,
-    )?;
-    let (environment_checks, _image_postprocess) =
-        crate::environment::plan_environment_checks(&workspace.root, environment)?;
-    let suite = lookup(
-        "workload suite",
-        &recipe.workload_suite,
-        &workspace.config.workload_suites,
-    )?;
+    let server = lookup("server", server_id, &workspace.config.servers)?;
+    let model = lookup("model", &server.model, &workspace.config.models)?;
+    let stack = lookup("stack", &server.stack, &workspace.config.stacks)?;
+    let (stack_checks, _image_postprocess) =
+        crate::environment::plan_environment_checks(&workspace.root, stack)?;
+    let suite = recipe_selection
+        .map(|(_, recipe)| {
+            lookup(
+                "workload suite",
+                &recipe.workload_suite,
+                &workspace.config.workload_suites,
+            )
+        })
+        .transpose()?;
+    let (case_id, case, case_selection) = match request.case {
+        Some(selected) => (
+            Some(selected),
+            Some(
+                server
+                    .cases
+                    .get(selected)
+                    .ok_or_else(|| InferlabError::InvalidConfig {
+                        message: format!("unknown case {selected:?} for server {server_id:?}"),
+                    })?,
+            ),
+            Some(CaseSelectionSource::Explicit),
+        ),
+        None => {
+            if let Some(selected) = server.default_case.as_deref() {
+                (
+                    Some(selected),
+                    Some(&server.cases[selected]),
+                    Some(CaseSelectionSource::Default),
+                )
+            } else {
+                match (server.cases.iter().next(), server.cases.iter().nth(1)) {
+                    (None, _) => (None, None, None),
+                    (Some((id, definition)), None) => (
+                        Some(id.as_str()),
+                        Some(definition),
+                        Some(CaseSelectionSource::Sole),
+                    ),
+                    (Some(_), Some(_)) => {
+                        return Err(InferlabError::InvalidConfig {
+                            message: format!(
+                                "server {server_id:?} declares multiple cases {:?}; select one with --case or set default_case",
+                                server.cases.keys().collect::<Vec<_>>()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    };
     let weight = workspace
         .local
         .model_weights
-        .get(&model.weight)
+        .get(&server.model)
         .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("missing model weight binding {:?}", model.weight),
+            message: format!("missing model weight binding {:?}", server.model),
         })?;
-    let placement_id = &workspace.local.default_placement;
+    let (placement_id, placement_selection) = if let Some(selected) = request.placement {
+        (selected, PlacementSelectionSource::Explicit)
+    } else if let Some(selected) = workspace.local.default_placement.as_deref() {
+        (selected, PlacementSelectionSource::Default)
+    } else {
+        match (
+            workspace.local.placements.keys().next(),
+            workspace.local.placements.keys().nth(1),
+        ) {
+            (Some(only), None) => (only.as_str(), PlacementSelectionSource::Sole),
+            (None, _) => {
+                return Err(InferlabError::InvalidConfig {
+                    message: "no local placement is declared".to_owned(),
+                });
+            }
+            (Some(_), Some(_)) => {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "local bindings declare multiple placements {:?}; select one with --placement or set default_placement",
+                        workspace.local.placements.keys().collect::<Vec<_>>()
+                    ),
+                });
+            }
+        }
+    };
     let placement = workspace
         .local
         .placements
         .get(placement_id)
         .ok_or_else(|| InferlabError::InvalidConfig {
-            message: format!("unknown default placement {placement_id:?}"),
+            message: format!("unknown placement {placement_id:?}"),
         })?;
 
-    let mut topology = case.topology.unwrap_or(profile.topology);
-    let mut routing_backend = case
-        .routing_backend
-        .clone()
-        .unwrap_or_else(|| profile.routing_backend.clone());
-    let mut kv_transfer = case.kv_transfer.or(profile.kv_transfer);
-    let mut profiling = case.profiling.unwrap_or(profile.profiling);
+    let topology = server.topology;
+    let mut readiness_timeout_seconds = server.readiness_timeout_seconds;
+    let mut routing_backend = server.routing_backend.clone();
+    let mut kv_transfer = server.kv_transfer;
+    let mut profiling = server.profiling.unwrap_or(false);
+    let capture_control_deadline_seconds = server
+        .capture_control_deadline_seconds
+        .unwrap_or(DEFAULT_CAPTURE_CONTROL_DEADLINE_SECONDS);
+    if let Some(value) = case.and_then(|case| case.readiness_timeout_seconds) {
+        readiness_timeout_seconds = value;
+    }
+    if let Some(value) = case.and_then(|case| case.routing_backend.as_ref()) {
+        routing_backend = Some(value.clone());
+    }
+    if let Some(value) = case.and_then(|case| case.kv_transfer) {
+        kv_transfer = Some(value);
+    }
+    if let Some(value) = case.and_then(|case| case.profiling) {
+        profiling = value;
+    }
 
-    let mut parallelism = Parallelism::default();
-    let mut parallelism_sources = BTreeMap::new();
-    merge_parallelism(
-        &mut parallelism,
-        &mut parallelism_sources,
-        &profile.parallelism,
-        &SettingSource::ServeProfile {
-            id: recipe.serve_profile.clone(),
-        },
-    );
-    merge_parallelism(
-        &mut parallelism,
-        &mut parallelism_sources,
-        &case.parallelism,
-        &SettingSource::Case {
-            id: case.id.clone(),
-        },
-    );
-    let mut settings = BTreeMap::new();
-    let mut setting_sources = BTreeMap::new();
-    merge_toml_settings(
-        &mut settings,
-        &mut setting_sources,
-        &profile.settings,
-        &SettingSource::ServeProfile {
-            id: recipe.serve_profile.clone(),
-        },
-    )?;
-    merge_toml_settings(
-        &mut settings,
-        &mut setting_sources,
-        &case.settings,
-        &SettingSource::Case {
-            id: case.id.clone(),
-        },
-    )?;
     let mut override_patches = Vec::new();
-    for value in request.overrides {
-        let patch = apply_override(
-            &mut parallelism,
-            &mut parallelism_sources,
-            &mut settings,
-            &mut setting_sources,
-            value,
-        )?;
-        if let Some(value) = patch.topology {
-            topology = value;
+    for (index, value) in request.overrides.iter().enumerate() {
+        if !value.starts_with("server.")
+            && matches!(request.workflow, Workflow::RecipeRun)
+            && (value.starts_with("evals.") || value.starts_with("benches."))
+        {
+            continue;
+        }
+        let patch = parse_override(value)?;
+        if patch.topology.is_some() {
+            return Err(InferlabError::InvalidConfig {
+                message: "invocation overrides must not change server topology".to_owned(),
+            });
         }
         if let Some(value) = &patch.routing_backend {
-            routing_backend.clone_from(value);
+            routing_backend = Some(value.clone());
         }
         if let Some(value) = patch.kv_transfer {
             kv_transfer = Some(value);
@@ -1152,62 +1387,59 @@ pub fn resolve<C: AdapterClient>(
         if let Some(value) = patch.profiling {
             profiling = value;
         }
-        override_patches.push(patch);
+        if let Some(value) = patch.readiness_timeout_seconds {
+            if value == 0 {
+                return Err(InferlabError::InvalidConfig {
+                    message: "readiness_timeout_seconds must be nonzero".to_owned(),
+                });
+            }
+            readiness_timeout_seconds = value;
+        }
+        override_patches.push(IndexedServerOverride {
+            index,
+            raw: value.clone(),
+            patch,
+        });
     }
     if !request.captures.is_empty() {
         profiling = true;
     }
 
-    let role_resolutions = resolve_role_inputs(
-        &recipe.serve_profile,
-        profile,
-        case,
-        &override_patches,
-        topology,
-    )?;
+    let role_resolutions = resolve_role_inputs(server, case_id, case, &override_patches, topology)?;
+    let declarations = server_declarations(server_id, server, case_id, case, &override_patches)?;
     let role_inputs = role_resolutions
         .iter()
         .map(|role| role.input.clone())
         .collect::<Vec<_>>();
 
-    let served_name = model
-        .served_name
-        .clone()
-        .unwrap_or_else(|| recipe.model.clone());
+    let served_name = model.served_name.clone();
     let plan_input = PlanServeInput {
         model: ServeModelInput {
-            locator: weight.locator.clone(),
+            id: server.model.clone(),
             served_name: served_name.clone(),
         },
         topology,
         routing_backend: routing_backend.clone(),
         kv_transfer,
-        parallelism: parallelism.clone(),
-        settings: settings.clone(),
         roles: role_inputs.clone(),
         profiling,
     };
     let planning = adapter.plan_serve(
         &workspace.root,
-        &profile.integration,
-        &environment.pixi_environment,
+        &stack.integration,
+        &stack.pixi_environment,
         plan_input,
     )?;
     let planned = planning.output;
-    validate_integration_identity(&profile.integration, &planned.integration.framework)?;
-    validate_effective_parallelism(
-        &profile.integration,
-        "server",
-        &parallelism,
-        &planned.effective_parallelism,
-    )?;
+    validate_integration_identity(&stack.integration, &planned.integration.framework)?;
     validate_serve_graph(
-        &profile.integration,
+        &stack.integration,
         topology,
         &role_inputs,
         kv_transfer,
         &planned,
     )?;
+    routing_backend = resolve_routing_backend(topology, routing_backend, &planned.routing)?;
     for resolution in &role_resolutions {
         let role = planned
             .roles
@@ -1216,79 +1448,92 @@ pub fn resolve<C: AdapterClient>(
             .ok_or_else(|| InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} omitted role {:?}",
-                    profile.integration, resolution.input.id
+                    stack.integration, resolution.input.id
                 ),
             })?;
         validate_effective_parallelism(
-            &profile.integration,
+            &stack.integration,
             &format!("role {:?}", resolution.input.id),
             &resolution.input.parallelism,
             &role.effective_parallelism,
         )?;
     }
-    validate_capture_targets(&profile.integration, profiling, &planned.replicas)?;
-    reconcile_effective_settings(
-        &settings,
-        &planned.effective_settings,
-        &mut setting_sources,
-        &profile.integration,
-    )?;
-    let effective_settings = planned.effective_settings.clone();
+    validate_capture_targets(&stack.integration, profiling, &planned.replicas)?;
     let mut requirements = expand_replica_requirements(
-        &profile.integration,
+        &stack.integration,
         topology,
         &planned.replicas,
-        &planned.public_endpoint,
+        &planned.routing,
         placement,
-        profile,
+        server,
     )?;
     let integration_process_count = requirements.len();
-    let (public_process, builtin_proxy) = match &planned.public_endpoint {
-        PublicEndpointRequirement::Replica { replica_id } => {
+    let (public_process, builtin_proxy) = match &planned.routing {
+        RoutingResult::Direct { role, replica }
+        | RoutingResult::IntegrationNative { role, replica, .. } => {
             let process_id = requirements
                 .iter()
-                .find(|process| process.replica_id == *replica_id && process.rank == 0)
+                .find(|process| {
+                    process.role_id == *role
+                        && process.replica_index == *replica
+                        && process.rank == 0
+                })
                 .map(|process| process.id.clone())
                 .ok_or_else(|| InferlabError::InvalidConfig {
                     message: format!(
-                        "integration {:?} selected unknown public replica {replica_id:?}",
-                        profile.integration
+                        "integration {:?} selected unknown public role {role:?} replica {replica}",
+                        stack.integration
                     ),
                 })?;
             (process_id, None)
         }
-        PublicEndpointRequirement::BuiltinProxy {
-            process_id,
-            role_id,
-            readiness,
-            ..
+        RoutingResult::InferlabBuiltin {
+            ports, readiness, ..
         } => {
+            let fixed_router = if !uses_explicit_replica_placement(placement) {
+                None
+            } else {
+                let rank = placement
+                    .roles
+                    .get("router")
+                    .and_then(|role| role.ranks_for_replica(0))
+                    .and_then(|ranks| ranks.first())
+                    .ok_or_else(|| InferlabError::InvalidConfig {
+                        message: "explicit routed placement must bind router replica 0 rank 0"
+                            .to_owned(),
+                    })?;
+                Some(FixedDeviceAssignment {
+                    machine: rank.machine.clone(),
+                    devices: Vec::new(),
+                    endpoint_port: rank.endpoint_port,
+                })
+            };
             requirements.push(ProcessRequirement {
-                id: process_id.clone(),
-                role_id: role_id.clone(),
-                replica_id: role_id.clone(),
+                id: "router".to_owned(),
+                role_id: "router".to_owned(),
+                replica_id: "router".to_owned(),
                 replica_index: 0,
                 rank: 0,
-                accelerator_count: 0,
-                ports: Vec::new(),
+                device_count: 0,
+                ports: ports.clone(),
                 readiness: readiness.clone(),
                 launch_dependencies: requirements
                     .iter()
                     .map(|process| process.id.clone())
                     .collect(),
                 capture_target: None,
-                fixed_gpus: None,
+                fixed_devices: fixed_router,
             });
-            (process_id.clone(), Some(&planned.public_endpoint))
+            ("router".to_owned(), Some(&planned.routing))
         }
     };
-    validate_launch_dependencies(&profile.integration, &requirements)?;
+    validate_launch_dependencies(&stack.integration, &requirements)?;
     let allocations = allocate_processes(
         workspace,
         placement_id,
         placement,
         weight,
-        &environment.pixi_environment,
+        &stack.pixi_environment,
         request
             .image
             .map(|image| image.image_id.as_str())
@@ -1296,26 +1541,22 @@ pub fn resolve<C: AdapterClient>(
         &requirements,
         builtin_proxy.map(|_| public_process.as_str()),
     )?;
-    let render_inputs = load_render_inputs(
-        &workspace.root,
-        &profile.integration,
-        &planned.render_inputs,
-    )?;
+    let render_inputs =
+        load_render_inputs(&workspace.root, &stack.integration, &planned.render_inputs)?;
     let rendering = adapter.render_serve(
         &workspace.root,
-        &profile.integration,
-        &environment.pixi_environment,
+        &stack.integration,
+        &stack.pixi_environment,
         RenderServeInput {
             model: ServeModelInput {
-                locator: weight.locator.clone(),
+                id: server.model.clone(),
                 served_name: served_name.clone(),
             },
             topology,
             routing_backend: routing_backend.clone(),
             kv_transfer,
-            parallelism: planned.effective_parallelism.clone(),
-            settings: effective_settings.clone(),
             roles: planned.roles.clone(),
+            routing: planned.routing.clone(),
             links: planned.links.clone(),
             allocations: allocations[..integration_process_count]
                 .iter()
@@ -1330,7 +1571,7 @@ pub fn resolve<C: AdapterClient>(
         return Err(InferlabError::InvalidConfig {
             message: format!(
                 "integration {:?} changed identity between serve planning and rendering",
-                profile.integration
+                stack.integration
             ),
         });
     }
@@ -1338,7 +1579,7 @@ pub fn resolve<C: AdapterClient>(
         return Err(InferlabError::InvalidConfig {
             message: format!(
                 "integration {:?} rendered {} processes for {} planned processes",
-                profile.integration,
+                stack.integration,
                 rendered.processes.len(),
                 integration_process_count
             ),
@@ -1362,48 +1603,63 @@ pub fn resolve<C: AdapterClient>(
 
     let mut processes = Vec::with_capacity(requirements.len());
     let mut public_endpoint = None;
-    let mut accelerator_count = 0_u32;
+    let mut device_count = 0_u32;
     for ((requirement, allocation), rendered_process) in requirements
         .iter()
         .zip(&allocations)
         .zip(&rendered_processes)
     {
-        if rendered_process.id != requirement.id || allocation.wire.process_id != requirement.id {
+        let expected_rank_count = u32::try_from(
+            requirements
+                .iter()
+                .filter(|candidate| candidate.replica_id == requirement.replica_id)
+                .count(),
+        )
+        .map_err(|_| InferlabError::InvalidConfig {
+            message: format!("replica {:?} has too many ranks", requirement.replica_id),
+        })?;
+        if rendered_process.process != requirement.id
+            || rendered_process.role != requirement.role_id
+            || rendered_process.replica != requirement.replica_index
+            || rendered_process.rank != requirement.rank
+            || rendered_process.rank_count != expected_rank_count
+            || allocation.wire.process != requirement.id
+        {
             return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} rendered process {:?} where {:?} was planned",
-                    profile.integration, rendered_process.id, requirement.id
+                    stack.integration, rendered_process.process, requirement.id
                 ),
             });
         }
-        if rendered_process.process.argv.is_empty() {
+        if rendered_process.command.argv.is_empty() {
             return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} rendered an empty argv for process {:?}",
-                    profile.integration, requirement.id
+                    stack.integration, requirement.id
                 ),
             });
         }
         if rendered_process
-            .process
+            .command
             .env
             .contains_key("CUDA_VISIBLE_DEVICES")
         {
             return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} attempted to select devices for process {:?}",
-                    profile.integration, requirement.id
+                    stack.integration, requirement.id
                 ),
             });
         }
         let launch_files = validate_launch_file_declarations(
-            &profile.integration,
+            &stack.integration,
             &requirement.id,
             &allocation.runtime_cache.path,
-            &rendered_process.process,
+            &rendered_process.command,
             &rendered_process.launch_files,
         )?;
-        let machine_id = &allocation.wire.machine_id;
+        let machine_id = &allocation.wire.machine;
         let machine = workspace.local.machines.get(machine_id).ok_or_else(|| {
             InferlabError::InvalidConfig {
                 message: format!("unknown machine {machine_id:?}"),
@@ -1429,8 +1685,8 @@ pub fn resolve<C: AdapterClient>(
         // Everything past this point is resolver- or integration-set: the
         // explicit list preserves that provenance next to the composed map
         // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
-        let mut explicit_env: Vec<String> = rendered_process.process.env.keys().cloned().collect();
-        env.extend(rendered_process.process.env.clone());
+        let mut explicit_env: Vec<String> = rendered_process.command.env.keys().cloned().collect();
+        env.extend(rendered_process.command.env.clone());
         env.insert(
             "CUDA_VISIBLE_DEVICES".to_owned(),
             allocation
@@ -1446,9 +1702,17 @@ pub fn resolve<C: AdapterClient>(
         explicit_env.push("PWD".to_owned());
         explicit_env.sort();
         explicit_env.dedup();
+        let allocation_endpoint =
+            allocation
+                .wire
+                .endpoint
+                .as_ref()
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!("allocation {:?} has no endpoint", allocation.wire.process),
+                })?;
         let endpoint = EndpointPlan {
-            host: allocation.wire.endpoint.host.clone(),
-            port: allocation.wire.endpoint.port,
+            host: allocation_endpoint.host.clone(),
+            port: allocation_endpoint.port,
             protocol: planned.endpoint.protocol,
             api_path: planned.endpoint.api_path.clone(),
             prefix_cache_reset: (requirement.id == public_process)
@@ -1458,32 +1722,29 @@ pub fn resolve<C: AdapterClient>(
         if requirement.id == public_process {
             public_endpoint = Some(endpoint.clone());
         }
-        accelerator_count += requirement.accelerator_count;
+        device_count += requirement.device_count;
         processes.push(ProcessPlan {
             id: requirement.id.clone(),
-            role_id: requirement.role_id.clone(),
-            replica_id: requirement.replica_id.clone(),
-            replica_index: requirement.replica_index,
             rank: requirement.rank,
+            rank_count: expected_rank_count,
             machine: machine_id.clone(),
             launch: launch_plan(&machine.launch),
             launch_dependencies: requirement.launch_dependencies.clone(),
             allocation: AllocationPlan {
-                machine_binding: machine_id.clone(),
-                accelerator_count: requirement.accelerator_count,
                 devices: allocation.wire.devices.clone(),
                 model_locator: allocation.wire.model_locator.clone(),
+                model_locator_source: allocation.model_locator_source,
                 ports: allocation.wire.ports.clone(),
                 runtime_cache: allocation.runtime_cache.clone(),
                 communication_interface: None,
             },
             command: CommandPlan {
                 argv: if builtin_proxy.is_some() && requirement.id == public_process {
-                    rendered_process.process.argv.clone()
+                    rendered_process.command.argv.clone()
                 } else {
                     pixi_command(
-                        &environment.pixi_environment,
-                        rendered_process.process.argv.clone(),
+                        &stack.pixi_environment,
+                        rendered_process.command.argv.clone(),
                     )
                 },
                 env,
@@ -1494,20 +1755,20 @@ pub fn resolve<C: AdapterClient>(
             launch_files,
             readiness: readiness_plan(
                 &requirement.readiness,
-                profile.readiness_timeout_seconds,
-                &recipe.serve_profile,
+                readiness_timeout_seconds,
                 profiling,
                 &planned.roles,
                 &allocations,
             )?,
             endpoint,
+            container: None,
             capture_target: requirement.capture_target.clone(),
         });
     }
     let public_endpoint = public_endpoint.ok_or_else(|| InferlabError::InvalidConfig {
         message: format!(
             "integration {:?} did not plan a public endpoint",
-            profile.integration
+            stack.integration
         ),
     })?;
     // The image placement gate fires before network resolution and remote
@@ -1554,7 +1815,7 @@ pub fn resolve<C: AdapterClient>(
             crate::server::preflight_targets(
                 &mut processes,
                 &workspace.snapshot,
-                &environment.pixi_environment,
+                &stack.pixi_environment,
             )?,
             BTreeMap::new(),
         )
@@ -1564,9 +1825,12 @@ pub fn resolve<C: AdapterClient>(
     let measurements = match request.workflow {
         Workflow::ServeStart => None,
         Workflow::RecipeRun => Some(resolve_measurements(
-            suite,
+            suite.ok_or_else(|| InferlabError::InvalidConfig {
+                message: "recipe workflow has no workload suite".to_owned(),
+            })?,
             &workspace.config.evals,
             &workspace.config.benches,
+            request.overrides,
             &MeasurementResolveContext {
                 endpoint: ClientEndpointInput {
                     protocol: public_endpoint.protocol,
@@ -1574,8 +1838,24 @@ pub fn resolve<C: AdapterClient>(
                     port: public_endpoint.port,
                     api_path: public_endpoint.api_path.clone(),
                 },
-                model: ServeModelInput {
-                    locator: weight.locator.clone(),
+                model: MeasurementModelInput {
+                    locator: weight
+                        .locator
+                        .clone()
+                        .or_else(|| {
+                            allocations
+                                .iter()
+                                .find(|allocation| {
+                                    allocation.wire.role != "router"
+                                        && allocation.wire.rank == 0
+                                })
+                                .and_then(|allocation| allocation.wire.model_locator.clone())
+                        })
+                        .ok_or_else(|| InferlabError::InvalidConfig {
+                            message: format!(
+                                "recipe target server {server_id:?} has no model locator usable by its measurements"
+                            ),
+                        })?,
                     served_name: served_name.clone(),
                 },
                 prefix_cache_reset: public_endpoint.prefix_cache_reset.clone(),
@@ -1585,6 +1865,16 @@ pub fn resolve<C: AdapterClient>(
             },
         )?),
     };
+    let process_count = processes.len();
+    let mut processes_by_id = processes
+        .into_iter()
+        .map(|process| (process.id.clone(), process))
+        .collect::<BTreeMap<_, _>>();
+    if processes_by_id.len() != process_count {
+        return Err(InferlabError::InvalidConfig {
+            message: "resolved topology contains duplicate process identities".to_owned(),
+        });
+    }
     let mut role_plans = planned
         .roles
         .iter()
@@ -1592,190 +1882,226 @@ pub fn resolve<C: AdapterClient>(
             let resolution = role_resolutions
                 .iter()
                 .find(|resolution| resolution.input.id == role.id);
-            let mut setting_sources = resolution
-                .map(|resolution| resolution.setting_sources.clone())
-                .unwrap_or_default();
             if let Some(resolution) = resolution {
-                reconcile_effective_settings(
+                validate_effective_settings(
                     &resolution.input.settings,
                     &role.effective_settings,
-                    &mut setting_sources,
-                    &profile.integration,
+                    &stack.integration,
                 )?;
             }
-            let replicas = requirements
+            let replicas = planned
+                .replicas
                 .iter()
-                .filter(|process| process.role_id == role.id)
-                .fold(
-                    BTreeMap::<(u32, String), Vec<String>>::new(),
-                    |mut replicas, process| {
-                        replicas
-                            .entry((process.replica_index, process.replica_id.clone()))
-                            .or_default()
-                            .push(process.id.clone());
-                        replicas
-                    },
-                )
-                .into_iter()
-                .map(|((index, id), processes)| RoleReplicaPlan {
-                    id,
-                    index,
-                    processes,
+                .filter(|replica| replica.role_id == role.id)
+                .map(|replica| {
+                    let mut ranks = requirements
+                        .iter()
+                        .filter(|process| {
+                            process.role_id == role.id
+                                && process.replica_index == replica.replica_index
+                        })
+                        .collect::<Vec<_>>();
+                    ranks.sort_by_key(|process| process.rank);
+                    let entry_process = ranks
+                        .first()
+                        .map(|process| process.id.clone())
+                        .ok_or_else(|| InferlabError::InvalidConfig {
+                            message: format!("resolved replica {:?} contains no ranks", replica.id),
+                        })?;
+                    let ranks = ranks
+                        .into_iter()
+                        .map(|requirement| {
+                            processes_by_id.remove(&requirement.id).ok_or_else(|| {
+                                InferlabError::InvalidConfig {
+                                    message: format!(
+                                        "resolved replica {:?} references missing process {:?}",
+                                        replica.id, requirement.id
+                                    ),
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(RoleReplicaPlan {
+                        id: replica.id.clone(),
+                        index: replica.replica_index,
+                        device_count: replica.device_count,
+                        ports: replica.ports.clone(),
+                        primary_ports: replica.primary_ports.clone(),
+                        primary_readiness: replica.primary_readiness.clone(),
+                        worker_readiness: replica.worker_readiness.clone(),
+                        capture_target: replica.capture_target.clone(),
+                        entry_process,
+                        ranks,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, InferlabError>>()?;
             Ok(RolePlan {
                 id: role.id.clone(),
                 kind: role.kind,
-                declared_replica_count: resolution.map_or(role.replica_count, |resolution| {
-                    resolution.input.replica_count
-                }),
-                effective_replica_count: role.replica_count,
+                declared_replica_count: role.declared_replica_count,
+                effective_replica_count: role.effective_replica_count,
+                declared_parallelism: resolution
+                    .map(|resolution| resolution.input.parallelism.clone())
+                    .unwrap_or_default(),
                 effective_parallelism: role.effective_parallelism.clone(),
-                parallelism_sources: resolution
-                    .map(|resolution| resolution.parallelism_sources.clone())
+                declared_settings: resolution
+                    .map(|resolution| resolution.input.settings.clone())
                     .unwrap_or_default(),
                 effective_settings: role.effective_settings.clone(),
-                setting_sources,
                 replicas,
             })
         })
         .collect::<Result<Vec<_>, InferlabError>>()?;
-    if let PublicEndpointRequirement::BuiltinProxy { role_id, .. } = &planned.public_endpoint {
+    if matches!(planned.routing, RoutingResult::InferlabBuiltin { .. }) {
         role_plans.push(RolePlan {
-            id: role_id.clone(),
+            id: "router".to_owned(),
             kind: ServeRoleKind::Router,
             declared_replica_count: 1,
             effective_replica_count: 1,
+            declared_parallelism: Parallelism::default(),
             effective_parallelism: Parallelism::default(),
-            parallelism_sources: BTreeMap::new(),
+            declared_settings: BTreeMap::new(),
             effective_settings: BTreeMap::new(),
-            setting_sources: BTreeMap::new(),
             replicas: vec![RoleReplicaPlan {
-                id: role_id.clone(),
+                id: "router".to_owned(),
                 index: 0,
-                processes: vec![public_process.clone()],
+                device_count: 0,
+                ports: requirements
+                    .iter()
+                    .find(|process| process.id == public_process)
+                    .map_or_else(Vec::new, |process| process.ports.clone()),
+                primary_ports: Vec::new(),
+                primary_readiness: requirements
+                    .iter()
+                    .find(|process| process.id == public_process)
+                    .map_or(ReadinessProbe::ProcessAlive, |process| {
+                        process.readiness.clone()
+                    }),
+                worker_readiness: ReadinessProbe::ProcessAlive,
+                capture_target: None,
+                entry_process: public_process.clone(),
+                ranks: vec![processes_by_id.remove(&public_process).ok_or_else(|| {
+                    InferlabError::InvalidConfig {
+                        message: format!(
+                            "resolved router references missing process {public_process:?}"
+                        ),
+                    }
+                })?],
             }],
+        });
+    }
+    if !processes_by_id.is_empty() {
+        return Err(InferlabError::InvalidConfig {
+            message: "resolved topology contains a process outside its role hierarchy".to_owned(),
         });
     }
     let selected_machines = allocations
         .iter()
-        .map(|allocation| allocation.wire.machine_id.clone())
+        .map(|allocation| allocation.wire.machine.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let (routing_implementation, routing_policy) = match &planned.public_endpoint {
-        PublicEndpointRequirement::BuiltinProxy { .. } => {
-            let meta = builtin_proxy_kind(&planned.integration.framework, kv_transfer)?.meta();
+    let (routing_implementation, routing_policy) = match &planned.routing {
+        RoutingResult::InferlabBuiltin {
+            implementation,
+            policy,
+            ..
+        } => {
+            let kind = match implementation {
+                BuiltinRouterKind::VllmMooncake => BuiltinProxyKind::VllmMooncake,
+                BuiltinRouterKind::VllmNixl => BuiltinProxyKind::VllmNixl,
+                BuiltinRouterKind::Sglang => BuiltinProxyKind::Sglang,
+                BuiltinRouterKind::Trtllm => BuiltinProxyKind::Trtllm,
+            };
+            let meta = kind.meta();
             (
                 RoutingImplementationPlan::Inferlab {
                     id: meta.id.to_owned(),
                     version: meta.version,
                 },
-                "round-robin".to_owned(),
+                policy.clone(),
             )
         }
-        PublicEndpointRequirement::Replica { replica_id } => {
-            let replica = planned
-                .replicas
-                .iter()
-                .find(|replica| replica.id == *replica_id)
-                .ok_or_else(|| InferlabError::InvalidConfig {
-                    message: format!(
-                        "integration {:?} selected unknown public replica {replica_id:?}",
-                        profile.integration
-                    ),
-                })?;
-            if planned
-                .roles
-                .iter()
-                .any(|role| role.id == replica.role_id && role.kind == ServeRoleKind::Router)
-            {
-                (
-                    RoutingImplementationPlan::Integration {
-                        id: routing_backend.clone(),
-                        adapter_version: planned.integration.adapter_version.clone(),
-                    },
-                    "round-robin".to_owned(),
-                )
-            } else {
-                (RoutingImplementationPlan::Direct, "direct".to_owned())
-            }
-        }
+        RoutingResult::IntegrationNative { policy, .. } => (
+            RoutingImplementationPlan::Integration {
+                id: routing_backend
+                    .clone()
+                    .ok_or_else(|| InferlabError::InvalidConfig {
+                        message: "native routing requires a selected routing backend".to_owned(),
+                    })?,
+                adapter_version: planned.integration.adapter_version.clone(),
+            },
+            policy.clone(),
+        ),
+        RoutingResult::Direct { .. } => (RoutingImplementationPlan::Direct, "direct".to_owned()),
     };
     let mut execution = ResolvedExecution {
         workflow: request.workflow,
         workspace: workspace.snapshot.clone(),
-        recipe: RecipePlan {
-            id: request.recipe.to_owned(),
-            case: CasePlan {
-                id: case.id.clone(),
-                index: case_index,
-                default: case_index == 0,
+        recipe: recipe_selection.map(|(id, recipe)| RecipePlan {
+            id: id.to_owned(),
+            workload_suite: recipe.workload_suite.clone(),
+        }),
+        stack: StackPlan {
+            id: server.stack.clone(),
+            integration: stack.integration.clone(),
+            pixi_environment: stack.pixi_environment.clone(),
+            source_paths: stack.source_paths.clone(),
+            realization: if request.image.is_some() {
+                crate::environment::CheckRealization::Image
+            } else if request.external.is_some() {
+                crate::environment::CheckRealization::ExternalImage
+            } else {
+                crate::environment::CheckRealization::LocalWorkspace
             },
-            references: RecipeReferences {
-                model: recipe.model.clone(),
-                serve_profile: recipe.serve_profile.clone(),
-                source_set: recipe.source_set.clone(),
-                environment: recipe.environment.clone(),
-                workload_suite: recipe.workload_suite.clone(),
-            },
-        },
-        source: SourcePlan {
-            id: recipe.source_set.clone(),
-            paths: source_set.paths.clone(),
+            checks: stack_checks,
         },
         server: ServerPlan {
-            explicit_overrides: request.overrides.to_vec(),
+            id: server_id.to_owned(),
+            case: case_id.zip(case_selection).map(|(id, selection)| CasePlan {
+                id: id.to_owned(),
+                selection,
+            }),
+            explicit_overrides: override_patches
+                .iter()
+                .map(|item| item.raw.clone())
+                .collect(),
+            declarations,
             topology,
+            profiling,
+            readiness_timeout_seconds,
+            capture_control_deadline_seconds,
             routing: RoutingPlan {
                 backend: routing_backend,
+                kv_transfer,
                 public_process,
                 policy: routing_policy,
                 implementation: routing_implementation,
             },
-            parallelism: ParallelismPlan {
-                declared: parallelism,
-                effective: planned.effective_parallelism,
-                declared_sources: parallelism_sources,
-            },
-            settings: effective_settings,
-            setting_sources,
-            profiler_escapes: profiler_escapes_plan(profile),
+            profiler_escapes: profiler_escapes_plan(server),
             model: ModelPlan {
-                id: recipe.model.clone(),
+                id: server.model.clone(),
                 served_name,
-                weight_binding: model.weight.clone(),
-                locator: weight.locator.clone(),
-            },
-            environment: EnvironmentPlan {
-                id: recipe.environment.clone(),
-                pixi_environment: environment.pixi_environment.clone(),
-                realization: if request.image.is_some() {
-                    crate::environment::CheckRealization::Image
-                } else if request.external.is_some() {
-                    crate::environment::CheckRealization::ExternalImage
-                } else {
-                    crate::environment::CheckRealization::LocalWorkspace
-                },
-                checks: environment_checks,
             },
             image: None,
             external_image: None,
             integration: IntegrationPlan {
-                id: profile.integration.clone(),
+                id: stack.integration.clone(),
                 adapter_id: planned.integration.adapter_id,
                 adapter_version: planned.integration.adapter_version,
                 framework: planned.integration.framework,
-                executable: executable_name(&profile.integration),
-                protocol_version: ProtocolVersion::V4,
+                framework_version: planned.integration.framework_version,
+                executable: executable_name(&stack.integration),
+                protocol_version: ProtocolVersion::V5,
                 plan_request_sha256: planning.request_sha256,
                 plan_response_sha256: planning.response_sha256,
                 render_request_sha256: rendering.request_sha256,
                 render_response_sha256: rendering.response_sha256,
             },
-            resources: ResourcePlan { accelerator_count },
+            resources: ResourcePlan { device_count },
             placement: PlacementPlan {
-                id: placement_id.clone(),
+                id: placement_id.to_owned(),
+                selection: placement_selection,
                 machines: selected_machines,
                 remote_workspaces,
                 remote_containers,
@@ -1783,7 +2109,6 @@ pub fn resolve<C: AdapterClient>(
             network,
             roles: role_plans,
             links: planned.links,
-            processes,
             endpoint: public_endpoint,
         },
         measurements,
@@ -1811,12 +2136,12 @@ fn validate_capture_targets(
     }
     for replica in replicas {
         if replica.capture_target.is_none() {
-            if replica.accelerator_count == 0 {
+            if replica.device_count == 0 {
                 continue;
             }
             return Err(InferlabError::InvalidConfig {
                 message: format!(
-                    "integration {integration:?} did not prepare accelerator replica {:?} as a profiling target",
+                    "integration {integration:?} did not prepare model-serving replica {:?} as a profiling target",
                     replica.id
                 ),
             });
@@ -1825,30 +2150,38 @@ fn validate_capture_targets(
     Ok(())
 }
 
-fn profiler_escapes_plan(profile: &ServeProfileDefinition) -> Option<ProfilerEscapesPlan> {
-    let roles = profile
+fn profiler_escapes_plan(server: &ServerDefinition) -> Option<ProfilerEscapesPlan> {
+    let roles = server
         .roles
         .iter()
         .filter(|(_, role)| !role.profiler.nsys.is_empty())
         .map(|(id, role)| (id.clone(), role.profiler.nsys.clone()))
         .collect::<BTreeMap<_, _>>();
-    if profile.profiler.nsys.is_empty() && roles.is_empty() {
+    if server.profiler.nsys.is_empty() && roles.is_empty() {
         return None;
     }
     Some(ProfilerEscapesPlan {
-        profile: profile.profiler.nsys.clone(),
+        common: server.profiler.nsys.clone(),
         roles,
     })
+}
+
+fn uses_explicit_replica_placement(placement: &PlacementBinding) -> bool {
+    placement
+        .roles
+        .values()
+        .any(PlacementRoleBinding::uses_explicit_replicas)
 }
 
 fn expand_replica_requirements(
     integration: &str,
     topology: ServeTopology,
     replicas: &[ServeReplicaRequirement],
-    public_endpoint: &PublicEndpointRequirement,
+    routing: &RoutingResult,
     placement: &PlacementBinding,
-    profile: &ServeProfileDefinition,
+    server: &ServerDefinition,
 ) -> Result<Vec<ProcessRequirement>, InferlabError> {
+    let uses_explicit_replicas = uses_explicit_replica_placement(placement);
     let role_replica_counts = replicas
         .iter()
         .fold(BTreeMap::new(), |mut counts, replica| {
@@ -1858,38 +2191,32 @@ fn expand_replica_requirements(
                 .or_insert(replica.replica_index + 1);
             counts
         });
-    let builtin_proxy_role = match public_endpoint {
-        PublicEndpointRequirement::BuiltinProxy { role_id, .. } => Some(role_id.as_str()),
-        PublicEndpointRequirement::Replica { .. } => None,
-    };
-    for (role_id, role_placement) in &placement.roles {
-        match role_replica_counts.get(role_id.as_str()) {
-            Some(replica_count)
-                if role_placement
-                    .ranks
-                    .iter()
-                    .any(|rank| rank.replica >= *replica_count) =>
-            {
+    for role in placement.roles.keys() {
+        if !(role_replica_counts.contains_key(role.as_str())
+            || role == "router" && matches!(routing, RoutingResult::InferlabBuiltin { .. }))
+        {
+            return Err(InferlabError::InvalidConfig {
+                message: format!(
+                    "placement references role {role:?}, which is not part of the resolved topology"
+                ),
+            });
+        }
+    }
+    if uses_explicit_replicas {
+        for (role, replica_count) in &role_replica_counts {
+            let expected =
+                usize::try_from(*replica_count).map_err(|_| InferlabError::InvalidConfig {
+                    message: format!("role {role:?} has too many replicas"),
+                })?;
+            let actual = placement
+                .roles
+                .get(*role)
+                .and_then(PlacementRoleBinding::replica_count)
+                .unwrap_or(0);
+            if actual != expected {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
-                        "placement rank for role {role_id:?} references an undeclared replica"
-                    ),
-                });
-            }
-            Some(_) => {}
-            None if builtin_proxy_role == Some(role_id.as_str()) => {
-                if !role_placement.ranks.is_empty() {
-                    return Err(InferlabError::InvalidConfig {
-                        message: format!(
-                            "built-in proxy placement role {role_id:?} cannot declare GPU rank groups"
-                        ),
-                    });
-                }
-            }
-            None => {
-                return Err(InferlabError::InvalidConfig {
-                    message: format!(
-                        "placement references role {role_id:?}, which is not part of the resolved topology"
+                        "placement assigns {actual} replicas to role {role:?}, which requires {expected}"
                     ),
                 });
             }
@@ -1898,41 +2225,38 @@ fn expand_replica_requirements(
 
     let mut processes = Vec::new();
     for replica in replicas {
-        let explicit_ranks = placement
-            .roles
-            .get(&replica.role_id)
-            .map(|role| {
-                role.ranks
-                    .iter()
-                    .filter(|rank| rank.replica == replica.replica_index)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let role_has_explicit_ranks = placement
-            .roles
-            .get(&replica.role_id)
-            .is_some_and(|role| !role.ranks.is_empty());
-        if role_has_explicit_ranks && explicit_ranks.is_empty() {
-            return Err(InferlabError::InvalidConfig {
-                message: format!(
-                    "placement does not assign GPU rank groups for replica {:?}",
-                    replica.id
-                ),
-            });
-        }
-        let assigned_accelerators = explicit_ranks
+        let explicit_ranks = if uses_explicit_replicas {
+            let replica_index = usize::try_from(replica.replica_index).map_err(|_| {
+                InferlabError::InvalidConfig {
+                    message: format!("replica {:?} has an invalid index", replica.id),
+                }
+            })?;
+            placement
+                .roles
+                .get(&replica.role_id)
+                .and_then(|role| role.ranks_for_replica(replica_index))
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!(
+                        "placement does not assign ranks for replica {:?}",
+                        replica.id
+                    ),
+                })?
+        } else {
+            &[]
+        };
+        let assigned_devices = explicit_ranks
             .iter()
-            .map(|rank| rank.gpus.len())
+            .map(|rank| rank.devices.len())
             .sum::<usize>();
-        if role_has_explicit_ranks && assigned_accelerators != replica.accelerator_count as usize {
+        if uses_explicit_replicas && assigned_devices != replica.device_count as usize {
             return Err(InferlabError::InvalidConfig {
                 message: format!(
-                    "placement assigns {assigned_accelerators} GPUs to replica {:?}, which requires {}",
-                    replica.id, replica.accelerator_count
+                    "placement assigns {assigned_devices} devices to replica {:?}, which requires {}",
+                    replica.id, replica.device_count
                 ),
             });
         }
-        let rank_count = if role_has_explicit_ranks {
+        let rank_count = if uses_explicit_replicas {
             explicit_ranks.len()
         } else {
             1
@@ -1942,17 +2266,18 @@ fn expand_replica_requirements(
             let rank_index = u32::try_from(rank).map_err(|_| InferlabError::InvalidConfig {
                 message: format!("replica {:?} has too many ranks", replica.id),
             })?;
-            let fixed_gpus = explicit_ranks
+            let fixed_devices = explicit_ranks
                 .get(rank)
-                .map(|assignment| FixedGpuAssignment {
+                .map(|assignment| FixedDeviceAssignment {
                     machine: assignment.machine.clone(),
-                    gpus: assignment.gpus.clone(),
+                    devices: assignment.devices.clone(),
+                    endpoint_port: assignment.endpoint_port,
                 });
-            let accelerator_count = fixed_gpus.as_ref().map_or_else(
-                || Ok(replica.accelerator_count),
+            let device_count = fixed_devices.as_ref().map_or_else(
+                || Ok(replica.device_count),
                 |fixed| {
-                    u32::try_from(fixed.gpus.len()).map_err(|_| InferlabError::InvalidConfig {
-                        message: format!("replica {:?} rank has too many GPUs", replica.id),
+                    u32::try_from(fixed.devices.len()).map_err(|_| InferlabError::InvalidConfig {
+                        message: format!("replica {:?} rank has too many devices", replica.id),
                     })
                 },
             )?;
@@ -1967,10 +2292,9 @@ fn expand_replica_requirements(
                     control_process_id: primary_id.clone(),
                     start_path: target.control.start_path.clone(),
                     stop_path: target.control.stop_path.clone(),
-                    control_deadline_seconds: profile.capture_control_deadline_seconds,
-                    escapes: profile.roles.get(&replica.role_id).map_or_else(
-                        || profile.profiler.nsys.clone(),
-                        |role| profile.profiler.nsys.merged_with(&role.profiler.nsys),
+                    escapes: server.roles.get(&replica.role_id).map_or_else(
+                        || server.profiler.nsys.clone(),
+                        |role| server.profiler.nsys.merged_with(&role.profiler.nsys),
                     ),
                 });
             processes.push(ProcessRequirement {
@@ -1979,7 +2303,7 @@ fn expand_replica_requirements(
                 replica_id: replica.id.clone(),
                 replica_index: replica.replica_index,
                 rank: rank_index,
-                accelerator_count,
+                device_count,
                 ports,
                 readiness: if rank == 0 {
                     replica.primary_readiness.clone()
@@ -1992,25 +2316,32 @@ fn expand_replica_requirements(
                     vec![primary_id.clone()]
                 },
                 capture_target,
-                fixed_gpus,
+                fixed_devices,
             });
         }
     }
     if topology == ServeTopology::PrefillDecode
-        && let PublicEndpointRequirement::Replica { replica_id } = public_endpoint
+        && let RoutingResult::IntegrationNative { role, replica, .. } = routing
     {
         let public_index = processes
             .iter()
-            .position(|process| process.replica_id == *replica_id && process.rank == 0)
+            .position(|process| {
+                process.role_id == *role
+                    && process.replica_index == *replica
+                    && process.rank == 0
+            })
             .ok_or_else(|| InferlabError::InvalidConfig {
                 message: format!(
-                    "integration {integration:?} selected unknown public replica {replica_id:?}"
+                    "integration {integration:?} selected unknown native router {role:?} replica {replica}"
                 ),
             })?;
         let dependencies = processes
             .iter()
             .enumerate()
-            .filter(|(index, process)| *index != public_index && process.replica_id != *replica_id)
+            .filter(|(index, process)| {
+                *index != public_index
+                    && !(process.role_id == *role && process.replica_index == *replica)
+            })
             .map(|(_, process)| process.id.clone())
             .collect();
         processes[public_index].launch_dependencies = dependencies;
@@ -2036,7 +2367,8 @@ fn validate_serve_graph(
     let mut role_kinds = BTreeMap::new();
     for role in &plan.roles {
         if role.id.is_empty()
-            || role.replica_count == 0
+            || role.declared_replica_count == 0
+            || role.effective_replica_count == 0
             || role_kinds.insert(role.id.as_str(), role.kind).is_some()
         {
             return Err(InferlabError::InvalidConfig {
@@ -2049,7 +2381,7 @@ fn validate_serve_graph(
     for requested in requested_roles {
         if role_kinds.get(requested.id.as_str()) != Some(&requested.kind)
             || !plan.roles.iter().any(|role| {
-                role.id == requested.id && role.replica_count == requested.replica_count
+                role.id == requested.id && role.declared_replica_count == requested.replica_count
             })
         {
             return Err(InferlabError::InvalidConfig {
@@ -2075,7 +2407,7 @@ fn validate_serve_graph(
     let role_replica_counts = plan
         .roles
         .iter()
-        .map(|role| (role.id.as_str(), role.replica_count))
+        .map(|role| (role.id.as_str(), role.effective_replica_count))
         .collect::<BTreeMap<_, _>>();
     let mut replica_ids = BTreeSet::new();
     let mut role_replicas = BTreeSet::new();
@@ -2101,7 +2433,7 @@ fn validate_serve_graph(
         }
     }
     for role in &plan.roles {
-        for index in 0..role.replica_count {
+        for index in 0..role.effective_replica_count {
             if !role_replicas.contains(&(role.id.as_str(), index)) {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
@@ -2114,25 +2446,27 @@ fn validate_serve_graph(
         match role.kind {
             ServeRoleKind::Router
                 if role.effective_parallelism != Parallelism::default()
-                    || plan.replicas.iter().any(|replica| {
-                        replica.role_id == role.id && replica.accelerator_count != 0
-                    }) =>
+                    || plan
+                        .replicas
+                        .iter()
+                        .any(|replica| replica.role_id == role.id && replica.device_count != 0) =>
             {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
-                        "integration {integration:?} router role {:?} must have empty parallelism and zero accelerator demand",
+                        "integration {integration:?} router role {:?} must have empty parallelism and zero device count",
                         role.id
                     ),
                 });
             }
             ServeRoleKind::Serve | ServeRoleKind::Prefill | ServeRoleKind::Decode
-                if plan.replicas.iter().any(|replica| {
-                    replica.role_id == role.id && replica.accelerator_count == 0
-                }) =>
+                if plan
+                    .replicas
+                    .iter()
+                    .any(|replica| replica.role_id == role.id && replica.device_count == 0) =>
             {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
-                        "integration {integration:?} accelerator-serving role {:?} must require at least one accelerator per replica",
+                        "integration {integration:?} model-serving role {:?} must require at least one device per replica",
                         role.id
                     ),
                 });
@@ -2140,20 +2474,29 @@ fn validate_serve_graph(
             _ => {}
         }
     }
-    let mut graph_roles = role_kinds.keys().copied().collect::<BTreeSet<_>>();
-    let routing_role = match &plan.public_endpoint {
-        PublicEndpointRequirement::Replica { replica_id } => {
-            let replica = plan
-                .replicas
-                .iter()
-                .find(|replica| replica.id == *replica_id)
-                .ok_or_else(|| InferlabError::InvalidConfig {
+    let mut graph_roles = role_kinds
+        .keys()
+        .map(|role| (*role).to_owned())
+        .collect::<BTreeSet<_>>();
+    let routing_role = match &plan.routing {
+        RoutingResult::Direct { role, replica }
+        | RoutingResult::IntegrationNative { role, replica, .. } => {
+            let Some(replica_count) = role_replica_counts.get(role.as_str()) else {
+                return Err(InferlabError::InvalidConfig {
                     message: format!(
-                        "integration {integration:?} selected unknown public replica {replica_id:?}"
+                        "integration {integration:?} selected unknown public role {role:?}"
                     ),
-                })?;
+                });
+            };
+            if replica >= replica_count {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!(
+                        "integration {integration:?} selected unknown public replica {replica} for role {role:?}"
+                    ),
+                });
+            }
             if topology == ServeTopology::PrefillDecode
-                && role_kinds.get(replica.role_id.as_str()) != Some(&ServeRoleKind::Router)
+                && role_kinds.get(role.as_str()) != Some(&ServeRoleKind::Router)
             {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
@@ -2161,37 +2504,25 @@ fn validate_serve_graph(
                     ),
                 });
             }
-            replica.role_id.clone()
+            role.clone()
         }
-        PublicEndpointRequirement::BuiltinProxy {
-            process_id,
-            role_id,
+        RoutingResult::InferlabBuiltin {
             prefill_role,
             decode_role,
             ..
         } => {
-            if process_id.is_empty()
-                || replica_ids.contains(process_id.as_str())
-                || role_id.is_empty()
-                || role_kinds.contains_key(role_id.as_str())
-            {
-                return Err(InferlabError::InvalidConfig {
-                    message: format!(
-                        "integration {integration:?} returned an invalid built-in proxy process id {process_id:?}"
-                    ),
-                });
-            }
-            if role_kinds.get(prefill_role.as_str()) != Some(&ServeRoleKind::Prefill)
+            if topology != ServeTopology::PrefillDecode
+                || role_kinds.get(prefill_role.as_str()) != Some(&ServeRoleKind::Prefill)
                 || role_kinds.get(decode_role.as_str()) != Some(&ServeRoleKind::Decode)
             {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
-                        "integration {integration:?} built-in proxy does not reference the planned prefill and decode roles"
+                        "integration {integration:?} built-in router does not reference the planned prefill and decode roles"
                     ),
                 });
             }
-            graph_roles.insert(role_id.as_str());
-            role_id.clone()
+            graph_roles.insert("router".to_owned());
+            "router".to_owned()
         }
     };
     if kv_transfer.is_some()
@@ -2211,19 +2542,17 @@ fn validate_serve_graph(
     for link in &plan.links {
         let valid = match link {
             ServeRoleLink::RequestRouting { source, targets } => {
-                graph_roles.contains(source.as_str())
+                graph_roles.contains(source)
                     && !targets.is_empty()
-                    && targets
-                        .iter()
-                        .all(|target| graph_roles.contains(target.as_str()))
+                    && targets.iter().all(|target| graph_roles.contains(target))
             }
             ServeRoleLink::KvTransfer {
                 source,
                 target,
                 mechanism,
             } => {
-                graph_roles.contains(source.as_str())
-                    && graph_roles.contains(target.as_str())
+                graph_roles.contains(source)
+                    && graph_roles.contains(target)
                     && Some(*mechanism) == kv_transfer
             }
             ServeRoleLink::Bootstrap {
@@ -2231,8 +2560,8 @@ fn validate_serve_graph(
                 target,
                 port,
             } => {
-                graph_roles.contains(source.as_str())
-                    && graph_roles.contains(target.as_str())
+                graph_roles.contains(source)
+                    && graph_roles.contains(target)
                     && role_all_have_port(&plan.replicas, target, port)
             }
             ServeRoleLink::SideChannel {
@@ -2240,8 +2569,8 @@ fn validate_serve_graph(
                 target,
                 port,
             } => {
-                graph_roles.contains(source.as_str())
-                    && graph_roles.contains(target.as_str())
+                graph_roles.contains(source)
+                    && graph_roles.contains(target)
                     && role_all_have_port(&plan.replicas, source, port)
                     && role_all_have_port(&plan.replicas, target, port)
             }
@@ -2339,6 +2668,37 @@ fn validate_serve_graph(
     Ok(())
 }
 
+fn resolve_routing_backend(
+    topology: ServeTopology,
+    selected: Option<String>,
+    routing: &RoutingResult,
+) -> Result<Option<String>, InferlabError> {
+    let compatible = match (topology, selected.as_deref(), routing) {
+        (ServeTopology::Single, None, RoutingResult::Direct { .. })
+        | (
+            ServeTopology::PrefillDecode,
+            None | Some("builtin"),
+            RoutingResult::InferlabBuiltin { .. },
+        ) => true,
+        (ServeTopology::PrefillDecode, Some(backend), RoutingResult::IntegrationNative { .. }) => {
+            backend != "builtin"
+        }
+        _ => false,
+    };
+    if !compatible {
+        return Err(InferlabError::InvalidConfig {
+            message: format!(
+                "integration routing ownership does not match topology {topology:?} and selected backend {selected:?}"
+            ),
+        });
+    }
+    if topology == ServeTopology::PrefillDecode && selected.is_none() {
+        Ok(Some("builtin".to_owned()))
+    } else {
+        Ok(selected)
+    }
+}
+
 fn role_all_have_port(replicas: &[ServeReplicaRequirement], role: &str, port: &str) -> bool {
     let mut role_replicas = replicas.iter().filter(|replica| replica.role_id == role);
     let Some(first) = role_replicas.next() else {
@@ -2429,14 +2789,15 @@ fn allocate_processes(
             });
         }
 
-        let mut candidates = if let Some(fixed) = &requirement.fixed_gpus {
+        let mut candidates = if let Some(fixed) = &requirement.fixed_devices {
             vec![fixed.machine.clone()]
-        } else if let Some(role) = placement
+        } else if let Some(role_machines) = placement
             .roles
             .get(&requirement.role_id)
-            .filter(|role| !role.machines.is_empty())
+            .and_then(|role| role.machines())
+            .filter(|machines| !machines.is_empty())
         {
-            role.machines.clone()
+            role_machines.to_vec()
         } else if !placement.machines.is_empty() {
             placement.machines.clone()
         } else {
@@ -2469,7 +2830,7 @@ fn allocate_processes(
                 machine_capacity(
                     machine,
                     used,
-                    requirement.accelerator_count as usize,
+                    requirement.device_count as usize,
                     requirement.ports.len() + 1,
                 )
             })
@@ -2484,10 +2845,10 @@ fn allocate_processes(
                     }
                 })?;
                 let available = free_device_count(machine, usage.get(candidate));
-                if available < requirement.accelerator_count as usize {
+                if available < requirement.device_count as usize {
                     return Err(InferlabError::InsufficientDevices {
                         machine: candidate.clone(),
-                        required: requirement.accelerator_count,
+                        required: requirement.device_count,
                         available,
                     });
                 }
@@ -2501,8 +2862,8 @@ fn allocate_processes(
             None => {
                 return Err(InferlabError::InvalidConfig {
                     message: format!(
-                        "placement {placement_id:?} has no machine with {} free accelerators and {} free ports for process {:?} in role {:?}",
-                        requirement.accelerator_count,
+                        "placement {placement_id:?} has no machine with {} free devices and {} free ports for process {:?} in role {:?}",
+                        requirement.device_count,
                         requirement.ports.len() + 1,
                         requirement.id,
                         requirement.role_id
@@ -2516,41 +2877,79 @@ fn allocate_processes(
             }
         })?;
         let used = usage.entry(machine_id.clone()).or_default();
-        let devices = if let Some(fixed) = &requirement.fixed_gpus {
-            if fixed
-                .gpus
+        let devices =
+            if let Some(fixed) = &requirement.fixed_devices {
+                if fixed.devices.iter().any(|device| {
+                    !machine.devices.contains(device) || used.devices.contains(device)
+                }) {
+                    return Err(InferlabError::InvalidConfig {
+                        message: format!(
+                            "placement assigns unavailable or overlapping devices to process {:?}",
+                            requirement.id
+                        ),
+                    });
+                }
+                fixed.devices.clone()
+            } else {
+                machine
+                    .devices
+                    .iter()
+                    .filter(|device| !used.devices.contains(device))
+                    .take(requirement.device_count as usize)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+        used.devices.extend(&devices);
+        let endpoint_port = requirement
+            .fixed_devices
+            .as_ref()
+            .and_then(|fixed| fixed.endpoint_port);
+        let endpoint_port = match endpoint_port {
+            Some(port) => {
+                if !machine.ports.contains(&port) || used.ports.contains(&port) {
+                    return Err(InferlabError::InvalidConfig {
+                        message: format!(
+                            "placement assigns unavailable endpoint port {port} to process {:?}",
+                            requirement.id
+                        ),
+                    });
+                }
+                used.ports.insert(port);
+                port
+            }
+            None => machine
+                .ports
                 .iter()
-                .any(|gpu| !machine.devices.contains(gpu) || used.devices.contains(gpu))
-            {
-                return Err(InferlabError::InvalidConfig {
+                .find(|port| !used.ports.contains(port))
+                .copied()
+                .ok_or_else(|| InferlabError::InvalidConfig {
                     message: format!(
-                        "placement assigns unavailable or overlapping GPUs to process {:?}",
+                        "machine {machine_id:?} has no free endpoint port for process {:?}",
                         requirement.id
                     ),
-                });
-            }
-            fixed.gpus.clone()
-        } else {
-            machine
-                .devices
-                .iter()
-                .filter(|device| !used.devices.contains(device))
-                .take(requirement.accelerator_count as usize)
-                .copied()
-                .collect::<Vec<_>>()
+                })?,
         };
-        used.devices.extend(&devices);
-        let selected_ports = std::iter::once(machine.port)
-            .chain(machine.extra_ports.iter().copied())
+        used.ports.insert(endpoint_port);
+        let selected_ports = machine
+            .ports
+            .iter()
             .filter(|port| !used.ports.contains(port))
-            .take(requirement.ports.len() + 1)
+            .take(requirement.ports.len())
+            .copied()
             .collect::<Vec<_>>();
+        if selected_ports.len() != requirement.ports.len() {
+            return Err(InferlabError::InvalidConfig {
+                message: format!(
+                    "machine {machine_id:?} has insufficient free named ports for process {:?}",
+                    requirement.id
+                ),
+            });
+        }
         used.ports.extend(&selected_ports);
-        let endpoint_port = selected_ports[0];
         let named_ports = requirement
             .ports
             .iter()
-            .zip(&selected_ports[1..])
+            .zip(&selected_ports)
             .map(|(name, port)| {
                 (
                     name.clone(),
@@ -2579,28 +2978,55 @@ fn allocate_processes(
                 ),
             })?
             .to_owned();
+        let (model_locator, model_locator_source) = if requirement.device_count == 0 {
+            (None, None)
+        } else if let Some(locator) = weight.machine_locators.get(&machine_id) {
+            (Some(locator.clone()), Some(ModelLocatorSource::Machine))
+        } else if let Some(locator) = &weight.locator {
+            (Some(locator.clone()), Some(ModelLocatorSource::Fallback))
+        } else {
+            return Err(InferlabError::InvalidConfig {
+                message: format!(
+                    "model weights have no locator for model-serving process {:?} on machine {machine_id:?}",
+                    requirement.id
+                ),
+            });
+        };
+        let rank_count = u32::try_from(
+            requirements
+                .iter()
+                .filter(|candidate| candidate.replica_id == requirement.replica_id)
+                .count(),
+        )
+        .map_err(|_| InferlabError::InvalidConfig {
+            message: format!("replica {:?} has too many ranks", requirement.replica_id),
+        })?;
         allocations.push(ResolvedProcessAllocation {
             wire: ServeProcessAllocation {
-                process_id: requirement.id.clone(),
-                role_id: requirement.role_id.clone(),
-                replica_id: requirement.replica_id.clone(),
-                replica_index: requirement.replica_index,
+                process: requirement.id.clone(),
+                role: requirement.role_id.clone(),
+                replica: requirement.replica_index,
                 rank: requirement.rank,
-                machine_id: machine_id.clone(),
-                model_locator: weight
-                    .machine_locators
-                    .get(&machine_id)
-                    .unwrap_or(&weight.locator)
-                    .clone(),
-                runtime_cache_root,
+                rank_count,
+                machine: machine_id.clone(),
                 devices,
-                endpoint: EndpointAssignment {
+                model_locator,
+                endpoint: Some(EndpointAssignment {
                     host: machine.host.clone(),
                     port: endpoint_port,
-                },
+                }),
                 ports: named_ports,
+                cache: runtime_cache_root,
+                launch: match &machine.launch {
+                    LaunchBinding::Local => AllocationLaunch::Local,
+                    LaunchBinding::Ssh { target } => AllocationLaunch::Ssh {
+                        target: target.clone(),
+                    },
+                },
+                dependencies: requirement.launch_dependencies.clone(),
             },
             runtime_cache,
+            model_locator_source,
         });
     }
     Ok(allocations)
@@ -2610,12 +3036,8 @@ fn placement_machine_pool(placement: &PlacementBinding) -> Vec<String> {
     placement
         .roles
         .values()
-        .flat_map(|role| {
-            role.machines
-                .iter()
-                .cloned()
-                .chain(role.ranks.iter().map(|rank| rank.machine.clone()))
-        })
+        .filter_map(|role| role.machines())
+        .flat_map(|machines| machines.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -2630,13 +3052,13 @@ struct MachineAllocationUsage {
 fn machine_capacity(
     machine: &crate::workspace::MachineBinding,
     usage: Option<&MachineAllocationUsage>,
-    accelerators: usize,
+    devices: usize,
     ports: usize,
 ) -> bool {
     let free_devices = free_device_count(machine, usage);
-    let available_ports = 1 + machine.extra_ports.len();
+    let available_ports = machine.ports.len();
     let used_ports = usage.map_or(0, |usage| usage.ports.len());
-    free_devices >= accelerators && available_ports - used_ports >= ports
+    free_devices >= devices && available_ports - used_ports >= ports
 }
 
 fn free_device_count(
@@ -2735,14 +3157,10 @@ fn pixi_command(environment: &str, process: Vec<String>) -> Vec<String> {
 fn readiness_plan(
     probe: &ReadinessProbe,
     timeout: u64,
-    profile: &str,
     capture_armed: bool,
     roles: &[ServeRoleResult],
     allocations: &[ResolvedProcessAllocation],
 ) -> Result<ReadinessPlan, InferlabError> {
-    let timeout_source = SettingSource::ServeProfile {
-        id: profile.to_owned(),
-    };
     match probe {
         ReadinessProbe::Http { path } => Ok(ReadinessPlan::Http {
             path: path.clone(),
@@ -2751,7 +3169,6 @@ fn readiness_plan(
             // startup unpredictably, and the wait still terminates on process
             // death or interruption.
             timeout_seconds: (!capture_armed).then_some(timeout),
-            timeout_source,
         }),
         ReadinessProbe::HttpTargetRegistry(registry) => {
             let expected_targets = allocations
@@ -2760,7 +3177,7 @@ fn readiness_plan(
                 .filter_map(|allocation| {
                     roles
                         .iter()
-                        .find(|role| role.id == allocation.wire.role_id)
+                        .find(|role| role.id == allocation.wire.role)
                         .map(|role| (allocation, role.kind))
                 })
                 .filter_map(|(allocation, kind)| match kind {
@@ -2785,16 +3202,21 @@ fn readiness_plan(
                                 .ok_or_else(|| InferlabError::InvalidConfig {
                                     message: format!(
                                         "prefill process {:?} has no registry bootstrap port {port:?}",
-                                        allocation.wire.process_id
+                                        allocation.wire.process
                                     ),
                                 })
                         })
                         .transpose()?;
+                    let endpoint = allocation.wire.endpoint.as_ref().ok_or_else(|| {
+                        InferlabError::InvalidConfig {
+                            message: format!(
+                                "process {:?} has no endpoint for target-aware readiness",
+                                allocation.wire.process
+                            ),
+                        }
+                    })?;
                     Ok(TargetRegistryExpectedTarget {
-                        url: target_endpoint_url(
-                            &allocation.wire.endpoint,
-                            registry.target_scheme,
-                        ),
+                        url: target_endpoint_url(endpoint, registry.target_scheme),
                         role: role.to_owned(),
                         bootstrap_port,
                     })
@@ -2810,7 +3232,6 @@ fn readiness_plan(
                 target_bootstrap_port_field: registry.target_bootstrap_port_field.clone(),
                 expected_targets,
                 timeout_seconds: (!capture_armed).then_some(timeout),
-                timeout_source,
             })
         }
         ReadinessProbe::ProcessAlive => Ok(ReadinessPlan::ProcessAlive),
@@ -2845,36 +3266,16 @@ pub(crate) fn current_environment() -> Result<BTreeMap<String, String>, Inferlab
 
 fn merge_toml_settings(
     settings: &mut BTreeMap<String, SettingValue>,
-    sources: &mut BTreeMap<String, SettingProvenance>,
     patch: &BTreeMap<String, toml::Value>,
-    source: &SettingSource,
 ) -> Result<(), InferlabError> {
     for (key, value) in patch {
         let converted = setting_value(value, key)?;
-        merge_value(
-            settings,
-            sources,
-            std::slice::from_ref(key),
-            converted,
-            source,
-        );
+        merge_value(settings, std::slice::from_ref(key), converted);
     }
     Ok(())
 }
 
-fn merge_parallelism(
-    parallelism: &mut Parallelism,
-    sources: &mut BTreeMap<String, SettingSource>,
-    patch: &Parallelism,
-    source: &SettingSource,
-) {
-    // The provenance keys share their field set with `parallelism_values`,
-    // which prefixes the recorded `declared_sources` key with `parallelism.`.
-    for (field, value) in parallelism_values(patch) {
-        if value.is_some() {
-            sources.insert(format!("parallelism.{field}"), source.clone());
-        }
-    }
+fn merge_parallelism(parallelism: &mut Parallelism, patch: &Parallelism) {
     parallelism.merge_from(patch);
 }
 
@@ -2986,19 +3387,13 @@ fn non_concrete_parallelism(
     })
 }
 
-fn apply_override(
-    parallelism: &mut Parallelism,
-    parallelism_sources: &mut BTreeMap<String, SettingSource>,
-    settings: &mut BTreeMap<String, SettingValue>,
-    sources: &mut BTreeMap<String, SettingProvenance>,
-    value: &str,
-) -> Result<ServerOverridePatch, InferlabError> {
+fn parse_override(value: &str) -> Result<ServerOverridePatch, InferlabError> {
     let (path, raw_value) =
         value
             .split_once('=')
             .ok_or_else(|| InferlabError::InvalidOverride {
                 value: value.to_owned(),
-                message: "expected server.<setting>=<TOML-value>".to_owned(),
+                message: "expected server.<path>=<TOML-value>".to_owned(),
             })?;
     let setting_path =
         path.strip_prefix("server.")
@@ -3006,11 +3401,14 @@ fn apply_override(
                 value: value.to_owned(),
                 message: "only paths under server. may be overridden".to_owned(),
             })?;
-    let segments: Vec<_> = setting_path.split('.').map(str::to_owned).collect();
-    if segments.iter().any(String::is_empty) {
+    if setting_path.is_empty()
+        || setting_path
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
+    {
         return Err(InferlabError::InvalidOverride {
             value: value.to_owned(),
-            message: "setting path contains an empty segment".to_owned(),
+            message: "setting path must be one TOML key path".to_owned(),
         });
     }
     let document: toml::Table =
@@ -3020,44 +3418,56 @@ fn apply_override(
                 message: format!("invalid TOML value: {error}"),
             }
         })?;
-    let parsed = document
-        .get("value")
-        .ok_or_else(|| InferlabError::InvalidOverride {
+    let parsed = match (document.len(), document.get("value")) {
+        (1, Some(parsed)) => parsed.clone(),
+        _ => {
+            return Err(InferlabError::InvalidOverride {
+                value: value.to_owned(),
+                message: "override must contain exactly one TOML value".to_owned(),
+            });
+        }
+    };
+    let path: toml::Table = toml::from_str(&format!("{setting_path} = 0")).map_err(|error| {
+        InferlabError::InvalidOverride {
             value: value.to_owned(),
-            message: "missing override value".to_owned(),
-        })?
-        .clone();
+            message: format!("invalid TOML key path: {error}"),
+        }
+    })?;
+    let mut nested = toml::Value::Table(path);
+    replace_override_leaf(&mut nested, parsed).map_err(|message| {
+        InferlabError::InvalidOverride {
+            value: value.to_owned(),
+            message,
+        }
+    })?;
     let patch: ServerOverridePatch =
-        nested_toml_value(&segments, parsed)
+        nested
             .try_into()
             .map_err(|error| InferlabError::InvalidOverride {
                 value: value.to_owned(),
                 message: format!("invalid server setting: {error}"),
             })?;
 
-    merge_parallelism(
-        parallelism,
-        parallelism_sources,
-        &patch.parallelism,
-        &SettingSource::Invocation,
-    );
-    merge_toml_settings(
-        settings,
-        sources,
-        &patch.settings,
-        &SettingSource::Invocation,
-    )
-    .map_err(|error| InferlabError::InvalidOverride {
-        value: value.to_owned(),
-        message: error.to_string(),
-    })?;
     Ok(patch)
 }
 
-fn nested_toml_value(path: &[String], value: toml::Value) -> toml::Value {
-    path.iter().rev().fold(value, |value, segment| {
-        toml::Value::Table(toml::Table::from_iter([(segment.clone(), value)]))
-    })
+fn replace_override_leaf(node: &mut toml::Value, replacement: toml::Value) -> Result<(), String> {
+    if let toml::Value::Table(table) = node {
+        if table.len() != 1 {
+            return Err("setting path must contain exactly one TOML key path".to_owned());
+        }
+        let (key, child) = table
+            .iter_mut()
+            .next()
+            .ok_or_else(|| "setting path must not be empty".to_owned())?;
+        if key.is_empty() {
+            return Err("setting path contains an empty segment".to_owned());
+        }
+        replace_override_leaf(child, replacement)
+    } else {
+        *node = replacement;
+        Ok(())
+    }
 }
 
 fn setting_value(value: &toml::Value, path: &str) -> Result<SettingValue, InferlabError> {
@@ -3087,53 +3497,22 @@ fn setting_value(value: &toml::Value, path: &str) -> Result<SettingValue, Inferl
 
 fn merge_value(
     settings: &mut BTreeMap<String, SettingValue>,
-    sources: &mut BTreeMap<String, SettingProvenance>,
     path: &[String],
     value: SettingValue,
-    source: &SettingSource,
 ) {
     if let SettingValue::Object(values) = value {
         if values.is_empty() {
-            set_leaf(
-                settings,
-                sources,
-                path,
-                SettingValue::Object(values),
-                source,
-            );
+            set_map_value(settings, path, SettingValue::Object(values));
         } else {
             for (key, value) in values {
                 let mut child_path = path.to_vec();
                 child_path.push(key);
-                merge_value(settings, sources, &child_path, value, source);
+                merge_value(settings, &child_path, value);
             }
         }
     } else {
-        set_leaf(settings, sources, path, value, source);
+        set_map_value(settings, path, value);
     }
-}
-
-fn set_leaf(
-    settings: &mut BTreeMap<String, SettingValue>,
-    sources: &mut BTreeMap<String, SettingProvenance>,
-    path: &[String],
-    value: SettingValue,
-    source: &SettingSource,
-) {
-    set_map_value(settings, path, value);
-    let dotted = path.join(".");
-    sources.retain(|existing, _| {
-        existing != &dotted
-            && !existing.starts_with(&format!("{dotted}."))
-            && !dotted.starts_with(&format!("{existing}."))
-    });
-    sources.insert(
-        dotted,
-        SettingProvenance {
-            source: source.clone(),
-            adjusted_by_integration: None,
-        },
-    );
 }
 
 fn set_map_value(
@@ -3159,42 +3538,20 @@ fn set_map_value(
     }
 }
 
-fn reconcile_effective_settings(
+fn validate_effective_settings(
     requested: &BTreeMap<String, SettingValue>,
     effective: &BTreeMap<String, SettingValue>,
-    sources: &mut BTreeMap<String, SettingProvenance>,
     integration: &str,
 ) -> Result<(), InferlabError> {
     let requested = flattened_settings(requested);
     let effective = flattened_settings(effective);
-    for (path, requested_value) in &requested {
-        let effective_value = effective
-            .get(path)
-            .ok_or_else(|| InferlabError::InvalidConfig {
+    for path in requested.keys() {
+        if !effective.contains_key(path) {
+            return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {integration:?} omitted effective server setting {path:?}"
                 ),
-            })?;
-        if effective_value != requested_value {
-            let provenance = sources
-                .get_mut(path)
-                .ok_or_else(|| InferlabError::InvalidConfig {
-                    message: format!("server setting {path:?} lost its resolution provenance"),
-                })?;
-            provenance.adjusted_by_integration = Some(integration.to_owned());
-        }
-    }
-    for path in effective.keys() {
-        if !requested.contains_key(path) {
-            sources.insert(
-                path.clone(),
-                SettingProvenance {
-                    source: SettingSource::IntegrationDefault {
-                        integration: integration.to_owned(),
-                    },
-                    adjusted_by_integration: None,
-                },
-            );
+            });
         }
     }
     Ok(())
@@ -3275,7 +3632,8 @@ mod tests {
             .map(|role| ServeRoleResult {
                 id: role.id.clone(),
                 kind: role.kind,
-                replica_count: role.replica_count,
+                declared_replica_count: role.replica_count,
+                effective_replica_count: role.replica_count,
                 effective_settings: BTreeMap::new(),
                 effective_parallelism: Parallelism::default(),
             })
@@ -3286,7 +3644,7 @@ mod tests {
                 id: role.id.clone(),
                 role_id: role.id.clone(),
                 replica_index: 0,
-                accelerator_count: 1,
+                device_count: 1,
                 ports: if role.kind == ServeRoleKind::Prefill {
                     vec!["bootstrap".to_owned()]
                 } else {
@@ -3305,9 +3663,8 @@ mod tests {
                 adapter_id: format!("inferlab-{framework}"),
                 adapter_version: "1".to_owned(),
                 framework: framework.to_owned(),
+                framework_version: "test".to_owned(),
             },
-            effective_settings: BTreeMap::new(),
-            effective_parallelism: Parallelism::default(),
             roles,
             replicas,
             links: vec![
@@ -3326,11 +3683,16 @@ mod tests {
                     port: "bootstrap".to_owned(),
                 },
             ],
-            public_endpoint: PublicEndpointRequirement::BuiltinProxy {
-                process_id: "proxy".to_owned(),
-                role_id: "router".to_owned(),
+            routing: RoutingResult::InferlabBuiltin {
+                implementation: match framework {
+                    "sglang" => BuiltinRouterKind::Sglang,
+                    "tensorrt-llm" => BuiltinRouterKind::Trtllm,
+                    _ => BuiltinRouterKind::VllmNixl,
+                },
+                policy: "round_robin".to_owned(),
                 prefill_role: "prefill".to_owned(),
                 decode_role: "decode".to_owned(),
+                ports: Vec::new(),
                 readiness: ReadinessProbe::Http {
                     path: "/healthcheck".to_owned(),
                 },
@@ -3355,7 +3717,8 @@ mod tests {
         plan.roles.push(ServeRoleResult {
             id: "router".to_owned(),
             kind: ServeRoleKind::Router,
-            replica_count: 1,
+            declared_replica_count: 1,
+            effective_replica_count: 1,
             effective_settings: BTreeMap::new(),
             effective_parallelism: Parallelism::default(),
         });
@@ -3363,7 +3726,7 @@ mod tests {
             id: "router".to_owned(),
             role_id: "router".to_owned(),
             replica_index: 0,
-            accelerator_count: 0,
+            device_count: 0,
             ports: Vec::new(),
             primary_ports: Vec::new(),
             primary_readiness: ReadinessProbe::Http {
@@ -3372,10 +3735,30 @@ mod tests {
             worker_readiness: ReadinessProbe::ProcessAlive,
             capture_target: None,
         });
-        plan.public_endpoint = PublicEndpointRequirement::Replica {
-            replica_id: "router".to_owned(),
+        plan.routing = RoutingResult::IntegrationNative {
+            role: "router".to_owned(),
+            replica: 0,
+            policy: "round_robin".to_owned(),
         };
         (requested_roles, plan)
+    }
+
+    #[test]
+    fn omitted_prefill_decode_backend_freezes_only_builtin_ownership() {
+        let (_, builtin) = bootstrap_prefill_decode_plan("vllm");
+        assert!(matches!(
+            resolve_routing_backend(
+                ServeTopology::PrefillDecode,
+                None,
+                &builtin.routing,
+            ),
+            Ok(Some(backend)) if backend == "builtin"
+        ));
+
+        let (_, native) = native_trtllm_prefill_decode_plan();
+        assert!(
+            resolve_routing_backend(ServeTopology::PrefillDecode, None, &native.routing,).is_err()
+        );
     }
 
     fn add_second_replica(
@@ -3393,7 +3776,12 @@ mod tests {
             .iter_mut()
             .find(|role| role.id == role_id)
             .ok_or_else(|| format!("missing planned role {role_id:?}"))?
-            .replica_count = 2;
+            .declared_replica_count = 2;
+        plan.roles
+            .iter_mut()
+            .find(|role| role.id == role_id)
+            .ok_or_else(|| format!("missing planned role {role_id:?}"))?
+            .effective_replica_count = 2;
         let mut replica = plan
             .replicas
             .iter()
@@ -3580,7 +3968,8 @@ mod tests {
         let role = |id: &str, kind| ServeRoleResult {
             id: id.to_owned(),
             kind,
-            replica_count: 1,
+            declared_replica_count: 1,
+            effective_replica_count: 1,
             effective_settings: BTreeMap::new(),
             effective_parallelism: Parallelism::default(),
         };
@@ -3603,20 +3992,22 @@ mod tests {
                 }
                 ResolvedProcessAllocation {
                     wire: ServeProcessAllocation {
-                        process_id: process_id.to_owned(),
-                        role_id: role_id.to_owned(),
-                        replica_id: role_id.to_owned(),
-                        replica_index: 0,
+                        process: process_id.to_owned(),
+                        role: role_id.to_owned(),
+                        replica: 0,
                         rank,
-                        machine_id: "node".to_owned(),
-                        model_locator: "/models/example".to_owned(),
-                        runtime_cache_root: format!("/cache/{process_id}"),
+                        rank_count: if role_id == "prefill" { 2 } else { 1 },
+                        machine: "node".to_owned(),
+                        model_locator: Some("/models/example".to_owned()),
                         devices: Vec::new(),
-                        endpoint: EndpointAssignment {
+                        endpoint: Some(EndpointAssignment {
                             host: "node.example".to_owned(),
                             port,
-                        },
+                        }),
                         ports,
+                        cache: format!("/cache/{process_id}"),
+                        launch: AllocationLaunch::Local,
+                        dependencies: Vec::new(),
                     },
                     runtime_cache: RuntimeCachePlan {
                         storage_root: PathBuf::from("/cache"),
@@ -3630,6 +4021,7 @@ mod tests {
                         },
                         path: PathBuf::from(format!("/cache/{process_id}")),
                     },
+                    model_locator_source: Some(ModelLocatorSource::Fallback),
                 }
             };
         let allocations = vec![
@@ -3652,7 +4044,7 @@ mod tests {
             prefill_bootstrap_port: "bootstrap".to_owned(),
         }));
 
-        let readiness = readiness_plan(&probe, 900, "sglang-pd", false, &roles, &allocations)?;
+        let readiness = readiness_plan(&probe, 900, false, &roles, &allocations)?;
         assert!(matches!(
             &readiness,
             ReadinessPlan::HttpTargetRegistry { .. }

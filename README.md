@@ -1,11 +1,11 @@
 # Inferlab
 
 Reproducible LLM inference experiments. A committed **workspace** fixes the
-shareable baseline — serving sources, a locked Pixi environment, recipes,
-serve profiles, and eval/bench definitions. A git-ignored **local bindings**
-file supplies the machine-private facts (model weights, machines, GPUs,
-ports). Every execution writes a durable, file-first **record** you can
-inspect, compare, and reproduce from.
+shareable baseline — stacks, named servers and cases, recipes, and eval/bench
+definitions. A git-ignored **local bindings** file supplies machine-private
+facts (model weights, machines, devices, ports, and placement). Managed serving,
+measurement, and image-build workflows write durable, file-first **records**
+you can inspect, compare, and reproduce.
 
 - **Serve lifecycles** — long-running framework servers, single-role or
   prefill/decode disaggregated across machines, with readiness, logs, and
@@ -56,28 +56,31 @@ unpacked release plugin tarball, for testing an unreleased change.
 In a workspace (see [`docs/rfc/`](docs/rfc/) for the full contract, starting at RFC-0001):
 
 ```sh
-pixi install --locked --all                 # realize every declared serving environment from the lock
-inferlab env status                         # confirm each one before relying on it
+pixi install --locked --all                 # realize every stack's selected Pixi environment
+inferlab workspace show                     # validate and browse public definitions
+inferlab stack status                       # confirm each stack realization
 inferlab toolchain install                  # measurement runtimes (only for lm-eval/Bench measurements)
 
-inferlab recipe run my-recipe --dry-run     # validate placement, GPUs, commands, environment
+inferlab recipe run my-recipe --dry-run     # validate placement, devices, commands, environment
 inferlab recipe run my-recipe --case tp2    # closed loop: serve + eval/bench + cleanup
-inferlab serve start my-recipe              # or drive the pieces manually
+inferlab serve start my-server --case tp2   # or drive the pieces manually
 inferlab bench random-8k1k --serve <ID>
 inferlab serve stop <ID>
 ```
 
-Serve, recipe, bench, and image commands print JSON naming a record under
-`.inferlab/records/<ID>/`; `--dry-run` on serve/recipe/bench resolves and
-validates without launching.
+Non-dry-run `serve start`, `recipe run`, `bench`, and `image build` print JSON
+naming a record under `.inferlab/records/<ID>/`; `--dry-run` on
+those commands resolves and validates without launching or writing one.
 
 ## Documentation
 
+- [Workspace authoring](docs/workspace-authoring.md): public definitions,
+  local bindings, heterogeneous P/D placement, typed patches, and dry-run.
 - [Backend support](docs/backend-support.md): maintained backend capabilities
   and integration package names.
 - [RFC-0001 — Specification Overview And Authority Map](docs/rfc/RFC-0001.md):
   the entry point of the normative external contract; topic RFCs under
-  [docs/rfc/](docs/rfc/) own workspace/environments, recipes/execution,
+  [docs/rfc/](docs/rfc/) own workspaces/stacks, servers/execution,
   measurements/toolchains, evidence, the integration protocol, runtime
   images, and agent plugin distribution.
 - [Architecture decisions](docs/adr/): accepted ADRs.

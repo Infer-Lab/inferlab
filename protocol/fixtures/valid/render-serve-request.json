@@ -1,18 +1,17 @@
 {
   "operation": "render_serve",
-  "protocol_version": "4",
+  "protocol_version": "5",
   "input": {
-    "model": {"locator": "/models/dsv4", "served_name": "dsv4"},
+    "model": {"id": "dsv4", "served_name": "dsv4"},
     "topology": "prefill_decode",
     "routing_backend": "builtin",
     "kv_transfer": "mooncake",
-    "parallelism": {},
-    "settings": {"trust_remote_code": true},
     "roles": [
       {
         "id": "prefill",
         "kind": "prefill",
-        "replica_count": 1,
+        "declared_replica_count": 1,
+        "effective_replica_count": 1,
         "effective_settings": {"trust_remote_code": true},
         "effective_parallelism": {
           "outer": {"tensor_parallel_size": 2, "pipeline_parallel_size": 1},
@@ -23,7 +22,8 @@
       {
         "id": "decode",
         "kind": "decode",
-        "replica_count": 1,
+        "declared_replica_count": 1,
+        "effective_replica_count": 1,
         "effective_settings": {"trust_remote_code": true},
         "effective_parallelism": {
           "outer": {"tensor_parallel_size": 2, "pipeline_parallel_size": 1},
@@ -37,33 +37,46 @@
       {"kind": "kv_transfer", "source": "prefill", "target": "decode", "mechanism": "mooncake"},
       {"kind": "bootstrap", "source": "router", "target": "prefill", "port": "bootstrap"}
     ],
+    "routing": {
+      "owner": "inferlab_builtin",
+      "implementation": "vllm_mooncake",
+      "policy": "round_robin",
+      "prefill_role": "prefill",
+      "decode_role": "decode",
+      "ports": [],
+      "readiness": {"kind": "http", "path": "/healthcheck"}
+    },
     "profiling": true,
     "allocations": [
       {
-        "process_id": "prefill",
-        "role_id": "prefill",
-        "replica_id": "prefill",
-        "replica_index": 0,
+        "process": "prefill",
+        "role": "prefill",
+        "replica": 0,
         "rank": 0,
-        "machine_id": "node-a",
+        "rank_count": 1,
+        "machine": "node-a",
         "model_locator": "/models/dsv4",
-        "runtime_cache_root": "/cache/runtime/node-a/prefill",
+        "cache": "/cache/runtime/node-a/prefill",
         "devices": [0, 1],
         "endpoint": {"host": "node-a.example", "port": 8000},
-        "ports": {"bootstrap": {"host": "node-a.example", "port": 29501}}
+        "ports": {"bootstrap": {"host": "node-a.example", "port": 29501}},
+        "launch": {"kind": "local"},
+        "dependencies": []
       },
       {
-        "process_id": "decode",
-        "role_id": "decode",
-        "replica_id": "decode",
-        "replica_index": 0,
+        "process": "decode",
+        "role": "decode",
+        "replica": 0,
         "rank": 0,
-        "machine_id": "node-b",
+        "rank_count": 1,
+        "machine": "node-b",
         "model_locator": "/models/dsv4",
-        "runtime_cache_root": "/cache/runtime/node-b/decode",
+        "cache": "/cache/runtime/node-b/decode",
         "devices": [0, 1],
         "endpoint": {"host": "node-b.example", "port": 8000},
-        "ports": {}
+        "ports": {},
+        "launch": {"kind": "ssh", "target": "operator@node-b"},
+        "dependencies": []
       }
     ]
   }

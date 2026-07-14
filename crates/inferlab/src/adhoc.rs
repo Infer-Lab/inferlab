@@ -5,36 +5,37 @@
 
 use crate::InferlabError;
 use crate::environment;
-use crate::workspace::LoadedWorkspace;
+use crate::workspace::WorkspaceConfig;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 
 pub(crate) struct AdHocRequest<'a> {
-    pub environment: Option<&'a str>,
+    pub stack: Option<&'a str>,
     pub image: Option<&'a str>,
     pub external_image: Option<&'a str>,
     pub mounts: &'a [String],
-    pub gpus: Option<&'a str>,
+    pub devices: Option<&'a str>,
     pub command: &'a [String],
 }
 
 /// Execute the request and return the command's exit code.
 pub(crate) fn execute(
-    workspace: &LoadedWorkspace,
+    root: &Path,
+    config: &WorkspaceConfig,
     request: &AdHocRequest,
 ) -> Result<i32, InferlabError> {
     // Mount requests parse before any selection I/O: a rejected request
     // should never cost a record read or a docker probe.
     let mounts = parse_mounts(request.mounts)?;
     let argv = if let Some(record_id) = request.image {
-        let image_id = crate::image::launch::select_for_adhoc(&workspace.root, record_id)?;
-        container_argv(&image_id, &mounts, request.gpus, request.command, false)
+        let image_id = crate::image::launch::select_for_adhoc(root, record_id)?;
+        container_argv(&image_id, &mounts, request.devices, request.command, false)
     } else if let Some(external_id) = request.external_image {
-        let reference = crate::image::launch::select_external_for_adhoc(workspace, external_id)?;
-        container_argv(&reference, &mounts, request.gpus, request.command, true)
+        let reference = crate::image::launch::select_external_for_adhoc(config, external_id)?;
+        container_argv(&reference, &mounts, request.devices, request.command, true)
     } else {
-        local_argv(workspace, request.environment, request.command)?
+        local_argv(root, config, request.stack, request.command)?
     };
     // Ctrl-C must reach the foreground command, not kill the wrapper: the
     // installed handler keeps this process alive to report the command's
@@ -55,35 +56,34 @@ pub(crate) fn execute(
 /// manifest path pins the workspace authority while the command keeps the
 /// operator's working directory.
 fn local_argv(
-    workspace: &LoadedWorkspace,
-    environment: Option<&str>,
+    root: &Path,
+    config: &WorkspaceConfig,
+    stack: Option<&str>,
     command: &[String],
 ) -> Result<Vec<String>, InferlabError> {
-    let environments = &workspace.config.environments;
-    let definition = match environment {
-        Some(id) => environments
-            .get(id)
-            .ok_or_else(|| InferlabError::AdHocRun {
-                message: format!(
-                    "unknown environment {id:?}; the workspace declares {:?}",
-                    environments.keys().collect::<Vec<_>>()
-                ),
-            })?,
+    let stacks = &config.stacks;
+    let definition = match stack {
+        Some(id) => stacks.get(id).ok_or_else(|| InferlabError::AdHocRun {
+            message: format!(
+                "unknown stack {id:?}; the workspace declares {:?}",
+                stacks.keys().collect::<Vec<_>>()
+            ),
+        })?,
         None => {
-            let mut candidates = environments.values();
+            let mut candidates = stacks.values();
             match (candidates.next(), candidates.next()) {
                 (Some(only), None) => only,
                 (None, _) => {
                     return Err(InferlabError::AdHocRun {
-                        message: "the workspace declares no environments".to_owned(),
+                        message: "the workspace declares no stacks".to_owned(),
                     });
                 }
                 (Some(_), Some(_)) => {
                     return Err(InferlabError::AdHocRun {
                         message: format!(
-                            "the workspace declares more than one environment {:?}; select one \
-                             with --environment",
-                            environments.keys().collect::<Vec<_>>()
+                            "the workspace declares more than one stack {:?}; select one \
+                             with --stack",
+                            stacks.keys().collect::<Vec<_>>()
                         ),
                     });
                 }
@@ -93,7 +93,7 @@ fn local_argv(
     // The ad-hoc check (never the confirmation-marker-aware gate): running
     // this operation MUST NOT trust or produce qualification evidence a
     // real launch would rely on ([[RFC-0002:C-ADHOC-EXECUTION]]).
-    environment::ensure_usable_without_confirmation(&workspace.root, &definition.pixi_environment)?;
+    environment::ensure_usable_without_confirmation(root, &definition.pixi_environment)?;
     let mut argv = vec![
         "pixi".to_owned(),
         "-q".to_owned(),
@@ -101,7 +101,7 @@ fn local_argv(
         "--as-is".to_owned(),
         "--executable".to_owned(),
         "--manifest-path".to_owned(),
-        workspace.root.join("pixi.toml").display().to_string(),
+        root.join("pixi.toml").display().to_string(),
         "-e".to_owned(),
         definition.pixi_environment.clone(),
         "--".to_owned(),
@@ -117,7 +117,7 @@ fn local_argv(
 fn container_argv(
     image: &str,
     mounts: &[Mount],
-    gpus: Option<&str>,
+    devices: Option<&str>,
     command: &[String],
     external: bool,
 ) -> Vec<String> {
@@ -133,8 +133,8 @@ fn container_argv(
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         argv.push("--tty".to_owned());
     }
-    if let Some(spec) = gpus {
-        argv.extend(crate::container::gpu_device_args(spec));
+    if let Some(spec) = devices {
+        argv.extend(crate::container::docker_device_args(spec));
     }
     for mount in mounts {
         // The explicit --mount form, not the -v shorthand: at least one site

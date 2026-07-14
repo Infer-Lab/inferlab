@@ -2,8 +2,8 @@ use crate::InferlabError;
 use crate::adapter::ProcessAdapterClient;
 use crate::environment;
 use crate::recipe::{self, RecipeStatus};
-use crate::record::new_record_id;
-use crate::resolve::{ResolveRequest, Workflow, resolve};
+use crate::record::{RecordIdentity, new_record_id};
+use crate::resolve::{ExecutionTarget, ResolveRequest, Workflow, resolve};
 use crate::server;
 use crate::toolchain;
 use crate::workload::{self, WorkloadStatus};
@@ -24,23 +24,22 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     workspace: Option<PathBuf>,
 
-    /// Alternate machine-local bindings file.
-    #[arg(long, global = true, value_name = "FILE")]
-    local: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Maintain the committed workspace package environment.
+    /// Maintain the committed workspace.
     #[command(subcommand)]
-    Env(EnvCommand),
+    Workspace(WorkspaceCommand),
+    /// Inspect serving-stack realizations.
+    #[command(subcommand)]
+    Stack(StackCommand),
     /// Install Inferlab-owned experiment tools.
     #[command(subcommand)]
     Toolchain(ToolchainCommand),
-    /// Manage a long-running server selected from a recipe.
+    /// Manage a long-running named server.
     #[command(subcommand)]
     Serve(ServeCommand),
     /// Run a closed-loop eval and bench recipe.
@@ -48,7 +47,7 @@ enum Command {
     Recipe(RecipeCommand),
     /// Run one named Bench against an explicit managed server.
     Bench(BenchArgs),
-    /// Execute one command inside a selected serving-environment realization.
+    /// Execute one command inside a selected stack realization.
     Run(RunArgs),
     /// Produce and validate runtime images from the workspace.
     #[command(subcommand)]
@@ -152,6 +151,14 @@ struct ImageBuildArgs {
     #[arg(long, value_name = "BUILDER")]
     builder: Option<String>,
 
+    /// Machine placement used by every image validation.
+    #[arg(long, value_name = "PLACEMENT")]
+    placement: Option<String>,
+
+    /// Alternate machine-local bindings file.
+    #[arg(long, value_name = "FILE")]
+    local: Option<PathBuf>,
+
     /// Export each assembled image as an OCI archive into this directory.
     #[arg(long, value_name = "DIR")]
     export: Option<PathBuf>,
@@ -243,19 +250,30 @@ struct TrtllmProxyArgs {
 }
 
 #[derive(Debug, Subcommand)]
-enum EnvCommand {
+enum WorkspaceCommand {
+    /// Validate and show the merged public workspace configuration.
+    Show(WorkspaceShowArgs),
     /// Produce the committed Pixi lock from a clean local prefix.
     Lock,
-    /// Report whether declared serving environments are confirmed usable.
-    Status(EnvStatusArgs),
 }
 
 #[derive(Debug, Args)]
-struct EnvStatusArgs {
-    /// Report on this declared environment only. Omit to report on every
-    /// declared environment.
+struct WorkspaceShowArgs {
+    /// Emit the canonical merged public workspace definition as JSON.
     #[arg(long)]
-    environment: Option<String>,
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct StackStatusArgs {
+    /// Stack to inspect. Omit to report every declared stack.
+    stack: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum StackCommand {
+    /// Report whether selected stack realizations are confirmed usable.
+    Status(StackStatusArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,8 +284,8 @@ enum ToolchainCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServeCommand {
-    /// Resolve and start one recipe case.
-    Start(SelectionArgs),
+    /// Resolve and start one named server.
+    Start(ServeStartArgs),
     /// Inspect one managed server record and its observed process state.
     Status(RecordArgs),
     /// Show the log paths owned by one managed server record.
@@ -278,25 +296,41 @@ enum ServeCommand {
 
 #[derive(Debug, Subcommand)]
 enum RecipeCommand {
-    /// Resolve and run one recipe case as a closed loop.
+    /// Resolve and run one recipe as a closed loop.
     Run(RecipeRunArgs),
 }
 
 #[derive(Debug, Args)]
-struct SelectionArgs {
-    /// Recipe identifier from the workspace.
-    recipe: String,
+struct ServeStartArgs {
+    /// Server identifier from the workspace.
+    server: String,
 
-    /// Recipe case. Omit to select the first declared case.
+    #[command(flatten)]
+    selection: SelectionArgs,
+}
+
+#[derive(Debug, Args)]
+struct SelectionArgs {
+    /// Server case. Omission follows the server's case-selection rule.
     #[arg(long, value_name = "CASE")]
     case: Option<String>,
 
-    /// Override one server setting with a TOML value.
-    #[arg(long = "set", value_name = "server.PATH=VALUE")]
+    /// Machine placement from local bindings.
+    #[arg(long, value_name = "PLACEMENT")]
+    placement: Option<String>,
+
+    /// Apply a typed TOML patch, for example
+    /// `server.readiness_timeout_seconds=1800`. Recipe runs also accept
+    /// selected measurement paths such as `evals.gsm8k.limit=100`.
+    #[arg(long = "set", value_name = "PATH=VALUE")]
     overrides: Vec<String>,
 
+    /// Alternate machine-local bindings file.
+    #[arg(long, value_name = "FILE")]
+    local: Option<PathBuf>,
+
     /// Launch server processes from this image build record's host-platform
-    /// assembled image instead of the locally installed serving environment.
+    /// assembled image instead of the local stack realization.
     #[arg(long, value_name = "IMAGE_BUILD_RECORD")]
     image: Option<String>,
 
@@ -313,6 +347,9 @@ struct SelectionArgs {
 
 #[derive(Debug, Args)]
 struct RecipeRunArgs {
+    /// Recipe identifier from the workspace.
+    recipe: String,
+
     #[command(flatten)]
     selection: SelectionArgs,
 
@@ -323,18 +360,18 @@ struct RecipeRunArgs {
 
 /// Ad-hoc execution ([[RFC-0002:C-ADHOC-EXECUTION]]). The argument shape
 /// carries the clause's selection rules: the two image forms are one
-/// exclusive group, an explicit environment belongs to the local realization
-/// only, and mounts and GPU selections exist only where a container does.
+/// exclusive group, an explicit stack belongs to the local realization
+/// only, and mounts and device selections exist only where a container does.
 #[derive(Debug, Args)]
 #[command(group = clap::ArgGroup::new("container-image").args(["image", "external_image"]))]
 struct RunArgs {
-    /// Workspace environment to activate. Defaults to the single declared
-    /// environment; required when the workspace declares more than one.
-    #[arg(long, value_name = "ENVIRONMENT", conflicts_with = "container-image")]
-    environment: Option<String>,
+    /// Workspace stack to activate. Defaults to the single declared stack;
+    /// required when the workspace declares more than one.
+    #[arg(long, value_name = "STACK", conflicts_with = "container-image")]
+    stack: Option<String>,
 
     /// Execute inside this image build record's host-platform assembled
-    /// image instead of the locally installed environment.
+    /// image instead of the local stack realization.
     #[arg(long, value_name = "IMAGE_BUILD_RECORD")]
     image: Option<String>,
 
@@ -348,10 +385,10 @@ struct RunArgs {
     #[arg(long = "mount", value_name = "PATH[:rw]", requires = "container-image")]
     mounts: Vec<String>,
 
-    /// Host GPU devices to expose to the container: an index or a
-    /// comma-joined list. Without it the container requests no GPUs.
+    /// Host devices to expose to the container: an index or a comma-joined
+    /// list. Without it the container requests no devices.
     #[arg(long, value_name = "INDEX[,INDEX...]", requires = "container-image")]
-    gpus: Option<String>,
+    devices: Option<String>,
 
     /// Command to execute.
     #[arg(last = true, required = true, value_name = "CMD")]
@@ -373,7 +410,7 @@ struct BenchArgs {
     #[arg(long, value_name = "SERVER_RECORD_ID")]
     serve: String,
 
-    /// Override one existing Bench field with a TOML value.
+    /// Override one typed Bench field with a TOML value.
     #[arg(long = "set", value_name = "PATH=VALUE")]
     overrides: Vec<String>,
 
@@ -387,21 +424,31 @@ struct BenchArgs {
 }
 
 pub fn run(cli: Cli) -> Result<(), InferlabError> {
-    let Cli {
-        workspace,
-        local,
-        command,
-    } = cli;
+    let Cli { workspace, command } = cli;
     match command {
-        Command::Env(EnvCommand::Lock) => {
+        Command::Workspace(WorkspaceCommand::Show(args)) => {
+            let root = discover_workspace(workspace.as_deref())?;
+            let config = load_workspace_config(&root)?;
+            if args.json {
+                write_json(&config)
+            } else {
+                write_text(&crate::workspace::workspace_summary(&config))
+            }
+        }
+        Command::Workspace(WorkspaceCommand::Lock) => {
             let root = discover_workspace(workspace.as_deref())?;
             write_json(&environment::lock_workspace(&root)?)
         }
-        Command::Env(EnvCommand::Status(args)) => run_env_status(workspace, args),
+        Command::Stack(StackCommand::Status(args)) => run_stack_status(workspace, args),
         Command::Toolchain(ToolchainCommand::Install) => write_json(&toolchain::install()?),
-        Command::Serve(ServeCommand::Start(selection)) => {
-            run_selection(workspace, local, Workflow::ServeStart, selection, &[])
-        }
+        Command::Serve(ServeCommand::Start(args)) => run_selection(
+            workspace,
+            args.selection.local.clone(),
+            Workflow::ServeStart,
+            args.server,
+            args.selection,
+            &[],
+        ),
         Command::Serve(ServeCommand::Status(args)) => {
             let root = discover_workspace(workspace.as_deref())?;
             write_json(&server::status(&root, &args.id)?)
@@ -416,23 +463,25 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
         }
         Command::Recipe(RecipeCommand::Run(args)) => run_selection(
             workspace,
-            local,
+            args.selection.local.clone(),
             Workflow::RecipeRun,
+            args.recipe,
             args.selection,
             &args.capture,
         ),
-        Command::Bench(args) => run_bench_command(workspace, local, args),
+        Command::Bench(args) => run_bench_command(workspace, args),
         Command::Run(args) => {
             let root = discover_workspace(workspace.as_deref())?;
-            let loaded = load_workspace(root, local.as_deref())?;
+            let config = load_workspace_config(&root)?;
             let code = crate::adhoc::execute(
-                &loaded,
+                &root,
+                &config,
                 &crate::adhoc::AdHocRequest {
-                    environment: args.environment.as_deref(),
+                    stack: args.stack.as_deref(),
                     image: args.image.as_deref(),
                     external_image: args.external_image.as_deref(),
                     mounts: &args.mounts,
-                    gpus: args.gpus.as_deref(),
+                    devices: args.devices.as_deref(),
                     command: &args.command,
                 },
             )?;
@@ -441,7 +490,7 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
             // command's own report, never an Inferlab diagnostic.
             std::process::exit(code);
         }
-        Command::Image(ImageCommand::Build(args)) => run_image_build(workspace, local, args),
+        Command::Image(ImageCommand::Build(args)) => run_image_build(workspace, args),
         Command::Scratchpad(command) => {
             let root = discover_workspace(workspace.as_deref())?;
             let output = match command {
@@ -494,28 +543,27 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
     }
 }
 
-fn run_env_status(
+fn run_stack_status(
     workspace_path: Option<PathBuf>,
-    args: EnvStatusArgs,
+    args: StackStatusArgs,
 ) -> Result<(), InferlabError> {
     let root = discover_workspace(workspace_path.as_deref())?;
     let config = load_workspace_config(&root)?;
-    let selected: Vec<(String, String)> = match args.environment.as_deref() {
+    let selected: Vec<(String, String)> = match args.stack.as_deref() {
         Some(id) => {
-            let definition =
-                config
-                    .environments
-                    .get(id)
-                    .ok_or_else(|| InferlabError::InvalidConfig {
-                        message: format!(
-                            "unknown environment {id:?}; the workspace declares {:?}",
-                            config.environments.keys().collect::<Vec<_>>()
-                        ),
-                    })?;
+            let definition = config
+                .stacks
+                .get(id)
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!(
+                        "unknown stack {id:?}; the workspace declares {:?}",
+                        config.stacks.keys().collect::<Vec<_>>()
+                    ),
+                })?;
             vec![(id.to_owned(), definition.pixi_environment.clone())]
         }
         None => config
-            .environments
+            .stacks
             .iter()
             .map(|(id, definition)| (id.clone(), definition.pixi_environment.clone()))
             .collect(),
@@ -526,7 +574,7 @@ fn run_env_status(
         .any(|report| report.status != environment::EnvironmentStatusKind::Confirmed);
     write_json(&reports)?;
     if unconfirmed {
-        Err(InferlabError::EnvironmentStatusUnconfirmed)
+        Err(InferlabError::StackStatusUnconfirmed)
     } else {
         Ok(())
     }
@@ -534,17 +582,17 @@ fn run_env_status(
 
 fn run_image_build(
     workspace_path: Option<PathBuf>,
-    local: Option<PathBuf>,
     args: ImageBuildArgs,
 ) -> Result<(), InferlabError> {
     let root = discover_workspace(workspace_path.as_deref())?;
-    let workspace = load_workspace(root, local.as_deref())?;
+    let workspace = load_workspace(root, args.local.as_deref())?;
     let tool = crate::image::tool::DockerBuilderTool;
     let resolved = crate::image::resolve_image(
         &workspace,
         &crate::image::ImageBuildRequest {
             image: &args.image,
             builder: args.builder.as_deref(),
+            placement: args.placement.as_deref(),
             export: args.export.as_deref(),
         },
         &tool,
@@ -655,15 +703,17 @@ fn sglang_prefill_targets(
 
 fn run_bench_command(
     workspace_path: Option<PathBuf>,
-    local: Option<PathBuf>,
     args: BenchArgs,
 ) -> Result<(), InferlabError> {
     let root = discover_workspace(workspace_path.as_deref())?;
-    let workspace = load_workspace(root.clone(), local.as_deref())?;
+    let config = load_workspace_config(&root)?;
+    let snapshot = crate::workspace::snapshot_workspace(&root, &config)?;
     let status = server::status(&root, &args.serve)?;
     server::require_running(&status)?;
     let plan = workload::resolve_manual_bench(
-        &workspace,
+        &root,
+        &config,
+        &snapshot,
         &status.record,
         &args.bench,
         &args.overrides,
@@ -676,12 +726,14 @@ fn run_bench_command(
     crate::interrupt::prepare().map_err(|message| InferlabError::ServerLifecycle { message })?;
     let record = workload::run_bench(
         &root,
-        &new_record_id("bench")?,
+        &new_record_id(RecordIdentity::Bench {
+            bench: &plan.bench.id,
+        })?,
         &plan.bench,
         workload::WorkloadServerAccess::ManagedServer {
             record_id: &plan.target.server_record_id,
         },
-        &plan,
+        workload::ResolvedWorkloadPlan::ManualBench(Box::new(plan.clone())),
     )?;
     let failed = record.status == WorkloadStatus::Failed;
     let record_id = record.id.clone();
@@ -697,29 +749,46 @@ fn run_selection(
     workspace_path: Option<PathBuf>,
     local: Option<PathBuf>,
     workflow: Workflow,
+    target_id: String,
     selection: SelectionArgs,
     captures: &[String],
 ) -> Result<(), InferlabError> {
     let root = discover_workspace(workspace_path.as_deref())?;
     let workspace = load_workspace(root.clone(), local.as_deref())?;
+    let server_id = match workflow {
+        Workflow::ServeStart => target_id.as_str(),
+        Workflow::RecipeRun => workspace
+            .config
+            .recipes
+            .get(&target_id)
+            .map(|recipe| recipe.server.as_str())
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: format!("unknown recipe {target_id:?}"),
+            })?,
+    };
     // The selection validates before resolution and keys realization-
     // dependent resolution facts: adapter lowering executes against the
-    // image realization, so no locally installed serving environment is
+    // image realization, so no local stack realization is
     // required ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     let image = selection
         .image
         .as_deref()
-        .map(|record_id| crate::image::launch::select(&workspace, &selection.recipe, record_id))
+        .map(|record_id| crate::image::launch::select(&workspace, server_id, record_id))
         .transpose()?;
     let external = selection
         .external_image
         .as_deref()
-        .map(|id| crate::image::launch::select_external(&workspace, &selection.recipe, id))
+        .map(|id| crate::image::launch::select_external(&workspace, server_id, id))
         .transpose()?;
+    let target = match workflow {
+        Workflow::ServeStart => ExecutionTarget::Server(&target_id),
+        Workflow::RecipeRun => ExecutionTarget::Recipe(&target_id),
+    };
     let request = ResolveRequest {
         workflow,
-        recipe: &selection.recipe,
+        target,
         case: selection.case.as_deref(),
+        placement: selection.placement.as_deref(),
         overrides: &selection.overrides,
         captures,
         image: image.as_ref(),
@@ -781,5 +850,19 @@ fn write_json(value: &impl Serialize) -> Result<(), InferlabError> {
     output
         .write_all(b"\n")
         .map_err(|source| InferlabError::WriteOutput { source })?;
+    Ok(())
+}
+
+fn write_text(value: &str) -> Result<(), InferlabError> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    output
+        .write_all(value.as_bytes())
+        .map_err(|source| InferlabError::WriteOutput { source })?;
+    if !value.ends_with('\n') {
+        output
+            .write_all(b"\n")
+            .map_err(|source| InferlabError::WriteOutput { source })?;
+    }
     Ok(())
 }

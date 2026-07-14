@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The shared protocol version used by framework integrations and release-owned
-/// measurement clients. The only accepted value is `4` (serialized as the
-/// string `"4"`); a mismatch is rejected before lowering.
+/// measurement clients. The only accepted value is `5` (serialized as the
+/// string `"5"`); a mismatch is rejected before lowering.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum ProtocolVersion {
-    /// Protocol version 4.
-    #[serde(rename = "4")]
-    V4,
+    /// Protocol version 5.
+    #[serde(rename = "5")]
+    V5,
 }
 
 /// The one JSON request an integration reads from stdin, tagged by the
@@ -60,11 +60,10 @@ impl AdapterRequest {
 pub struct PlanServeInput {
     pub model: ServeModelInput,
     pub topology: ServeTopology,
-    pub routing_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_transfer: Option<KvTransferMechanism>,
-    pub parallelism: Parallelism,
-    pub settings: BTreeMap<String, SettingValue>,
     pub roles: Vec<ServeRoleInput>,
     #[serde(default)]
     pub profiling: bool,
@@ -77,12 +76,12 @@ pub struct PlanServeInput {
 pub struct RenderServeInput {
     pub model: ServeModelInput,
     pub topology: ServeTopology,
-    pub routing_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_transfer: Option<KvTransferMechanism>,
-    pub parallelism: Parallelism,
-    pub settings: BTreeMap<String, SettingValue>,
     pub roles: Vec<ServeRoleResult>,
+    pub routing: RoutingResult,
     pub links: Vec<ServeRoleLink>,
     pub allocations: Vec<ServeProcessAllocation>,
     #[serde(default)]
@@ -144,7 +143,8 @@ pub struct ServeRoleInput {
 pub struct ServeRoleResult {
     pub id: String,
     pub kind: ServeRoleKind,
-    pub replica_count: u32,
+    pub declared_replica_count: u32,
+    pub effective_replica_count: u32,
     pub effective_settings: BTreeMap<String, SettingValue>,
     pub effective_parallelism: Parallelism,
 }
@@ -188,8 +188,10 @@ impl Parallelism {
 #[serde(default, deny_unknown_fields)]
 pub struct ParallelismOuter {
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tensor_parallel_size: Option<u32>,
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_parallel_size: Option<u32>,
 }
 
@@ -209,10 +211,13 @@ impl ParallelismOuter {
 #[serde(default, deny_unknown_fields)]
 pub struct ParallelismAttention {
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tensor_parallel_size: Option<u32>,
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_parallel_size: Option<u32>,
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_parallel_size: Option<u32>,
 }
 
@@ -235,12 +240,16 @@ impl ParallelismAttention {
 #[serde(default, deny_unknown_fields)]
 pub struct ParallelismExperts {
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tensor_parallel_size: Option<u32>,
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_parallel_size: Option<u32>,
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expert_parallel_size: Option<u32>,
     #[schemars(range(min = 1))]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dense_tensor_parallel_size: Option<u32>,
 }
 
@@ -261,10 +270,20 @@ impl ParallelismExperts {
     }
 }
 
-/// The model to serve: its resolved locator and the name it is served under.
+/// The logical model supplied during serving planning and rendering.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeModelInput {
+    pub id: String,
+    pub served_name: String,
+}
+
+/// The model identity used by measurement clients. Unlike integration
+/// planning, a benchmark client may need a controller-visible tokenizer
+/// locator.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementModelInput {
     pub locator: String,
     pub served_name: String,
 }
@@ -395,12 +414,10 @@ pub enum AdapterResult {
 #[serde(deny_unknown_fields)]
 pub struct PlanServeResult {
     pub integration: IntegrationIdentity,
-    pub effective_settings: BTreeMap<String, SettingValue>,
-    pub effective_parallelism: Parallelism,
     pub roles: Vec<ServeRoleResult>,
     pub replicas: Vec<ServeReplicaRequirement>,
     pub links: Vec<ServeRoleLink>,
-    pub public_endpoint: PublicEndpointRequirement,
+    pub routing: RoutingResult,
     pub endpoint: EndpointRequirement,
     #[serde(default)]
     pub render_inputs: Vec<RenderInputDeclaration>,
@@ -432,7 +449,7 @@ pub struct ServeReplicaRequirement {
     pub id: String,
     pub role_id: String,
     pub replica_index: u32,
-    pub accelerator_count: u32,
+    pub device_count: u32,
     pub ports: Vec<String>,
     pub primary_ports: Vec<String>,
     pub primary_readiness: ReadinessProbe,
@@ -444,20 +461,33 @@ pub struct ServeReplicaRequirement {
 /// One concrete process the control plane placed, supplied to `RenderServe`:
 /// its identity, rank, machine, devices, model locator, and allocated
 /// endpoints and named ports.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeProcessAllocation {
-    pub process_id: String,
-    pub role_id: String,
-    pub replica_id: String,
-    pub replica_index: u32,
+    pub process: String,
+    pub role: String,
+    pub replica: u32,
     pub rank: u32,
-    pub machine_id: String,
-    pub model_locator: String,
-    pub runtime_cache_root: String,
+    pub rank_count: u32,
+    pub machine: String,
     pub devices: Vec<u32>,
-    pub endpoint: EndpointAssignment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_locator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<EndpointAssignment>,
     pub ports: BTreeMap<String, EndpointAssignment>,
+    pub cache: String,
+    pub launch: AllocationLaunch,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+}
+
+/// The machine-local launch channel selected by the control plane.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AllocationLaunch {
+    Local,
+    Ssh { target: String },
 }
 
 /// A directed link between serve roles the integration declares as part of the
@@ -490,21 +520,38 @@ pub enum ServeRoleLink {
     },
 }
 
-/// How the topology's public workload endpoint is exposed.
+/// The closed routing owner selected during integration planning.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PublicEndpointRequirement {
-    /// The endpoint is served directly by a single replica.
-    Replica { replica_id: String },
-    /// The endpoint is fronted by an Inferlab-owned built-in proxy routing
-    /// across the named prefill and decode roles.
-    BuiltinProxy {
-        process_id: String,
-        role_id: String,
+#[serde(tag = "owner", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoutingResult {
+    Direct {
+        role: String,
+        replica: u32,
+    },
+    InferlabBuiltin {
+        implementation: BuiltinRouterKind,
+        policy: String,
         prefill_role: String,
         decode_role: String,
+        #[serde(default)]
+        ports: Vec<String>,
         readiness: ReadinessProbe,
     },
+    IntegrationNative {
+        role: String,
+        replica: u32,
+        policy: String,
+    },
+}
+
+/// An Inferlab-owned routing implementation with stable target semantics.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinRouterKind {
+    VllmMooncake,
+    VllmNixl,
+    Sglang,
+    Trtllm,
 }
 
 /// Marks a replica as a profiling capture target and carries its window
@@ -536,9 +583,13 @@ pub struct RenderServeResult {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenderedServeProcess {
-    pub id: String,
+    pub process: String,
+    pub role: String,
+    pub replica: u32,
+    pub rank: u32,
+    pub rank_count: u32,
     pub launch_files: Vec<LaunchFileDeclaration>,
-    pub process: ProcessSpec,
+    pub command: ProcessSpec,
 }
 
 /// One immutable text input a rendered process requires before it can launch.
@@ -574,6 +625,7 @@ pub struct IntegrationIdentity {
     pub adapter_id: String,
     pub adapter_version: String,
     pub framework: String,
+    pub framework_version: String,
 }
 
 /// A launchable process: its argument vector and environment.
@@ -674,7 +726,7 @@ pub enum AdapterErrorCode {
 pub struct EvalClientRequest {
     pub protocol_version: ProtocolVersion,
     pub endpoint: ClientEndpointInput,
-    pub model: ServeModelInput,
+    pub model: MeasurementModelInput,
     pub definition: EvalDefinitionInput,
     pub artifact_dir: PathBuf,
 }
@@ -687,7 +739,7 @@ pub struct EvalClientRequest {
 pub struct BenchClientRequest {
     pub protocol_version: ProtocolVersion,
     pub endpoint: ClientEndpointInput,
-    pub model: ServeModelInput,
+    pub model: MeasurementModelInput,
     pub definition: BenchDefinitionInput,
     pub case: BenchCaseInput,
     pub artifact_dir: PathBuf,

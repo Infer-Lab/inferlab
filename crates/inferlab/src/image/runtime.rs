@@ -15,7 +15,7 @@ use crate::adapter::AdapterClient;
 use crate::environment;
 use crate::interrupt;
 use crate::recipe::{self, RecipeStatus};
-use crate::record::new_record_id;
+use crate::record::{RecordIdentity, new_record_id};
 use crate::resolve::{ResolveRequest, Workflow, resolve};
 use crate::workspace::LoadedWorkspace;
 use crate::{InferlabError, image::context};
@@ -39,7 +39,9 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
 ) -> Result<ImageBuildReport, InferlabError> {
     environment::ensure_usable(&workspace.root, &resolved.image.pixi_environment)?;
     interrupt::prepare().map_err(|message| InferlabError::ImageBuild { message })?;
-    let id = new_record_id("image")?;
+    let id = new_record_id(RecordIdentity::Image {
+        image: &resolved.image.id,
+    })?;
     let mut store = ImageRecordStore::begin(&workspace.root, id, resolved)?;
     // Operator progress goes to the diagnostic stream as phases begin;
     // stdout stays a single final report ([[RFC-0007:C-IMAGE-BUILD]]).
@@ -191,7 +193,7 @@ fn assemble<T: BuilderTool>(
         format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()))
     };
 
-    // Wheels build against a sanitized view of the whole source set: builds
+    // Wheels build against a sanitized view of all stack sources: builds
     // read sibling build inputs (for example DeepGEMM through activation
     // references) from copies, subpackage paths (for example
     // flashinfer/flashinfer-cubin) build inside their owner's copy, and any
@@ -213,7 +215,7 @@ fn assemble<T: BuilderTool>(
                 .find(|path| wheel_source.starts_with(path))
                 .ok_or_else(|| InferlabError::ImageBuild {
                     message: format!(
-                        "package path {} is not under a source-set path",
+                        "package path {} is not under a stack source path",
                         wheel_source.display()
                     ),
                 })?;
@@ -614,8 +616,9 @@ fn validate<C: AdapterClient>(
         workspace,
         &ResolveRequest {
             workflow: Workflow::RecipeRun,
-            recipe: &plan.recipe,
-            case: Some(&plan.case),
+            target: crate::resolve::ExecutionTarget::Recipe(&plan.recipe),
+            case: plan.server_case.as_deref(),
+            placement: record.resolved.placement.as_deref(),
             overrides: &[],
             captures: &[],
             image: None,
@@ -631,16 +634,19 @@ fn validate<C: AdapterClient>(
             };
         }
     };
-    if let Err(reason) = super::single_host_local(&resolved.server.processes) {
+    if let Err(reason) = super::single_host_local(resolved.server.processes()) {
         return ValidationOutcome::BuiltButUnvalidated { reason };
     }
     eprintln!(
         "image {}: validating {}/{} ({})",
-        record.id, plan.recipe, plan.case, plan.platform
+        record.id,
+        plan.recipe,
+        plan.server_case.as_deref().unwrap_or("base"),
+        plan.platform
     );
     let mut resolved = resolved;
     // The realization was checked during assembly ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
-    resolved.server.environment.realization = environment::CheckRealization::Image;
+    resolved.stack.realization = environment::CheckRealization::Image;
     super::launch::containerize(&mut resolved, &image_id, &workspace.local.machines, false);
     match recipe::run(&workspace.root, resolved) {
         Ok(record) if record.status == RecipeStatus::Failed => ValidationOutcome::Failed {
@@ -658,7 +664,7 @@ fn validate<C: AdapterClient>(
 }
 
 /// The wheel cache key covers every fact that can change built wheel content:
-/// the committed identity of every source-set path (build-time inputs such as
+/// the committed identity of every stack source path (build-time inputs such as
 /// DeepGEMM feed sibling builds through the activation environment), the
 /// wheel subpath, the selected environment's locked package closure and
 /// projected activation environment (derived facts — unrelated manifest and
@@ -916,11 +922,11 @@ fn wheel_build_dir(build_dir: &Path, wheel_source: &Path) -> PathBuf {
     build_dir.join("wheel-build").join("out").join(sanitized)
 }
 
-/// Activation values referencing `$PIXI_PROJECT_ROOT/<source-set path>` are
+/// Activation values referencing `$PIXI_PROJECT_ROOT/<stack source path>` are
 /// build-time source references; redirect them into the sanitized view so
 /// external build backends read sibling sources (for example DeepGEMM) from
 /// the copies rather than the workspace ([[RFC-0007:C-IMAGE-BUILD]]). A value
-/// whose single reference points outside the source set stays untouched. A
+/// whose single reference points outside the stack sources stays untouched. A
 /// value with more than one workspace-root reference is rejected: classifying
 /// by one reference while rewriting all of them would misdirect mixed values,
 /// and a shell-expansion parser is not worth owning for a shape no workspace
@@ -945,7 +951,7 @@ fn build_env_redirects(
                 message: format!(
                     "activation value {name:?} carries {references} workspace-root references; \
                      sanitized-view redirection supports exactly one \
-                     $PIXI_PROJECT_ROOT/<source-set path> reference per value"
+                     $PIXI_PROJECT_ROOT/<stack source path> reference per value"
                 ),
             });
         }
@@ -1187,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn redirects_source_set_references_and_leaves_the_rest() -> Result<(), crate::InferlabError> {
+    fn redirects_stack_source_references_and_leaves_the_rest() -> Result<(), crate::InferlabError> {
         let mut activation = BTreeMap::new();
         activation.insert(
             "DEEPGEMM_SRC_DIR".to_owned(),

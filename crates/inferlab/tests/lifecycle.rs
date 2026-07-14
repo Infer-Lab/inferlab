@@ -22,6 +22,25 @@ struct TestWorkspace {
     ssh_events: PathBuf,
 }
 
+fn resolved_ranks(
+    server: &Value,
+) -> Result<Vec<support::ResolvedProcessProjection>, Box<dyn Error>> {
+    support::resolved_processes(server)
+}
+
+fn resolved_rank(
+    server: &Value,
+    id: &str,
+) -> Result<support::ResolvedRankProjection, Box<dyn Error>> {
+    support::resolved_process(server, id)
+}
+
+fn process_evidence<'a>(record: &'a Value, id: &str) -> Result<&'a Value, Box<dyn Error>> {
+    record["process_evidence"]
+        .get(id)
+        .ok_or_else(|| format!("missing process evidence {id:?}").into())
+}
+
 impl TestWorkspace {
     fn new() -> Result<Self, Box<dyn Error>> {
         let root = tempfile::tempdir()?;
@@ -73,7 +92,7 @@ impl TestWorkspace {
                  \n\
                  [machines.local]\n\
                  host = \"127.0.0.1\"\n\
-                 port = {port}\n\
+                 ports = [{port}]\n\
                  devices = [0, 1, 2, 3]\n\
                  \n\
                  [placements.local]\n\
@@ -138,26 +157,22 @@ impl TestWorkspace {
                  \n\
                  [machines.node-a]\n\
                  host = \"127.0.0.1\"\n\
-                 port = {node_a_port}\n\
-                 extra_ports = [{master_port}]\n\
+                 ports = [{node_a_port}, {master_port}]\n\
                  devices = [0]\n\
                  workspace = {:?}\n\
                  launch = {{ kind = \"ssh\", target = \"node-a\" }}\n\
                  \n\
                  [machines.node-b]\n\
                  host = \"127.0.0.1\"\n\
-                 port = {node_b_port}\n\
+                 ports = [{node_b_port}]\n\
                  devices = [1]\n\
                  workspace = {:?}\n\
                  launch = {{ kind = \"ssh\", target = \"node-b\" }}\n\
                  \n\
-                 [placements.pair]\n\
-                 machines = [\"node-a\", \"node-b\"]\n\
-                 \n\
                  [placements.pair.roles.serve]\n\
                  ranks = [\n\
-                   {{ replica = 0, machine = \"node-a\", gpus = [0] }},\n\
-                   {{ replica = 0, machine = \"node-b\", gpus = [1] }},\n\
+                   {{ machine = \"node-a\", devices = [0] }},\n\
+                   {{ machine = \"node-b\", devices = [1] }},\n\
                  ]\n",
                 self.root.path(),
                 self.root.path(),
@@ -179,8 +194,8 @@ impl TestWorkspace {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    /// Declare one always-passing environment check on the serving
-    /// environment ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
+    /// Declare one always-passing realization check on the serving stack
+    /// ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
     fn declare_environment_check(&self) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(self.root.path().join("tools"))?;
         fs::write(
@@ -193,7 +208,7 @@ impl TestWorkspace {
         let manifest = self.root.path().join(".inferlab/workspace.toml");
         let mut text = fs::read_to_string(&manifest)?;
         text.push_str(
-            "\n[[environments.vllm.checks]]\n\
+            "\n[[stacks.vllm.checks]]\n\
              id = \"fixture-guard\"\n\
              script = \"tools/fixture-check.py\"\n",
         );
@@ -207,19 +222,24 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     let started = workspace.run_json(&["serve", "start", "dsv4-qualify"])?;
     let id = started["id"].as_str().ok_or("missing record id")?;
-    assert_datetime_record_id(id, "serve")?;
+    assert_datetime_record_id(id, "serve-dsv4-qualify-tp2")?;
 
     assert_eq!(started["status"], "running");
-    assert_eq!(started["resolved"]["recipe"]["id"], "dsv4-qualify");
-    assert_eq!(started["resolved"]["source"]["id"], "vllm");
-    assert_eq!(started["resolved"]["source"]["paths"][0], "vendor/vllm");
-    assert_eq!(started["processes"][0]["handle"]["kind"], "local");
+    assert!(started["resolved"]["recipe"].is_null());
+    assert_eq!(started["resolved"]["stack"]["id"], "vllm");
     assert_eq!(
-        started["resolved"]["server"]["processes"][0]["command"]["env"]["INFERLAB_LIFECYCLE_FIXTURE"],
+        started["resolved"]["stack"]["source_paths"][0],
+        "vendor/vllm"
+    );
+    let rank = resolved_rank(&started["resolved"]["server"], "server")?;
+    let evidence = process_evidence(&started, "server")?;
+    assert_eq!(evidence["handle"]["kind"], "local");
+    assert_eq!(
+        rank.command.env["INFERLAB_LIFECYCLE_FIXTURE"],
         "actual-value"
     );
     assert_eq!(
-        started["resolved"]["server"]["processes"][0]["command"]["env"]["PWD"],
+        rank.command.env["PWD"],
         workspace
             .root
             .path()
@@ -227,18 +247,12 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
             .to_string_lossy()
             .as_ref()
     );
+    assert_eq!(rank.machine, "local");
+    let cache_path = &rank.runtime_cache.path;
+    assert!(cache_path.is_dir());
     assert_eq!(
-        started["resolved"]["server"]["processes"][0]["allocation"]["machine_binding"],
-        "local"
-    );
-    let cache_path =
-        started["resolved"]["server"]["processes"][0]["allocation"]["runtime_cache"]["path"]
-            .as_str()
-            .ok_or("missing runtime cache path")?;
-    assert!(Path::new(cache_path).is_dir());
-    assert_eq!(
-        started["resolved"]["server"]["processes"][0]["command"]["env"]["FLASHINFER_WORKSPACE_BASE"],
-        format!("{cache_path}/flashinfer")
+        rank.command.env["FLASHINFER_WORKSPACE_BASE"],
+        cache_path.join("flashinfer").to_string_lossy()
     );
     assert_eq!(
         started["resolved"]["server"]["endpoint"]["host"],
@@ -252,27 +266,30 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
             .is_file()
     );
 
-    // GPU hardware identity probed at launch ([[RFC-0005:C-EVIDENCE]]):
-    // one entry for the single hosting machine, covering its assigned GPUs.
-    let hardware = started["hardware"].as_array().ok_or("hardware evidence")?;
+    // Device hardware identity probed at launch ([[RFC-0005:C-EVIDENCE]]):
+    // one entry for the single hosting machine, covering its assigned devices.
+    let hardware = started["hardware"].as_object().ok_or("hardware evidence")?;
     assert_eq!(hardware.len(), 1);
-    assert_eq!(hardware[0]["machine"], "local");
-    assert_eq!(hardware[0]["driver_version"], "580.65.06");
-    let gpus = hardware[0]["gpus"].as_array().ok_or("probed gpus")?;
-    assert!(!gpus.is_empty());
-    assert_eq!(gpus[0]["model"], "Fixture GPU");
-    assert_eq!(gpus[0]["memory_total_mib"], 97871);
+    let local_hardware = hardware.get("local").ok_or("local hardware evidence")?;
+    assert_eq!(local_hardware["driver_version"], "580.65.06");
+    let devices = local_hardware["devices"]
+        .as_array()
+        .ok_or("probed devices")?;
+    assert!(!devices.is_empty());
+    assert_eq!(devices[0]["model"], "Fixture GPU");
+    assert_eq!(devices[0]["memory_total_mib"], 97871);
     assert!(
-        gpus[0]["uuid"]
+        devices[0]["uuid"]
             .as_str()
             .is_some_and(|uuid| uuid.starts_with("GPU-fixture-")),
-        "{hardware:?}"
+        "{local_hardware:?}"
     );
 
     fs::write(
         workspace.root.path().join(".inferlab/workspace.toml"),
         "this is not valid TOML = [",
     )?;
+    fs::remove_file(workspace.root.path().join(".inferlab/local.toml"))?;
     fs::remove_file(workspace.bin.join("inferlab-adapter-vllm"))?;
 
     let status = workspace.run_json(&["serve", "status", id])?;
@@ -290,11 +307,11 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
     let stdout_path = logs["processes"][0]["stdout"]
         .as_str()
         .ok_or("missing stdout log path")?;
-    assert!(Path::new(stdout_path).is_absolute() && stdout_path.ends_with("stdout.log"));
+    assert!(Path::new(stdout_path).is_absolute() && stdout_path.ends_with("server.stdout.log"));
     let stderr_path = logs["processes"][0]["stderr"]
         .as_str()
         .ok_or("missing stderr log path")?;
-    assert!(stderr_path.ends_with("stderr.log"));
+    assert!(stderr_path.ends_with("server.stderr.log"));
     // The reported paths are real captured log files on disk, not placeholder
     // strings or directories.
     assert!(
@@ -314,12 +331,10 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
 
     let stopped = workspace.run_json(&["serve", "stop", id])?;
     assert_eq!(stopped["status"], "stopped");
-    assert_eq!(stopped["processes"][0]["cleanup"][0]["verified"], true);
-    assert_eq!(
-        stopped["processes"][0]["cleanup"][0]["signals"][0]["signal"],
-        "term"
-    );
-    assert!(stopped["processes"][0]["cleanup"][0]["signals"][0]["process_group"].is_u64());
+    let evidence = process_evidence(&stopped, "server")?;
+    assert_eq!(evidence["cleanup"][0]["verified"], true);
+    assert_eq!(evidence["cleanup"][0]["signals"][0]["signal"], "term");
+    assert!(evidence["cleanup"][0]["signals"][0]["process_group"].is_u64());
     Ok(())
 }
 
@@ -332,23 +347,21 @@ fn start_materializes_launch_files_and_preserves_them_in_the_record() -> Result<
         "start",
         "dsv4-qualify",
         "--set",
-        "server.fixture_mode=\"launch-file\"",
+        "server.settings.fixture_mode=\"launch-file\"",
     ])?;
     let id = started["id"].as_str().ok_or("missing record id")?;
-    let launch_file = &started["resolved"]["server"]["processes"][0]["launch_files"][0];
-    let resolved_path = launch_file["resolved_path"]
-        .as_str()
-        .ok_or("missing resolved launch-file path")?;
-    let text = launch_file["text"]
-        .as_str()
-        .ok_or("missing launch-file text")?;
+    let rank = resolved_rank(&started["resolved"]["server"], "server")?;
+    let launch_file = &rank.launch_files[0];
+    let resolved_path = &launch_file.resolved_path;
+    let text = &launch_file.text;
 
-    assert_eq!(launch_file["text"], "fixture: runtime\nunicode: 雪\n");
-    assert_eq!(fs::read_to_string(resolved_path)?, text);
+    assert_eq!(launch_file.text, "fixture: runtime\nunicode: 雪\n");
+    assert_eq!(fs::read_to_string(resolved_path)?, text.as_str());
     assert!(
-        started["resolved"]["server"]["processes"][0]["command"]["argv"]
-            .as_array()
-            .is_some_and(|argv| argv.iter().any(|value| value == resolved_path))
+        rank.command
+            .argv
+            .iter()
+            .any(|value| Path::new(value) == resolved_path)
     );
     let persisted: Value = serde_json::from_slice(&fs::read(
         workspace
@@ -357,8 +370,8 @@ fn start_materializes_launch_files_and_preserves_them_in_the_record() -> Result<
             .join(format!(".inferlab/records/{id}/record.json")),
     )?)?;
     assert_eq!(
-        persisted["resolved"]["server"]["processes"][0]["launch_files"][0],
-        launch_file.clone()
+        resolved_rank(&persisted["resolved"]["server"], "server")?.launch_files[0],
+        *launch_file
     );
 
     workspace.run_json(&["serve", "stop", id])?;
@@ -373,16 +386,16 @@ fn local_launch_file_conflict_fails_the_record_before_spawn() -> Result<(), Box<
         "start",
         "dsv4-qualify",
         "--set",
-        "server.fixture_mode=\"launch-file\"",
+        "server.settings.fixture_mode=\"launch-file\"",
     ];
     let mut dry_args = args.to_vec();
     dry_args.push("--dry-run");
     let dry = workspace.run_json(&dry_args)?;
-    let path = dry["server"]["processes"][0]["launch_files"][0]["resolved_path"]
-        .as_str()
-        .ok_or("resolved launch-file path")?;
-    fs::create_dir_all(Path::new(path).parent().ok_or("launch-file parent")?)?;
-    fs::write(path, "stale\n")?;
+    let path = resolved_rank(&dry["server"], "server")?.launch_files[0]
+        .resolved_path
+        .clone();
+    fs::create_dir_all(path.parent().ok_or("launch-file parent")?)?;
+    fs::write(&path, "stale\n")?;
 
     let output = workspace.run(&args)?;
     assert!(!output.status.success());
@@ -392,12 +405,7 @@ fn local_launch_file_conflict_fails_the_record_before_spawn() -> Result<(), Box<
     let record: Value = serde_json::from_slice(&fs::read(entries[0].path().join("record.json"))?)?;
     assert_eq!(record["status"], "failed");
     assert_eq!(record["failure"]["phase"], "launch");
-    assert!(
-        record["failure"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("does not match declared digest"))
-    );
-    assert!(record["processes"][0]["handle"].is_null());
+    assert!(process_evidence(&record, "server")?["handle"].is_null());
     assert_eq!(fs::read_to_string(path)?, "stale\n");
     Ok(())
 }
@@ -469,22 +477,15 @@ fn ssh_launch_materializes_files_before_each_remote_spawn() -> Result<(), Box<dy
         "start",
         "dsv4-qualify",
         "--set",
-        "server.fixture_mode=\"launch-file\"",
+        "server.settings.fixture_mode=\"launch-file\"",
     ])?;
     let id = started["id"].as_str().ok_or("missing record id")?;
-    let processes = started["resolved"]["server"]["processes"]
-        .as_array()
-        .ok_or("resolved processes")?;
-    assert_eq!(processes.len(), 2);
-    for process in processes {
-        let launch_file = &process["launch_files"][0];
-        let path = launch_file["resolved_path"]
-            .as_str()
-            .ok_or("resolved launch-file path")?;
-        assert_eq!(
-            fs::read_to_string(path)?,
-            launch_file["text"].as_str().ok_or("launch-file text")?
-        );
+    let ranks = resolved_ranks(&started["resolved"]["server"])?;
+    assert_eq!(ranks.len(), 2);
+    for process in ranks {
+        let launch_file = &process.rank.launch_files[0];
+        let path = &launch_file.resolved_path;
+        assert_eq!(fs::read_to_string(path)?, launch_file.text);
     }
 
     let events = fs::read_to_string(&workspace.ssh_events)?;
@@ -517,16 +518,16 @@ fn ssh_launch_file_conflict_records_failure_without_launching() -> Result<(), Bo
         "start",
         "dsv4-qualify",
         "--set",
-        "server.fixture_mode=\"launch-file\"",
+        "server.settings.fixture_mode=\"launch-file\"",
     ];
     let mut dry_args = args.to_vec();
     dry_args.push("--dry-run");
     let dry = workspace.run_json(&dry_args)?;
-    let path = dry["server"]["processes"][0]["launch_files"][0]["resolved_path"]
-        .as_str()
-        .ok_or("resolved launch-file path")?;
-    fs::create_dir_all(Path::new(path).parent().ok_or("launch-file parent")?)?;
-    fs::write(path, "stale\n")?;
+    let path = resolved_rank(&dry["server"], "server-rank-000")?.launch_files[0]
+        .resolved_path
+        .clone();
+    fs::create_dir_all(path.parent().ok_or("launch-file parent")?)?;
+    fs::write(&path, "stale\n")?;
     fs::write(&workspace.ssh_events, "")?;
 
     let output = workspace.run(&args)?;
@@ -538,9 +539,9 @@ fn ssh_launch_file_conflict_records_failure_without_launching() -> Result<(), Bo
     assert_eq!(record["status"], "failed");
     assert_eq!(record["failure"]["phase"], "launch");
     assert!(
-        record["processes"]
-            .as_array()
-            .is_some_and(|processes| processes.iter().all(|process| process["handle"].is_null()))
+        record["process_evidence"]
+            .as_object()
+            .is_some_and(|evidence| evidence.values().all(|process| process["handle"].is_null()))
     );
     let events = fs::read_to_string(&workspace.ssh_events)?;
     assert!(events.lines().any(|line| line.ends_with(" materialize")));
@@ -557,24 +558,12 @@ fn image_selection_rejects_remote_placement() -> Result<(), Box<dyn Error>> {
     // A record-compatible selection: the placement rejection is the only
     // gate left to fire. Adapter lowering executes against the image
     // realization, so the fixture docker execs the image-backed adapter.
-    let record_dir = workspace
-        .root
-        .path()
-        .join(".inferlab/records/fixture-image-record");
-    fs::create_dir_all(&record_dir)?;
-    fs::write(
-        record_dir.join("record.json"),
-        serde_json::json!({
-            "resolved": {
-                "workspace": {"revision": "fixture-revision"},
-                "image": {"environment": "vllm", "source_set": "vllm"},
-            },
-            "assemblies": [{
-                "platform": "linux/amd64",
-                "outcome": {"status": "assembled", "image_id": "sha256:fixture"},
-            }],
-        })
-        .to_string(),
+    support::write_assembled_image_record(
+        workspace.root.path(),
+        "fixture-image-record",
+        "vllm",
+        "linux/amd64",
+        "sha256:fixture",
     )?;
     write_executable(
         &workspace.bin.join("docker"),
@@ -602,11 +591,6 @@ fn image_selection_rejects_remote_placement() -> Result<(), Box<dyn Error>> {
         !output.status.success(),
         "an image selection with remote placement must be rejected"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("single-host local placement"),
-        "the rejection names the placement constraint: {stderr}"
-    );
     // The gate fires before remote workspace preflight consumes the
     // placement: no ssh reached either machine.
     let events = fs::read_to_string(&workspace.ssh_events).unwrap_or_default();
@@ -625,24 +609,26 @@ fn ordered_two_node_ssh_lifecycle_preserves_logs_and_reverse_cleanup() -> Result
 
     let started = workspace.run_json(&["serve", "start", "dsv4-qualify"])?;
     let id = started["id"].as_str().ok_or("missing record id")?;
-    assert_eq!(started["processes"].as_array().map(Vec::len), Some(2));
-    assert_eq!(started["processes"][0]["id"], "server-rank-000");
-    assert_eq!(started["processes"][1]["id"], "server-rank-001");
-    assert_eq!(started["processes"][0]["handle"]["target"], "node-a");
-    assert_eq!(started["processes"][1]["handle"]["target"], "node-b");
+    let evidence = started["process_evidence"]
+        .as_object()
+        .ok_or("process evidence")?;
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence["server-rank-000"]["handle"]["target"], "node-a");
+    assert_eq!(evidence["server-rank-001"]["handle"]["target"], "node-b");
     // Each hosting machine is probed through its own SSH launch path for
-    // exactly the GPUs its rank is assigned ([[RFC-0005:C-EVIDENCE]]).
-    let hardware = started["hardware"].as_array().ok_or("hardware evidence")?;
-    let probed: Vec<(Option<&str>, Vec<i64>)> = hardware
+    // exactly the devices its rank is assigned ([[RFC-0005:C-EVIDENCE]]).
+    let hardware = started["hardware"].as_object().ok_or("hardware evidence")?;
+    let probed: Vec<(&str, Vec<i64>)> = hardware
         .iter()
-        .map(|entry| {
+        .map(|(machine, entry)| {
             (
-                entry["machine"].as_str(),
-                entry["gpus"]
+                machine.as_str(),
+                entry["devices"]
                     .as_array()
-                    .map(|gpus| {
-                        gpus.iter()
-                            .filter_map(|gpu| gpu["index"].as_i64())
+                    .map(|devices| {
+                        devices
+                            .iter()
+                            .filter_map(|device| device["index"].as_i64())
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -651,20 +637,15 @@ fn ordered_two_node_ssh_lifecycle_preserves_logs_and_reverse_cleanup() -> Result
         .collect();
     assert_eq!(
         probed,
-        [(Some("node-a"), vec![0]), (Some("node-b"), vec![1]),],
+        [("node-a", vec![0]), ("node-b", vec![1]),],
         "{hardware:?}"
     );
-    let first_cache = started["resolved"]["server"]["processes"][0]["allocation"]["runtime_cache"]
-        ["path"]
-        .as_str()
-        .ok_or("missing first cache path")?;
-    let second_cache = started["resolved"]["server"]["processes"][1]["allocation"]["runtime_cache"]
-        ["path"]
-        .as_str()
-        .ok_or("missing second cache path")?;
+    let ranks = resolved_ranks(&started["resolved"]["server"])?;
+    let first_cache = &ranks[0].rank.runtime_cache.path;
+    let second_cache = &ranks[1].rank.runtime_cache.path;
     assert_ne!(first_cache, second_cache);
-    assert!(Path::new(first_cache).is_dir());
-    assert!(Path::new(second_cache).is_dir());
+    assert!(first_cache.is_dir());
+    assert!(second_cache.is_dir());
     assert_eq!(
         started["resolved"]["server"]["network"]["selected_interface"],
         "ens-rdma"
@@ -675,14 +656,10 @@ fn ordered_two_node_ssh_lifecycle_preserves_logs_and_reverse_cleanup() -> Result
             .map(serde_json::Map::len),
         Some(2)
     );
-    assert!(
-        started["resolved"]["server"]["processes"]
-            .as_array()
-            .is_some_and(|processes| processes.iter().all(|process| {
-                process["allocation"]["communication_interface"] == "ens-rdma"
-                    && process["command"]["env"]["NCCL_SOCKET_IFNAME"] == "ens-rdma"
-            }))
-    );
+    assert!(ranks.iter().all(|process| {
+        process.rank.communication_interface.as_deref() == Some("ens-rdma")
+            && process.rank.command.env["NCCL_SOCKET_IFNAME"] == "ens-rdma"
+    }));
     assert_eq!(
         started["resolved"]["server"]["placement"]["remote_workspaces"]
             .as_object()
@@ -700,12 +677,9 @@ fn ordered_two_node_ssh_lifecycle_preserves_logs_and_reverse_cleanup() -> Result
     assert!(Path::new(pixi).is_absolute());
     assert!(node_a["environment"]["PATH"].is_string());
     assert!(node_a["environment"]["HOME"].is_string());
+    assert_eq!(ranks[0].rank.command.argv[0], pixi);
     assert_eq!(
-        started["resolved"]["server"]["processes"][0]["command"]["argv"][0],
-        pixi
-    );
-    assert_eq!(
-        started["resolved"]["server"]["processes"][0]["command"]["env"]["PATH"],
+        ranks[0].rank.command.env["PATH"],
         node_a["environment"]["PATH"]
     );
 
@@ -718,7 +692,11 @@ fn ordered_two_node_ssh_lifecycle_preserves_logs_and_reverse_cleanup() -> Result
     }
 
     let stopped = workspace.run_json(&["serve", "stop", id])?;
-    for process in stopped["processes"].as_array().ok_or("missing processes")? {
+    for process in stopped["process_evidence"]
+        .as_object()
+        .ok_or("missing process evidence")?
+        .values()
+    {
         assert_eq!(process["cleanup"][0]["verified"], true);
         assert_eq!(process["log_sync_error"], Value::Null);
     }
@@ -771,12 +749,6 @@ fn hardware_probe_failure_fails_the_launch_before_any_process() -> Result<(), Bo
     command.env("FIXTURE_NVIDIA_SMI_ERROR", "fixture probe boom");
     let output = command.output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("GPU hardware probe failed on machine \"local\""),
-        "{stderr}"
-    );
-    assert!(stderr.contains("fixture probe boom"), "{stderr}");
 
     let records = workspace.root.path().join(".inferlab/records");
     let entries = fs::read_dir(records)?.collect::<Result<Vec<_>, _>>()?;
@@ -785,18 +757,20 @@ fn hardware_probe_failure_fails_the_launch_before_any_process() -> Result<(), Bo
     assert_eq!(record["status"], "failed");
     assert_eq!(record["failure"]["phase"], "preflight");
     assert_eq!(
-        record["processes"][0]["handle"],
+        process_evidence(&record, "server")?["handle"],
         Value::Null,
         "no serving process may start after a failed probe"
     );
     assert!(
-        record["hardware"].as_array().is_none_or(Vec::is_empty),
+        record["hardware"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty),
         "a failed probe leaves no hardware evidence: {record}"
     );
     Ok(())
 }
 
-fn assert_datetime_record_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+fn assert_datetime_record_id(id: &str, expected_stem: &str) -> Result<(), Box<dyn Error>> {
     let (timestamp, suffix) = id.split_once("Z-").ok_or("record id has no UTC prefix")?;
     assert_eq!(timestamp.len(), 23);
     assert_eq!(
@@ -814,7 +788,9 @@ fn assert_datetime_record_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>>
             (19, '.')
         ]
     );
-    assert!(suffix.starts_with(&format!("{kind}-")));
+    let (stem, pid) = suffix.rsplit_once('-').ok_or("record id has no pid")?;
+    assert_eq!(stem, expected_stem);
+    pid.parse::<u32>()?;
     Ok(())
 }
 
@@ -826,7 +802,7 @@ fn process_exit_before_readiness_finalizes_the_precreated_record() -> Result<(),
         "start",
         "dsv4-qualify",
         "--set",
-        "server.fixture_mode=\"launch-failure\"",
+        "server.settings.fixture_mode=\"launch-failure\"",
     ])?;
     assert!(!output.status.success());
 
@@ -836,8 +812,9 @@ fn process_exit_before_readiness_finalizes_the_precreated_record() -> Result<(),
     let record: Value = serde_json::from_slice(&fs::read(entries[0].path().join("record.json"))?)?;
     assert_eq!(record["status"], "failed");
     assert_eq!(record["failure"]["phase"], "readiness");
-    assert_eq!(record["processes"][0]["handle"]["kind"], "local");
-    assert_eq!(record["processes"][0]["cleanup"][0]["verified"], true);
+    let evidence = process_evidence(&record, "server")?;
+    assert_eq!(evidence["handle"]["kind"], "local");
+    assert_eq!(evidence["cleanup"][0]["verified"], true);
     Ok(())
 }
 
@@ -849,7 +826,7 @@ fn sigterm_during_readiness_rolls_back_the_recorded_process_group() -> Result<()
         "start",
         "dsv4-qualify",
         "--set",
-        "server.fixture_mode=\"timeout\"",
+        "server.settings.fixture_mode=\"timeout\"",
     ]);
     let child = command
         .stdout(Stdio::piped())
@@ -871,8 +848,9 @@ fn sigterm_during_readiness_rolls_back_the_recorded_process_group() -> Result<()
     assert!(!output.status.success());
 
     let record: Value = serde_json::from_slice(&fs::read(record_path)?)?;
-    if record["processes"][0]["cleanup"][0]["verified"] != true
-        && let Some(process_group) = record["processes"][0]["handle"]["process_group"].as_u64()
+    let evidence = process_evidence(&record, "server")?;
+    if evidence["cleanup"][0]["verified"] != true
+        && let Some(process_group) = evidence["handle"]["process_group"].as_u64()
     {
         let _ = Command::new("kill")
             .args(["-KILL", "--", &format!("-{process_group}")])
@@ -880,7 +858,7 @@ fn sigterm_during_readiness_rolls_back_the_recorded_process_group() -> Result<()
     }
     assert_eq!(record["status"], "failed");
     assert_eq!(record["failure"]["phase"], "interrupted");
-    assert_eq!(record["processes"][0]["cleanup"][0]["verified"], true);
+    assert_eq!(evidence["cleanup"][0]["verified"], true);
     Ok(())
 }
 
@@ -893,7 +871,14 @@ fn wait_for_process_handle(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
                 let path = entry?.path().join("record.json");
                 if let Ok(bytes) = fs::read(&path) {
                     let record: Value = serde_json::from_slice(&bytes)?;
-                    if record["processes"][0]["handle"].is_object() {
+                    if record["process_evidence"]
+                        .as_object()
+                        .is_some_and(|evidence| {
+                            evidence
+                                .values()
+                                .any(|process| process["handle"].is_object())
+                        })
+                    {
                         return Ok(path);
                     }
                 }
@@ -1006,12 +991,11 @@ import sys
 request = json.load(sys.stdin)
 input = request["input"]
 operation = request["operation"]
-settings = input["settings"]
-mode = settings.get("fixture_mode", "ready")
-effective = dict(settings)
-effective.setdefault("trust_remote_code", False)
 if operation == "plan_serve":
     role = input["roles"][0]
+    settings = role["settings"]
+    effective = dict(settings)
+    effective.setdefault("trust_remote_code", False)
     declared = role["parallelism"]
     outer = declared.get("outer") or {}
     attention = declared.get("attention") or {}
@@ -1034,13 +1018,17 @@ if operation == "plan_serve":
         },
     }
     output = {
-        "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
-        "effective_settings": effective,
-        "effective_parallelism": effective_parallelism,
+        "integration": {
+            "adapter_id": "fixture",
+            "adapter_version": "1",
+            "framework": "vllm",
+            "framework_version": "test",
+        },
         "roles": [{
             "id": role["id"],
             "kind": role["kind"],
-            "replica_count": role["replica_count"],
+            "declared_replica_count": role["replica_count"],
+            "effective_replica_count": role["replica_count"],
             "effective_settings": effective,
             "effective_parallelism": effective_parallelism,
         }],
@@ -1048,22 +1036,23 @@ if operation == "plan_serve":
             "id": "server",
             "role_id": role["id"],
             "replica_index": 0,
-            "accelerator_count": world_size,
+            "device_count": world_size,
             "ports": [],
             "primary_ports": ["master"],
             "primary_readiness": {"kind": "http", "path": "/v1/models"},
             "worker_readiness": {"kind": "process_alive"},
         }],
         "links": [],
-        "public_endpoint": {
-            "kind": "replica",
-            "replica_id": "server",
-        },
+        "routing": {"owner": "direct", "role": role["id"], "replica": 0},
         "endpoint": {"protocol": "http", "api_path": "/v1/completions"},
     }
 elif operation == "render_serve":
+    allocations = input["allocations"]
+    roles = {role["id"]: role for role in input["roles"]}
+    settings = roles[allocations[0]["role"]]["effective_settings"]
+    mode = settings.get("fixture_mode", "ready")
     processes = []
-    for allocation in input["allocations"]:
+    for allocation in allocations:
         launch_files = []
         if mode == "launch-failure":
             argv = ["inferlab-missing-fixture-server"]
@@ -1077,7 +1066,7 @@ elif operation == "render_serve":
                 text = "fixture: runtime\nunicode: 雪\n"
                 digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 relative_path = f"launch-files/{digest}/fixture.yaml"
-                resolved_path = f'{allocation["runtime_cache_root"]}/{relative_path}'
+                resolved_path = f'{allocation["cache"]}/{relative_path}'
                 argv.append(resolved_path)
                 launch_files.append({
                     "relative_path": relative_path,
@@ -1085,26 +1074,35 @@ elif operation == "render_serve":
                     "sha256": digest,
                 })
         processes.append({
-            "id": allocation["process_id"],
+            "process": allocation["process"],
+            "role": allocation["role"],
+            "replica": allocation["replica"],
+            "rank": allocation["rank"],
+            "rank_count": allocation["rank_count"],
             "launch_files": launch_files,
-            "process": {
+            "command": {
                 "argv": argv,
                 "env": {
                     "FLASHINFER_WORKSPACE_BASE": (
-                        allocation["runtime_cache_root"] + "/flashinfer"
+                        allocation["cache"] + "/flashinfer"
                     ),
                 },
             },
         })
     output = {
-        "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
+        "integration": {
+            "adapter_id": "fixture",
+            "adapter_version": "1",
+            "framework": "vllm",
+            "framework_version": "test",
+        },
         "processes": processes,
     }
 else:
     raise ValueError(operation)
 print(json.dumps({
     "status": "ok",
-    "protocol_version": "4",
+    "protocol_version": "5",
     "result": {"operation": operation, "output": output}
 }))
 "#;

@@ -16,7 +16,7 @@ use crate::InferlabError;
 use crate::adapter::AdapterClient;
 use crate::resolve::{LaunchPlan, ResolveRequest, Workflow, resolve};
 use crate::workspace::{BuilderKind, LoadedWorkspace, WorkspaceSnapshot};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -25,16 +25,19 @@ use tool::BuilderTool;
 pub struct ImageBuildRequest<'a> {
     pub image: &'a str,
     pub builder: Option<&'a str>,
+    pub placement: Option<&'a str>,
     pub export: Option<&'a Path>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResolvedImageBuild {
     pub workspace: WorkspaceSnapshot,
     pub image: ImagePlan,
     pub builder: BuilderPlan,
     pub assemblies: Vec<AssemblyPlan>,
     pub validations: Vec<ValidationPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
     /// Declared target platforms the selected builder cannot produce,
     /// excluded from the plan before any closure is derived
     /// ([[RFC-0007:C-IMAGE-BUILD]]); reported, never planned or failed.
@@ -47,42 +50,41 @@ pub struct ResolvedImageBuild {
     pub export: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SkippedPlatform {
     pub platform: String,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResolutionObservation {
     pub fact: String,
     pub argv: Vec<String>,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImagePlan {
     pub id: String,
-    pub environment: String,
+    pub stack: String,
     pub pixi_environment: String,
-    pub source_set: String,
     pub source_paths: Vec<PathBuf>,
-    /// The source-set paths built into wheels for the image.
+    /// The stack source paths built into wheels for the image.
     pub wheel_sources: Vec<PathBuf>,
     pub base_image: String,
     /// Declared environment checks resolved to content identities
     /// ([[RFC-0002:C-ENVIRONMENT-CHECKS]]): executed against the local
     /// workspace realization before any package build, and inside image
     /// assembly through the entrypoint.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<crate::environment::PlannedEnvironmentCheck>,
     /// Declared image-realization postprocess steps, executed inside image
     /// assembly before the checks.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_postprocess: Vec<crate::environment::PlannedEnvironmentScript>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BuilderPlan {
     pub name: String,
     pub kind: BuilderKind,
@@ -91,7 +93,7 @@ pub struct BuilderPlan {
 
 /// One deduplicated image assembly: every requested (platform, coordinate)
 /// pair with the same closure digest and platform consumes this single result.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AssemblyPlan {
     pub platform: String,
     pub base_image_digest: String,
@@ -102,17 +104,18 @@ pub struct AssemblyPlan {
 }
 
 /// One requested (platform, validation coordinate) pair.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ValidationPlan {
     pub recipe: String,
-    pub case: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_case: Option<String>,
     pub model: String,
     pub platform: String,
     pub closure_digest: String,
     pub eligibility: EligibilityPlan,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum EligibilityPlan {
     Eligible,
@@ -128,6 +131,8 @@ pub struct ImageDryRunPlan<'a> {
     pub builder: &'a BuilderPlan,
     pub assemblies: &'a [AssemblyPlan],
     pub validations: &'a [ValidationPlan],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: &'a Option<String>,
     pub skipped_platforms: &'a [SkippedPlatform],
     pub observations: &'a [ResolutionObservation],
 }
@@ -142,6 +147,7 @@ impl ResolvedImageBuild {
             builder: &self.builder,
             assemblies: &self.assemblies,
             validations: &self.validations,
+            placement: &self.placement,
             skipped_platforms: &self.skipped_platforms,
             observations: &self.observations,
         }
@@ -180,20 +186,18 @@ pub fn resolve_image<T: BuilderTool, C: AdapterClient>(
         host_platform: host_platform.value,
     };
 
-    let environment = &workspace.config.environments[&definition.environment];
-    let source_set = &workspace.config.source_sets[&definition.source_set];
+    let stack = &workspace.config.stacks[&definition.stack];
     let (checks, image_postprocess) =
-        crate::environment::plan_environment_checks(&workspace.root, environment)?;
+        crate::environment::plan_environment_checks(&workspace.root, stack)?;
     let image = ImagePlan {
         id: request.image.to_owned(),
-        environment: definition.environment.clone(),
-        pixi_environment: environment.pixi_environment.clone(),
-        source_set: definition.source_set.clone(),
-        source_paths: source_set.paths.clone(),
+        stack: definition.stack.clone(),
+        pixi_environment: stack.pixi_environment.clone(),
+        source_paths: stack.source_paths.clone(),
         wheel_sources: definition
             .packages
             .clone()
-            .unwrap_or_else(|| source_set.paths.clone()),
+            .unwrap_or_else(|| stack.source_paths.clone()),
         base_image: definition.base_image.clone(),
         checks,
         image_postprocess,
@@ -269,23 +273,36 @@ pub fn resolve_image<T: BuilderTool, C: AdapterClient>(
     }
 
     let mut validations = Vec::new();
+    let mut selected_placement = request.placement.map(str::to_owned);
     for platform in &producible {
         for coordinate in &definition.validations {
             let recipe = &workspace.config.recipes[&coordinate.recipe];
-            let case = coordinate
-                .case
-                .clone()
-                .or_else(|| recipe.cases.first().map(|case| case.id.clone()))
-                .ok_or_else(|| InferlabError::InvalidConfig {
-                    message: format!("recipe {:?} declares no cases", coordinate.recipe),
-                })?;
+            let server = &workspace.config.servers[&recipe.server];
             let assembly_index = assembly_for_platform(&assemblies, platform)?;
-            let eligibility = classify_eligibility(workspace, &coordinate.recipe, &case, adapter);
+            let (server_case, placement, eligibility) = classify_eligibility(
+                workspace,
+                &coordinate.recipe,
+                coordinate.server_case.as_deref(),
+                request.placement,
+                adapter,
+            );
+            if let Some(placement) = placement {
+                if let Some(selected) = &selected_placement
+                    && selected != &placement
+                {
+                    return Err(InferlabError::InvalidConfig {
+                        message: format!(
+                            "image validations resolved different placements {selected:?} and {placement:?}"
+                        ),
+                    });
+                }
+                selected_placement = Some(placement);
+            }
             let index = validations.len();
             validations.push(ValidationPlan {
                 recipe: coordinate.recipe.clone(),
-                case,
-                model: recipe.model.clone(),
+                server_case,
+                model: server.model.clone(),
                 platform: platform.clone(),
                 closure_digest: assemblies[assembly_index].closure_digest.clone(),
                 eligibility,
@@ -300,6 +317,7 @@ pub fn resolve_image<T: BuilderTool, C: AdapterClient>(
         builder,
         assemblies,
         validations,
+        placement: selected_placement,
         skipped_platforms,
         observations,
         export: request.export.map(Path::to_path_buf),
@@ -369,8 +387,9 @@ fn content_closure(
         entrypoint_contract.to_owned(),
     );
     closure.insert("source_revision".to_owned(), snapshot.revision.clone());
+    closure.insert("stack".to_owned(), image.stack.clone());
     closure.insert(
-        "source_set".to_owned(),
+        "stack_source_paths".to_owned(),
         image
             .source_paths
             .iter()
@@ -436,7 +455,7 @@ fn assembly_for_platform(
 }
 
 /// Deterministic eligibility ([[RFC-0007:C-IMAGE-BUILD]]): a coordinate is
-/// eligible iff its recipe case resolves to single-host local placement with
+/// eligible iff its recipe and selected server case resolve to single-host local placement with
 /// locally bound model weights. Platform feasibility is already settled by
 /// resolution's builder scoping, so every planned platform matches the
 /// builder host. Resolution itself is the placement authority: the same
@@ -446,15 +465,17 @@ fn assembly_for_platform(
 fn classify_eligibility<C: AdapterClient>(
     workspace: &LoadedWorkspace,
     recipe: &str,
-    case: &str,
+    server_case: Option<&str>,
+    placement: Option<&str>,
     adapter: &C,
-) -> EligibilityPlan {
+) -> (Option<String>, Option<String>, EligibilityPlan) {
     let resolved = match resolve(
         workspace,
         &ResolveRequest {
             workflow: Workflow::RecipeRun,
-            recipe,
-            case: Some(case),
+            target: crate::resolve::ExecutionTarget::Recipe(recipe),
+            case: server_case,
+            placement,
             overrides: &[],
             captures: &[],
             image: None,
@@ -464,21 +485,30 @@ fn classify_eligibility<C: AdapterClient>(
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
-            return EligibilityPlan::Ineligible {
-                reason: format!("validation coordinate does not resolve: {error}"),
-            };
+            return (
+                server_case.map(str::to_owned),
+                placement.map(str::to_owned),
+                EligibilityPlan::Ineligible {
+                    reason: format!("validation coordinate does not resolve: {error}"),
+                },
+            );
         }
     };
-    match single_host_local(&resolved.server.processes) {
+    let selected_case = resolved.server.case.as_ref().map(|case| case.id.clone());
+    let selected_placement = Some(resolved.server.placement.id.clone());
+    let eligibility = match single_host_local(resolved.server.processes()) {
         Ok(()) => EligibilityPlan::Eligible,
         Err(reason) => EligibilityPlan::Ineligible { reason },
-    }
+    };
+    (selected_case, selected_placement, eligibility)
 }
 
 /// The containerized substitution requires every server process on one local
 /// machine — image validation eligibility and image-backed launches share
 /// this gate.
-pub(crate) fn single_host_local(processes: &[crate::resolve::ProcessPlan]) -> Result<(), String> {
+pub(crate) fn single_host_local<'a>(
+    processes: impl IntoIterator<Item = &'a crate::resolve::ProcessPlan>,
+) -> Result<(), String> {
     let mut machines = BTreeSet::new();
     for process in processes {
         if !matches!(process.launch, LaunchPlan::Local) {

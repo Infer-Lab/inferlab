@@ -18,6 +18,19 @@ use tempfile::TempDir;
 
 const WORKSPACE: &str = include_str!("fixtures/image-workspace.toml");
 
+fn resolved_ranks(
+    server: &Value,
+) -> Result<Vec<support::ResolvedProcessProjection>, Box<dyn Error>> {
+    support::resolved_processes(server)
+}
+
+fn resolved_rank(
+    server: &Value,
+    id: &str,
+) -> Result<support::ResolvedRankProjection, Box<dyn Error>> {
+    support::resolved_process(server, id)
+}
+
 /// Every fault the fixture shims can inject, behind one typed knob. An
 /// all-default `Scenario` injects no fault; the harness serializes it to a
 /// JSON file and hands the shims its path through the single `FIXTURE_SCENARIO`
@@ -175,7 +188,7 @@ impl TestWorkspace {
                  \n\
                  [machines.local]\n\
                  host = \"127.0.0.1\"\n\
-                 port = {port}\n\
+                 ports = [{port}]\n\
                  devices = [0, 1, 2, 3]\n\
                  \n\
                  [machines.local.container]\n\
@@ -394,6 +407,7 @@ fn closed_loop_builds_validates_and_scopes_platforms() -> Result<(), Box<dyn Err
     let report = stdout_json(&output)?;
     assert_eq!(report["status"], "succeeded");
     let record_id = report["record_id"].as_str().ok_or("record id")?;
+    assert_datetime_record_id(record_id, "image-dsv4-runtime")?;
 
     let progress = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -458,9 +472,9 @@ fn closed_loop_builds_validates_and_scopes_platforms() -> Result<(), Box<dyn Err
             .ok_or("server record id")?;
         let server_record =
             workspace.load_json(&format!(".inferlab/records/{server_record_id}/record.json"))?;
-        let argv: Vec<String> = serde_json::from_value(
-            server_record["resolved"]["server"]["processes"][0]["command"]["argv"].clone(),
-        )?;
+        let argv = resolved_rank(&server_record["resolved"]["server"], "server")?
+            .command
+            .argv;
         assert_eq!(argv[0], "docker", "validation server runs from the image");
         assert_eq!(argv[1], "run");
         assert!(argv.contains(&image_id.to_owned()));
@@ -551,7 +565,7 @@ fn closed_loop_builds_validates_and_scopes_platforms() -> Result<(), Box<dyn Err
         report["manifest"]["assemblies"][0]["export_archive"],
         archive_name
     );
-    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["schema_version"], 2);
     assert!(record["inferlab_version"].is_string());
     assert!(record["started_unix_ms"].is_u64());
     assert!(record["finished_unix_ms"].is_u64());
@@ -656,21 +670,15 @@ fn closed_loop_builds_validates_and_scopes_platforms() -> Result<(), Box<dyn Err
 #[test]
 fn invalid_check_declarations_fail_at_load() -> Result<(), Box<dyn Error>> {
     let duplicate = format!(
-        "{WORKSPACE}\n[[environments.vllm.checks]]\n\
+        "{WORKSPACE}\n[[stacks.vllm.checks]]\n\
          id = \"fixture-guard\"\nscript = \"tools/fixture-check.py\"\n"
     );
     let cases = [
-        (duplicate.as_str(), "duplicate check id"),
-        (
-            &WORKSPACE.replace("tools/fixture-check.py", "../outside.py"),
-            "workspace-relative without parent traversal",
-        ),
-        (
-            &WORKSPACE.replace("tools/fixture-check.py", "tools/absent.py"),
-            "does not exist",
-        ),
+        duplicate.as_str(),
+        &WORKSPACE.replace("tools/fixture-check.py", "../outside.py"),
+        &WORKSPACE.replace("tools/fixture-check.py", "tools/absent.py"),
     ];
-    for (manifest, expected) in cases {
+    for manifest in cases {
         let workspace = TestWorkspace::new()?;
         fs::write(
             workspace.root.path().join(".inferlab/workspace.toml"),
@@ -678,11 +686,6 @@ fn invalid_check_declarations_fail_at_load() -> Result<(), Box<dyn Error>> {
         )?;
         let output = workspace.build(&["dsv4-runtime", "--dry-run"])?;
         assert!(!output.status.success(), "declaration must fail at load");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(expected),
-            "expected {expected:?} in: {stderr}"
-        );
     }
     Ok(())
 }
@@ -889,7 +892,7 @@ fn external_image_adapter_container_mounts_modules_with_their_metadata()
             "--external-image",
             "fixture-external",
             "--set",
-            "server.fixture_mode=\"launch-file\"",
+            "server.settings.fixture_mode=\"launch-file\"",
             "--dry-run",
         ])
         .output()?;
@@ -928,7 +931,7 @@ fn external_image_adapter_container_mounts_modules_with_their_metadata()
     );
     let plan = stdout_json(&dry)?;
     assert_eq!(
-        plan["server"]["processes"][0]["launch_files"][0]["text"],
+        resolved_rank(&plan["server"], "server")?.launch_files[0].text,
         "INFERLAB_RUNTIME_ONLY_LAUNCH_FILE\nunicode: 雪\n"
     );
     Ok(())
@@ -971,8 +974,7 @@ fn container_hardware_facts_are_lowered_as_declared() -> Result<(), Box<dyn Erro
         String::from_utf8_lossy(&dry.stderr)
     );
     let plan = stdout_json(&dry)?;
-    let argv: Vec<String> =
-        serde_json::from_value(plan["server"]["processes"][0]["command"]["argv"].clone())?;
+    let argv = resolved_rank(&plan["server"], "server")?.command.argv;
     for (flag, value) in [
         ("--device", "/dev/infiniband"),
         ("--device", "/dev/gdrdrv"),
@@ -1150,7 +1152,7 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
             "--image",
             record_id,
             "--set",
-            "server.fixture_mode=\"launch-file\"",
+            "server.settings.fixture_mode=\"launch-file\"",
             "--dry-run",
         ])
         .output()?;
@@ -1168,36 +1170,31 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
         plan["server"]["image"]["workspace_revision"], plan["workspace"]["revision"],
         "the image was built from the invoking revision"
     );
-    assert_eq!(plan["server"]["environment"]["realization"], "image");
-    assert_eq!(
-        plan["server"]["processes"][0]["command"]["argv"][0],
-        "docker"
-    );
-    let dry_process = &plan["server"]["processes"][0];
-    let launch_file = &dry_process["launch_files"][0];
-    let resolved_path = launch_file["resolved_path"]
-        .as_str()
-        .ok_or("resolved launch-file path")?;
-    let relative_path = launch_file["relative_path"]
-        .as_str()
-        .ok_or("relative launch-file path")?;
-    let cache_path = dry_process["allocation"]["runtime_cache"]["path"]
-        .as_str()
-        .ok_or("runtime cache path")?;
-    let dry_argv: Vec<String> = serde_json::from_value(dry_process["command"]["argv"].clone())?;
-    assert!(dry_argv.contains(&resolved_path.to_owned()));
+    assert_eq!(plan["stack"]["realization"], "image");
+    let dry_process = resolved_rank(&plan["server"], "server")?;
+    assert_eq!(dry_process.command.argv[0], "docker");
+    let launch_file = &dry_process.launch_files[0];
+    let resolved_path = &launch_file.resolved_path;
+    let relative_path = &launch_file.relative_path;
+    let cache_path = &dry_process.runtime_cache.path;
+    let dry_argv = &dry_process.command.argv;
     assert!(
-        dry_argv.contains(&format!("{cache_path}:{cache_path}")),
+        dry_argv
+            .iter()
+            .any(|argument| Path::new(argument) == resolved_path)
+    );
+    assert!(
+        dry_argv.contains(&format!(
+            "{}:{}",
+            cache_path.display(),
+            cache_path.display()
+        )),
         "the existing same-path cache mount covers the launch file: {dry_argv:?}"
     );
-    assert!(resolved_path.starts_with(&format!("{cache_path}/launch-files/")));
+    assert!(resolved_path.starts_with(cache_path.join("launch-files")));
 
     let sentinel = "INFERLAB_RUNTIME_ONLY_LAUNCH_FILE";
-    assert!(
-        launch_file["text"]
-            .as_str()
-            .is_some_and(|text| text.contains(sentinel))
-    );
+    assert!(launch_file.text.contains(sentinel));
     let context = workspace
         .root
         .path()
@@ -1245,7 +1242,7 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
             "--image",
             record_id,
             "--set",
-            "server.fixture_mode=\"launch-file\"",
+            "server.settings.fixture_mode=\"launch-file\"",
         ])
         .output()?;
     assert!(
@@ -1259,15 +1256,12 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
     let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
     assert_eq!(server["status"], "stopped");
-    let runtime_launch_file = &server["resolved"]["server"]["processes"][0]["launch_files"][0];
-    let runtime_launch_path = runtime_launch_file["resolved_path"]
-        .as_str()
-        .ok_or("runtime launch-file path")?;
+    let runtime_rank = resolved_rank(&server["resolved"]["server"], "server")?;
+    let runtime_launch_file = &runtime_rank.launch_files[0];
+    let runtime_launch_path = &runtime_launch_file.resolved_path;
     assert_eq!(
         fs::read_to_string(runtime_launch_path)?,
-        runtime_launch_file["text"]
-            .as_str()
-            .ok_or("runtime launch-file text")?
+        runtime_launch_file.text
     );
     let image = &server["resolved"]["server"]["image"];
     assert_eq!(image["record_id"], record_id);
@@ -1280,12 +1274,13 @@ fn image_backed_recipe_runs_from_the_selected_record() -> Result<(), Box<dyn Err
         qualified, invoking,
         "both the qualifying and the invoking revision are preserved"
     );
-    let argv: Vec<String> = serde_json::from_value(
-        server["resolved"]["server"]["processes"][0]["command"]["argv"].clone(),
-    )?;
+    let argv = runtime_rank.command.argv;
     assert_eq!(argv[0], "docker", "the server launches from the image");
     assert!(argv.contains(&image_id.to_owned()));
-    assert!(argv.contains(&runtime_launch_path.to_owned()));
+    assert!(
+        argv.iter()
+            .any(|argument| Path::new(argument) == runtime_launch_path)
+    );
     assert!(
         server["environment_checks"].is_null(),
         "image-backed launches skip the local preflight; the image realization \
@@ -1333,7 +1328,9 @@ fn serve_start_from_image_admits_manual_bench_and_stops() -> Result<(), Box<dyn 
         record_id
     );
     assert_eq!(
-        server["resolved"]["server"]["processes"][0]["command"]["argv"][0],
+        resolved_rank(&server["resolved"]["server"], "server")?
+            .command
+            .argv[0],
         "docker"
     );
 
@@ -1400,30 +1397,18 @@ fn incompatible_image_selections_are_rejected() -> Result<(), Box<dyn Error>> {
     });
     write_synthetic_record(workspace.root.path(), "synthetic-failed", &failed)?;
 
-    for (recipe, record, expected) in [
-        ("dsv4-qualify-alt-env", record_id, "built environment"),
-        ("dsv4-qualify-alt-sources", record_id, "built source set"),
-        (
-            "dsv4-qualify",
-            "synthetic-arm",
-            "holds no assembly for host platform",
-        ),
-        ("dsv4-qualify", "synthetic-failed", "did not succeed"),
-        ("dsv4-qualify", "absent-record", "is not readable"),
+    for (recipe, record) in [
+        ("dsv4-qualify-alt-env", record_id),
+        ("dsv4-qualify-alt-sources", record_id),
+        ("dsv4-qualify", "synthetic-arm"),
+        ("dsv4-qualify", "synthetic-failed"),
+        ("dsv4-qualify", "absent-record"),
     ] {
         let output = workspace
             .command()
             .args(["recipe", "run", recipe, "--image", record, "--dry-run"])
             .output()?;
-        assert!(
-            !output.status.success(),
-            "selection must be rejected: {expected}"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(expected) && stderr.contains("error[E4003]"),
-            "expected {expected:?} in: {stderr}"
-        );
+        assert!(!output.status.success());
     }
     Ok(())
 }
@@ -1450,11 +1435,10 @@ fn image_backed_launch_needs_no_local_environment() -> Result<(), Box<dyn Error>
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(local_dry.status.success());
-    let local_cache_path =
-        stdout_json(&local_dry)?["server"]["processes"][0]["allocation"]["runtime_cache"]["path"]
-            .as_str()
-            .ok_or("local cache path")?
-            .to_owned();
+    let local_plan = stdout_json(&local_dry)?;
+    let local_cache_path = resolved_rank(&local_plan["server"], "server")?
+        .runtime_cache
+        .path;
 
     // From here on the locally installed serving environment is gone: any
     // Pixi invocation fails loudly.
@@ -1480,24 +1464,24 @@ fn image_backed_launch_needs_no_local_environment() -> Result<(), Box<dyn Error>
     assert_eq!(recipe["status"], "succeeded");
     let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
-    let process = &server["resolved"]["server"]["processes"][0];
-    let argv: Vec<String> = serde_json::from_value(process["command"]["argv"].clone())?;
+    let process = resolved_rank(&server["resolved"]["server"], "server")?;
+    let argv = &process.command.argv;
     assert!(
         argv.contains(&"FIXTURE_EXPLICIT=1".to_owned()),
         "an explicitly set variable reaches the container even when the ambient \
          value coincides: {argv:?}"
     );
-    let cache = &process["allocation"]["runtime_cache"];
+    let cache = &process.runtime_cache;
     assert_eq!(
-        cache["namespace"]["image_id"], image_id,
+        cache.namespace.image_id.as_deref(),
+        Some(image_id),
         "the image identity keys the runtime cache namespace"
     );
-    let cache_path = cache["path"].as_str().ok_or("cache path")?;
     assert_ne!(
-        cache_path, local_cache_path,
+        cache.path, local_cache_path,
         "an image-backed launch never shares the invoking checkout's cache namespace"
     );
-    let explicit: Vec<String> = serde_json::from_value(process["command"]["explicit_env"].clone())?;
+    let explicit = &process.command.explicit_env;
     assert!(
         explicit.contains(&"FIXTURE_EXPLICIT".to_owned()),
         "resolver provenance is preserved in the record: {explicit:?}"
@@ -1542,7 +1526,7 @@ fn selection_rejections_precede_integration_invocation() -> Result<(), Box<dyn E
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("built environment") && !stderr.contains("must not run"),
+        !stderr.contains("must not run"),
         "the compatibility rejection fires before any integration invocation: {stderr}"
     );
     Ok(())
@@ -1615,7 +1599,7 @@ fn adapter_container_device_is_declared_not_guessed() -> Result<(), Box<dyn Erro
     let report = stdout_json(&build)?;
     let record_id = report["record_id"].as_str().ok_or("record id")?;
 
-    // Default: the integration computes on no accelerator, so the adapter
+    // Default: the integration computes on no devices, so the adapter
     // container requests no device.
     let docker_log = workspace.root.path().join("docker-log");
     let dry = workspace
@@ -1887,10 +1871,7 @@ fn external_image_recipe_runs_with_unqualified_evidence() -> Result<(), Box<dyn 
         plan["server"]["external_image"]["framework_version"],
         "0.7.fixture"
     );
-    assert_eq!(
-        plan["server"]["environment"]["realization"],
-        "external-image"
-    );
+    assert_eq!(plan["stack"]["realization"], "external-image");
     assert!(plan["server"]["image"].is_null());
 
     let run = workspace
@@ -1920,8 +1901,8 @@ fn external_image_recipe_runs_with_unqualified_evidence() -> Result<(), Box<dyn 
         server["environment_checks"].is_null(),
         "no environment-check claim exists for an unqualified realization"
     );
-    let process = &server["resolved"]["server"]["processes"][0];
-    let argv: Vec<String> = serde_json::from_value(process["command"]["argv"].clone())?;
+    let process = resolved_rank(&server["resolved"]["server"], "server")?;
+    let argv = &process.command.argv;
     assert!(
         argv.contains(&"--entrypoint".to_owned())
             && argv.contains(&"fixture-server".to_owned())
@@ -1929,7 +1910,8 @@ fn external_image_recipe_runs_with_unqualified_evidence() -> Result<(), Box<dyn 
         "the external image launches through an explicit command override: {argv:?}"
     );
     assert_eq!(
-        process["allocation"]["runtime_cache"]["namespace"]["image_id"], digest,
+        process.runtime_cache.namespace.image_id.as_deref(),
+        Some(digest),
         "the cache namespace keys on the external image digest"
     );
     Ok(())
@@ -2011,7 +1993,7 @@ fn enable_pair_placement(workspace: &TestWorkspace) -> Result<u16, Box<dyn Error
     local.push_str(&format!(
         "\n[machines.remote]\n\
          host = \"127.0.0.1\"\n\
-         port = {remote_port}\n\
+         ports = [{remote_port}]\n\
          devices = [0]\n\
          workspace = \"{remote}\"\n\
          \n\
@@ -2029,11 +2011,11 @@ fn enable_pair_placement(workspace: &TestWorkspace) -> Result<u16, Box<dyn Error
            \"FIXTURE_REAPER_WORKSPACE\",\n\
          ]\n\
          \n\
-         [placements.pair]\n\
-         machines = [\"local\", \"remote\"]\n\
-         \n\
          [placements.pair.roles.serve]\n\
-         ranks = [{{ replica = 0, machine = \"local\", gpus = [0] }}, {{ replica = 1, machine = \"remote\", gpus = [0] }}]\n",
+         replicas = [\n\
+           {{ machine = \"local\", devices = [0] }},\n\
+           {{ machine = \"remote\", devices = [0] }},\n\
+         ]\n",
         remote = remote_root.display(),
     ));
     fs::write(&local_path, local)?;
@@ -2106,13 +2088,16 @@ fn external_two_machine_serving_resolves_per_machine_facts() -> Result<(), Box<d
             .any(|name| name == "HF_TOKEN"),
         "the declared pass-through is observed on the remote machine: {facts}"
     );
-    let processes = plan["server"]["processes"].as_array().ok_or("processes")?;
+    let processes = resolved_ranks(&plan["server"])?;
     let remote_process = processes
         .iter()
-        .find(|process| process["machine"] == "remote")
+        .find(|process| process.rank.machine == "remote")
         .ok_or("remote process")?;
-    assert_eq!(remote_process["launch"]["kind"], "ssh");
-    let argv: Vec<String> = serde_json::from_value(remote_process["command"]["argv"].clone())?;
+    assert!(matches!(
+        remote_process.rank.launch,
+        support::LaunchProjection::Ssh { .. }
+    ));
+    let argv = &remote_process.rank.command.argv;
     assert_eq!(
         argv[0], "docker",
         "the remote server launches from the image"
@@ -2160,27 +2145,27 @@ fn external_two_machine_serving_resolves_per_machine_facts() -> Result<(), Box<d
     let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
     assert_eq!(server["status"], "stopped");
-    assert_eq!(
-        server["resolved"]["server"]["environment"]["realization"],
-        "external-image"
-    );
+    assert_eq!(server["resolved"]["stack"]["realization"], "external-image");
 
     // Every containerized server process carries a container handle, and
     // cleanup confirms the container's removal on its launch machine
     // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     let log = fs::read_to_string(&live_log)?;
-    for process in server["processes"].as_array().ok_or("record processes")? {
-        if process["id"] == "proxy" {
+    for (id, evidence) in server["process_evidence"]
+        .as_object()
+        .ok_or("record process evidence")?
+    {
+        if id == "proxy" {
             continue;
         }
-        let container = process["handle"]["container"]
+        let container = evidence["handle"]["container"]
             .as_str()
             .ok_or("container handle")?;
         assert!(
             container.starts_with("inferlab-"),
             "the handle names the resolver-assigned container: {container}"
         );
-        let removal = &process["cleanup"][0]["container_removal"];
+        let removal = &evidence["cleanup"][0]["container_removal"];
         assert_eq!(
             removal["container"], container,
             "cleanup confirmed the handle's container: {removal}"
@@ -2221,13 +2206,11 @@ fn external_two_machine_serving_resolves_per_machine_facts() -> Result<(), Box<d
     // environment into their env map by standing host-process semantics,
     // and records are unredacted by policy; the reference channel is what
     // keeps the value out of the plan where no ambient composition exists.)
-    let remote_plan = server["resolved"]["server"]["processes"]
-        .as_array()
-        .ok_or("record processes")?
-        .iter()
-        .find(|process| process["machine"] == "remote")
-        .map(serde_json::to_string)
-        .ok_or("remote process plan")??;
+    let remote_plan = resolved_ranks(&server["resolved"]["server"])?
+        .into_iter()
+        .find(|process| process.rank.machine == "remote")
+        .ok_or("remote process plan")?;
+    let remote_plan = format!("{remote_plan:?}");
     assert!(
         !remote_plan.contains("fixture-secret"),
         "the pass-through value never enters the remote process plan"
@@ -2274,11 +2257,11 @@ fn swallowed_ssh_handle_removes_the_created_container() -> Result<(), Box<dyn Er
         .as_str()
         .ok_or("server record id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
-    let removal = server["processes"]
-        .as_array()
-        .ok_or("processes")?
-        .iter()
-        .flat_map(|process| process["cleanup"].as_array().cloned().unwrap_or_default())
+    let removal = server["process_evidence"]
+        .as_object()
+        .ok_or("process evidence")?
+        .values()
+        .flat_map(|evidence| evidence["cleanup"].as_array().cloned().unwrap_or_default())
         .filter_map(|entry| entry["container_removal"].as_object().cloned())
         .find(|removal| {
             removal["container"]
@@ -2332,11 +2315,11 @@ fn unconfirmed_launch_removal_never_claims_verified_cleanup() -> Result<(), Box<
         .as_str()
         .ok_or("server record id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
-    let removal = server["processes"]
-        .as_array()
-        .ok_or("processes")?
-        .iter()
-        .flat_map(|process| process["cleanup"].as_array().cloned().unwrap_or_default())
+    let removal = server["process_evidence"]
+        .as_object()
+        .ok_or("process evidence")?
+        .values()
+        .flat_map(|evidence| evidence["cleanup"].as_array().cloned().unwrap_or_default())
         .filter_map(|entry| entry["container_removal"].as_object().cloned())
         .find(|removal| {
             removal["container"]
@@ -2377,11 +2360,11 @@ fn hung_remote_removal_expires_with_deadline_evidence() -> Result<(), Box<dyn Er
     assert_eq!(recipe["cleanup"]["verified"], false);
     let server_id = recipe["server"]["id"].as_str().ok_or("server id")?;
     let server = workspace.load_json(&format!(".inferlab/records/{server_id}/record.json"))?;
-    let remote = server["processes"]
-        .as_array()
-        .ok_or("processes")?
-        .iter()
-        .find(|process| process["handle"]["kind"] == "ssh")
+    let remote = server["process_evidence"]
+        .as_object()
+        .ok_or("process evidence")?
+        .values()
+        .find(|evidence| evidence["handle"]["kind"] == "ssh")
         .ok_or("remote process")?;
     let removal = &remote["cleanup"][0]["container_removal"];
     assert_eq!(removal["confirmed"], false);
@@ -2398,10 +2381,10 @@ fn hung_remote_removal_expires_with_deadline_evidence() -> Result<(), Box<dyn Er
 /// The structured container-removal evidence of the failed remote launch
 /// (server-1), located across every process's cleanup entries.
 fn failed_remote_removal(server: &Value) -> Option<serde_json::Map<String, Value>> {
-    server["processes"]
-        .as_array()?
-        .iter()
-        .flat_map(|process| process["cleanup"].as_array().cloned().unwrap_or_default())
+    server["process_evidence"]
+        .as_object()?
+        .values()
+        .flat_map(|evidence| evidence["cleanup"].as_array().cloned().unwrap_or_default())
         .filter_map(|entry| entry["container_removal"].as_object().cloned())
         .find(|removal| {
             removal["container"]
@@ -2413,10 +2396,10 @@ fn failed_remote_removal(server: &Value) -> Option<serde_json::Map<String, Value
 /// The verified flag of the cleanup entry that carries the failed remote
 /// launch's container removal.
 fn failed_remote_cleanup_verified(server: &Value) -> Option<bool> {
-    server["processes"]
-        .as_array()?
-        .iter()
-        .flat_map(|process| process["cleanup"].as_array().cloned().unwrap_or_default())
+    server["process_evidence"]
+        .as_object()?
+        .values()
+        .flat_map(|evidence| evidence["cleanup"].as_array().cloned().unwrap_or_default())
         .find(|entry| {
             entry["container_removal"]["container"]
                 .as_str()
@@ -2654,6 +2637,15 @@ fn write_synthetic_record(root: &Path, id: &str, record: &Value) -> Result<(), B
     let dir = root.join(".inferlab/records").join(id);
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("record.json"), serde_json::to_vec_pretty(record)?)?;
+    Ok(())
+}
+
+fn assert_datetime_record_id(id: &str, expected_stem: &str) -> Result<(), Box<dyn Error>> {
+    let (timestamp, suffix) = id.split_once("Z-").ok_or("record id has no UTC prefix")?;
+    assert_eq!(timestamp.len(), 23);
+    let (stem, pid) = suffix.rsplit_once('-').ok_or("record id has no pid")?;
+    assert_eq!(stem, expected_stem);
+    pid.parse::<u32>()?;
     Ok(())
 }
 

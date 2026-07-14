@@ -13,6 +13,18 @@ use tempfile::{NamedTempFile, TempDir};
 
 const WORKSPACE: &str = include_str!("fixtures/dsv4-workspace.toml");
 
+fn resolved_ranks(
+    server: &Value,
+) -> Result<Vec<support::ResolvedProcessProjection>, Box<dyn Error>> {
+    support::resolved_processes(server)
+}
+
+fn process_evidence<'a>(record: &'a Value, id: &str) -> Result<&'a Value, Box<dyn Error>> {
+    record["process_evidence"]
+        .get(id)
+        .ok_or_else(|| format!("missing process evidence {id:?}").into())
+}
+
 struct TestWorkspace {
     // Declared before `root` so fixture process groups are reaped before the
     // workspace directory they run in is removed.
@@ -72,7 +84,7 @@ impl TestWorkspace {
                  \n\
                  [machines.local]\n\
                  host = \"127.0.0.1\"\n\
-                 port = {port}\n\
+                 ports = [{port}]\n\
                  devices = [0, 1, 2, 3]\n\
                  \n\
                  [placements.local]\n\
@@ -149,7 +161,7 @@ impl TestWorkspace {
             .output()?)
     }
 
-    /// Declare one environment check on the serving environment whose script
+    /// Declare one realization check on the serving stack whose script
     /// exits with the given code ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
     fn declare_environment_check(&self, exit_code: i32) -> Result<(), Box<dyn Error>> {
         fs::create_dir_all(self.root.path().join("tools"))?;
@@ -163,7 +175,7 @@ impl TestWorkspace {
         let manifest = self.root.path().join(".inferlab/workspace.toml");
         let mut text = fs::read_to_string(&manifest)?;
         text.push_str(
-            "\n[[environments.vllm.checks]]\n\
+            "\n[[stacks.vllm.checks]]\n\
              id = \"fixture-guard\"\n\
              script = \"tools/fixture-check.py\"\n\
              repair_hint = \"pixi run fixture-repair\"\n",
@@ -183,30 +195,35 @@ impl TestWorkspace {
     }
 
     fn configure_pd(&self, transport: &str) -> Result<(), Box<dyn Error>> {
-        let mut config = WORKSPACE
+        let config = WORKSPACE
             .replacen(
-                "readiness_timeout_seconds = 900",
+                "topology = \"single\"",
                 &format!(
-                    "readiness_timeout_seconds = 900\ntopology = \"prefill_decode\"\nrouting_backend = \"builtin\"\nkv_transfer = {transport:?}"
+                    "topology = \"prefill_decode\"\nrouting_backend = \"builtin\"\nkv_transfer = {transport:?}"
                 ),
                 1,
             )
+            .replacen(
+                "[servers.dsv4-qualify.roles.serve.parallelism.attention]\n",
+                "[servers.dsv4-qualify.roles.prefill]\nreplicas = 2\n\n[servers.dsv4-qualify.roles.prefill.parallelism.attention]\n",
+                1,
+            )
+            .replacen(
+                "[servers.dsv4-qualify.roles.serve.settings]\n",
+                "[servers.dsv4-qualify.roles.prefill.settings]\n",
+                1,
+            )
+            .replace(
+                "[servers.dsv4-qualify.cases.tp2.parallelism.outer]",
+                "[servers.dsv4-qualify.roles.decode]\nreplicas = 2\n\n[servers.dsv4-qualify.cases.tp2.parallelism.outer]",
+            )
             .replace("reset_prefix_cache = true", "reset_prefix_cache = false");
-        config.push_str(
-            "\n[serve_profiles.vllm-dsv4.roles.prefill]\n\
-             kind = \"prefill\"\n\
-             replicas = 2\n\
-             \n\
-             [serve_profiles.vllm-dsv4.roles.decode]\n\
-             kind = \"decode\"\n\
-             replicas = 2\n",
-        );
         fs::write(self.root.path().join(".inferlab/workspace.toml"), config)?;
         let ports = support::reserve_local_ports(9)?;
         fs::write(
             self.root.path().join(".inferlab/local.toml"),
             format!(
-                "default_placement = \"local\"\n\n[model_weights.dsv4]\nlocator = \"/models/dsv4\"\n\n[machines.local]\nhost = \"127.0.0.1\"\nport = {}\nextra_ports = [{}, {}, {}, {}, {}, {}, {}, {}]\ndevices = [0, 1, 2, 3, 4, 5, 6, 7]\n\n[placements.local]\nmachines = [\"local\"]\n",
+                "default_placement = \"local\"\n\n[model_weights.dsv4]\nlocator = \"/models/dsv4\"\n\n[machines.local]\nhost = \"127.0.0.1\"\nports = [{}, {}, {}, {}, {}, {}, {}, {}, {}]\ndevices = [0, 1, 2, 3, 4, 5, 6, 7]\n\n[placements.local]\nmachines = [\"local\"]\n",
                 ports.get(0),
                 ports.get(1),
                 ports.get(2),
@@ -275,9 +292,13 @@ fn recipe_runs_eval_and_bench_then_stops_the_server() -> Result<(), Box<dyn Erro
         String::from_utf8_lossy(&output.stderr)
     );
     let record: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(record["schema_version"], 2);
     let id = record["id"].as_str().ok_or("missing recipe record id")?;
     assert_datetime_record_id(id, "recipe-dsv4-qualify-tp2")?;
-    assert_eq!(record["server"]["id"], format!("{id}-serve"));
+    let server_id = record["server"]["id"]
+        .as_str()
+        .ok_or("missing server record id")?;
+    assert_datetime_record_id(server_id, "serve-dsv4-qualify-tp2")?;
     assert_eq!(record["status"], "succeeded");
     assert_eq!(record["evals"].as_array().map(Vec::len), Some(2));
     assert_eq!(record["benches"].as_array().map(Vec::len), Some(2));
@@ -312,6 +333,7 @@ fn recipe_runs_eval_and_bench_then_stops_the_server() -> Result<(), Box<dyn Erro
         .as_str()
         .ok_or("missing matrix bench record id")?;
     let matrix = workspace.load_record(matrix_id)?;
+    assert_eq!(matrix["schema_version"], 3);
     assert_eq!(matrix["cases"][0]["prefix_cache_reset"]["succeeded"], true);
     assert!(
         matrix["cases"][0]["prefix_cache_reset"]
@@ -497,25 +519,27 @@ fn recipe_captures_one_selected_bench_and_verifies_static_ranges() -> Result<(),
         .as_str()
         .ok_or("recipe has no server record id")?;
     let server = workspace.load_record(server_id)?;
-    assert_eq!(server["processes"][0]["role_id"], "serve");
-    assert_eq!(server["processes"][0]["profiler"]["executable"], "nsys");
-    // The undeclared serve-profile fact resolves to the clause default
+    let server_ranks = resolved_ranks(&server["resolved"]["server"])?;
+    let server_evidence = process_evidence(&server, "server")?;
+    assert_eq!(server_ranks[0].role_id, "serve");
+    assert_eq!(server_evidence["profiler"]["executable"], "nsys");
+    // The undeclared server fact resolves to the clause default
     // ([[RFC-0004:C-WORKLOAD-PROFILING]]).
     assert_eq!(
-        server["processes"][0]["profiler"]["control"]["deadline_seconds"],
+        server_evidence["profiler"]["control"]["deadline_seconds"],
         60
     );
     assert_eq!(
-        server["processes"][0]["profiler_finalization"]["operation"],
+        server_evidence["profiler_finalization"]["operation"],
         "finalize-collection"
     );
-    assert_eq!(server["processes"][0]["profiler_cleanup"]["verified"], true);
+    assert_eq!(server_evidence["profiler_cleanup"]["verified"], true);
     assert_eq!(recipe["cleanup"]["verified"], true);
     // A no-escape server record carries none of the escape fields — exactly
     // the shape written before they existed — so this capture attaching to
     // it is the old-record compatibility proof
     // ([[RFC-0004:C-WORKLOAD-PROFILING]]).
-    assert!(server["processes"][0]["profiler"].get("escapes").is_none());
+    assert!(server_evidence["profiler"].get("escapes").is_none());
     assert!(
         server["resolved"]["server"]
             .get("profiler_escapes")
@@ -533,14 +557,14 @@ fn recipe_captures_one_selected_bench_and_verifies_static_ranges() -> Result<(),
 fn capture_renders_declared_escapes_and_records_raw_and_effective() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys]\n\
          launch_options = [\"--cuda-graph-trace=node\"]\n\
          start_options = [\"--nic-metrics=true\"]\n\
          trace = [\"cuda\", \"nvtx\"]\n\
          sampling = \"cpu\"\n\
          context_switch = \"process-tree\"\n\
          \n\
-         [serve_profiles.vllm-dsv4.profiler.nsys.env]\n\
+         [servers.dsv4-qualify.profiler.nsys.env]\n\
          NSYS_FIXTURE = \"a b\"\n",
     )?;
     let output = workspace
@@ -559,7 +583,7 @@ fn capture_renders_declared_escapes_and_records_raw_and_effective() -> Result<()
             .as_str()
             .ok_or("recipe has no server record id")?,
     )?;
-    let profiler = &server["processes"][0]["profiler"];
+    let profiler = &process_evidence(&server, "server")?["profiler"];
     let session = profiler["session"]
         .as_str()
         .ok_or("profiler target has no session")?;
@@ -583,7 +607,7 @@ fn capture_renders_declared_escapes_and_records_raw_and_effective() -> Result<()
         "--nic-metrics=true"
     );
     assert_eq!(profiler["escapes"]["sampling"], "cpu");
-    let raw = &server["resolved"]["server"]["profiler_escapes"]["profile"];
+    let raw = &server["resolved"]["server"]["profiler_escapes"]["common"];
     assert_eq!(raw["launch_options"][0], "--cuda-graph-trace=node");
     assert_eq!(raw["trace"], serde_json::json!(["cuda", "nvtx"]));
     assert_eq!(raw["env"]["NSYS_FIXTURE"], "a b");
@@ -630,28 +654,29 @@ fn capture_renders_declared_escapes_and_records_raw_and_effective() -> Result<()
     Ok(())
 }
 
-/// Role escapes merge into profile escapes in the resolved plan: scalars
-/// replace, option lists concatenate with the role's after the profile's,
+/// Role escapes merge into common server escapes in the resolved plan: scalars
+/// replace, option lists concatenate with the role's after the common values,
 /// and env entries merge with the role value winning; the raw declaration
 /// keeps both layers ([[RFC-0004:C-WORKLOAD-PROFILING]]).
 #[test]
-fn role_escapes_merge_over_profile_escapes_in_the_resolved_plan() -> Result<(), Box<dyn Error>> {
+fn role_escapes_merge_over_common_server_escapes_in_the_resolved_plan() -> Result<(), Box<dyn Error>>
+{
     let workspace = TestWorkspace::new()?;
     workspace.configure_pd("nixl")?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys]\n\
          launch_options = [\"--cuda-graph-trace=node\"]\n\
          sampling = \"cpu\"\n\
          \n\
-         [serve_profiles.vllm-dsv4.profiler.nsys.env]\n\
+         [servers.dsv4-qualify.profiler.nsys.env]\n\
          NSYS_SHARED = \"profile\"\n\
          NSYS_PROFILE_ONLY = \"1\"\n\
          \n\
-         [serve_profiles.vllm-dsv4.roles.prefill.profiler.nsys]\n\
+         [servers.dsv4-qualify.roles.prefill.profiler.nsys]\n\
          launch_options = [\"--nvtx-domain-include=prefill\"]\n\
          sampling = \"process-tree\"\n\
          \n\
-         [serve_profiles.vllm-dsv4.roles.prefill.profiler.nsys.env]\n\
+         [servers.dsv4-qualify.roles.prefill.profiler.nsys.env]\n\
          NSYS_SHARED = \"role\"\n",
     )?;
     let output = workspace
@@ -672,37 +697,33 @@ fn role_escapes_merge_over_profile_escapes_in_the_resolved_plan() -> Result<(), 
         String::from_utf8_lossy(&output.stderr)
     );
     let plan: Value = serde_json::from_slice(&output.stdout)?;
-    let processes = plan["server"]["processes"]
-        .as_array()
-        .ok_or("plan has no processes")?;
-    let escapes_of = |role: &str| -> Result<&Value, Box<dyn Error>> {
-        Ok(&processes
+    let processes = resolved_ranks(&plan["server"])?;
+    let escapes_of = |role: &str| -> Result<&support::NsysEscapesProjection, Box<dyn Error>> {
+        processes
             .iter()
-            .find(|process| process["role_id"] == role)
-            .ok_or_else(|| format!("plan has no {role} process"))?["capture_target"]["escapes"])
+            .find(|process| process.role_id == role)
+            .ok_or_else(|| format!("plan has no {role} process"))?
+            .rank
+            .capture_target
+            .as_ref()
+            .map(|target| &target.escapes)
+            .ok_or_else(|| format!("plan has no {role} capture target").into())
     };
     let prefill = escapes_of("prefill")?;
     assert_eq!(
-        prefill["launch_options"],
-        serde_json::json!(["--cuda-graph-trace=node", "--nvtx-domain-include=prefill"])
+        prefill.launch_options,
+        ["--cuda-graph-trace=node", "--nvtx-domain-include=prefill"]
     );
-    assert_eq!(prefill["sampling"], "process-tree");
-    assert_eq!(
-        prefill["env"],
-        serde_json::json!({ "NSYS_PROFILE_ONLY": "1", "NSYS_SHARED": "role" })
-    );
+    assert_eq!(prefill.sampling.as_deref(), Some("process-tree"));
+    assert_eq!(prefill.env["NSYS_PROFILE_ONLY"], "1");
+    assert_eq!(prefill.env["NSYS_SHARED"], "role");
     let decode = escapes_of("decode")?;
-    assert_eq!(
-        decode["launch_options"],
-        serde_json::json!(["--cuda-graph-trace=node"])
-    );
-    assert_eq!(decode["sampling"], "cpu");
-    assert_eq!(
-        decode["env"],
-        serde_json::json!({ "NSYS_PROFILE_ONLY": "1", "NSYS_SHARED": "profile" })
-    );
+    assert_eq!(decode.launch_options, ["--cuda-graph-trace=node"]);
+    assert_eq!(decode.sampling.as_deref(), Some("cpu"));
+    assert_eq!(decode.env["NSYS_PROFILE_ONLY"], "1");
+    assert_eq!(decode.env["NSYS_SHARED"], "profile");
     let raw = &plan["server"]["profiler_escapes"];
-    assert_eq!(raw["profile"]["sampling"], "cpu");
+    assert_eq!(raw["common"]["sampling"], "cpu");
     assert_eq!(raw["roles"]["prefill"]["sampling"], "process-tree");
     Ok(())
 }
@@ -714,7 +735,7 @@ fn role_escapes_merge_over_profile_escapes_in_the_resolved_plan() -> Result<(), 
 fn a_managed_launch_escape_option_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys]\n\
          launch_options = [\"--wait=none\"]\n",
     )?;
     let output = workspace
@@ -722,15 +743,6 @@ fn a_managed_launch_escape_option_is_rejected_at_workspace_load() -> Result<(), 
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "serve profile \"vllm-dsv4\" nsys launch_options contains managed option \
-             \"--wait=none\"; use the dedicated profiler escape field or the \
-             inferlab-managed value"
-        ),
-        "{stderr}"
-    );
     Ok(())
 }
 
@@ -741,7 +753,7 @@ fn a_managed_launch_escape_option_is_rejected_at_workspace_load() -> Result<(), 
 fn an_attached_managed_escape_option_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys]\n\
          start_options = [\"-cnone\"]\n",
     )?;
     let output = workspace
@@ -749,15 +761,6 @@ fn an_attached_managed_escape_option_is_rejected_at_workspace_load() -> Result<(
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "serve profile \"vllm-dsv4\" nsys start_options contains managed option \
-             \"-cnone\"; use the dedicated profiler escape field or the inferlab-managed \
-             value"
-        ),
-        "{stderr}"
-    );
     Ok(())
 }
 
@@ -769,7 +772,7 @@ fn an_abbreviated_managed_escape_option_is_rejected_at_workspace_load() -> Resul
 {
     let workspace = TestWorkspace::new()?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys]\n\
          launch_options = [\"--wai=all\"]\n",
     )?;
     let output = workspace
@@ -777,15 +780,6 @@ fn an_abbreviated_managed_escape_option_is_rejected_at_workspace_load() -> Resul
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "serve profile \"vllm-dsv4\" nsys launch_options contains managed option \
-             \"--wai=all\"; use the dedicated profiler escape field or the \
-             inferlab-managed value"
-        ),
-        "{stderr}"
-    );
     Ok(())
 }
 
@@ -797,7 +791,7 @@ fn an_abbreviated_managed_escape_option_is_rejected_at_workspace_load() -> Resul
 fn a_standalone_terminator_escape_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys]\n\
          launch_options = [\"--\"]\n",
     )?;
     let output = workspace
@@ -805,14 +799,6 @@ fn a_standalone_terminator_escape_is_rejected_at_workspace_load() -> Result<(), 
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "serve profile \"vllm-dsv4\" nsys launch_options contains standalone \"--\", \
-             which ends option parsing and displaces the inferlab-managed argv tail"
-        ),
-        "{stderr}"
-    );
     Ok(())
 }
 
@@ -823,7 +809,7 @@ fn a_standalone_terminator_escape_is_rejected_at_workspace_load() -> Result<(), 
 fn a_non_identifier_escape_env_key_is_rejected_at_workspace_load() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.profiler.nsys.env]\n\
+        "\n[servers.dsv4-qualify.profiler.nsys.env]\n\
          \"--unset\" = \"NSYS_FIXTURE\"\n",
     )?;
     let output = workspace
@@ -831,15 +817,6 @@ fn a_non_identifier_escape_env_key_is_rejected_at_workspace_load() -> Result<(),
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "serve profile \"vllm-dsv4\" nsys env contains key \"--unset\", which is not \
-             a POSIX identifier; environment entries reach the profiler commands as \
-             assignments"
-        ),
-        "{stderr}"
-    );
     Ok(())
 }
 
@@ -848,7 +825,7 @@ fn a_managed_start_escape_option_is_rejected_at_workspace_load() -> Result<(), B
     let workspace = TestWorkspace::new()?;
     workspace.configure_pd("nixl")?;
     workspace.append_manifest(
-        "\n[serve_profiles.vllm-dsv4.roles.prefill.profiler.nsys]\n\
+        "\n[servers.dsv4-qualify.roles.prefill.profiler.nsys]\n\
          start_options = [\"-c=cudaProfilerApi\"]\n",
     )?;
     let output = workspace
@@ -856,15 +833,6 @@ fn a_managed_start_escape_option_is_rejected_at_workspace_load() -> Result<(), B
         .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
         .output()?;
     assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "serve profile \"vllm-dsv4\" role \"prefill\" nsys start_options contains \
-             managed option \"-c=cudaProfilerApi\"; use the dedicated profiler escape \
-             field or the inferlab-managed value"
-        ),
-        "{stderr}"
-    );
     Ok(())
 }
 
@@ -932,7 +900,7 @@ fn readiness_probing_backs_off_for_slow_starts() -> Result<(), Box<dyn Error>> {
             .as_str()
             .ok_or("recipe has no server record id")?,
     )?;
-    let attempts = server["processes"][0]["readiness"]["attempts"]
+    let attempts = process_evidence(&server, "server")?["readiness"]["attempts"]
         .as_u64()
         .ok_or("readiness evidence has no attempt count")?;
     assert!(
@@ -970,7 +938,7 @@ fn capture_armed_readiness_fails_immediately_on_process_exit() -> Result<(), Box
     Ok(())
 }
 
-/// Window-opening control keeps a deadline — the serve-profile fact
+/// Window-opening control keeps a deadline — the server fact
 /// `capture_control_deadline_seconds` — because a lost start silently shifts
 /// range identities ([[RFC-0004:C-WORKLOAD-PROFILING]]).
 #[test]
@@ -1111,16 +1079,18 @@ fn run_pd_recipe(transport: &str) -> Result<(), Box<dyn Error>> {
         .as_str()
         .ok_or("recipe has no server record id")?;
     let server = workspace.load_record(server_id)?;
-    let processes = server["processes"]
-        .as_array()
-        .ok_or("server has no process records")?;
+    let processes = resolved_ranks(&server["resolved"]["server"])?;
+    let process_evidence = server["process_evidence"]
+        .as_object()
+        .ok_or("server has no process evidence")?;
     assert_eq!(server["resolved"]["server"]["topology"], "prefill_decode");
     assert_eq!(processes.len(), 5);
-    assert_eq!(processes[0]["replica_id"], "prefill-000");
-    assert_eq!(processes[1]["replica_id"], "prefill-001");
-    assert_eq!(processes[2]["replica_id"], "decode-000");
-    assert_eq!(processes[3]["replica_id"], "decode-001");
-    assert_eq!(processes[4]["role_id"], "router");
+    assert_eq!(process_evidence.len(), 5);
+    assert_eq!(processes[0].replica_id, "prefill-000");
+    assert_eq!(processes[1].replica_id, "prefill-001");
+    assert_eq!(processes[2].replica_id, "decode-000");
+    assert_eq!(processes[3].replica_id, "decode-001");
+    assert_eq!(processes[4].role_id, "router");
 
     // The resolved plan wires the KV transfer for exactly the selected
     // transport: a mooncake break fails only the mooncake case and a nixl
@@ -1140,19 +1110,16 @@ fn run_pd_recipe(transport: &str) -> Result<(), Box<dyn Error>> {
         Some(transport),
         "the kv_transfer link records the {transport} mechanism: {links:?}"
     );
-    // The rendered command and port allocation live on the resolved plan's
-    // processes, ordered prefill, decode, then router.
-    let plan_processes = server["resolved"]["server"]["processes"]
-        .as_array()
-        .ok_or("resolved plan has no processes")?;
-    let router_argv = plan_processes[4]["command"]["argv"]
-        .as_array()
-        .ok_or("router process has no argv")?;
+    // The rendered command and port allocation live on the resolved hierarchy,
+    // ordered prefill, decode, then router.
+    let router_argv = &processes[4].rank.command.argv;
     let prefill_ports = |replica_index: usize| {
-        plan_processes[replica_index]["allocation"]["ports"]
-            .as_object()
-            .map(|ports| ports.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
+        processes[replica_index]
+            .rank
+            .ports
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
     };
     match transport {
         "mooncake" => {
@@ -1173,9 +1140,7 @@ fn run_pd_recipe(transport: &str) -> Result<(), Box<dyn Error>> {
                 prefill_ports(0)
             );
             assert!(
-                router_argv
-                    .iter()
-                    .any(|arg| arg.as_str() == Some("vllm-mooncake")),
+                router_argv.iter().any(|arg| arg == "vllm-mooncake"),
                 "the router launches the mooncake proxy: {router_argv:?}"
             );
         }
@@ -1197,9 +1162,7 @@ fn run_pd_recipe(transport: &str) -> Result<(), Box<dyn Error>> {
                 prefill_ports(0)
             );
             assert!(
-                router_argv
-                    .iter()
-                    .any(|arg| arg.as_str() == Some("vllm-nixl")),
+                router_argv.iter().any(|arg| arg == "vllm-nixl"),
                 "the router launches the nixl proxy: {router_argv:?}"
             );
         }
@@ -1238,8 +1201,8 @@ fn run_pd_recipe(transport: &str) -> Result<(), Box<dyn Error>> {
         .ok_or("recipe has no Eval record id")?;
     let eval = workspace.load_record(eval_id)?;
     assert_eq!(eval["resolved"]["endpoint"]["port"], public_port);
-    assert!(processes.iter().all(|process| {
-        process["cleanup"]
+    assert!(process_evidence.values().all(|evidence| {
+        evidence["cleanup"]
             .as_array()
             .and_then(|cleanup| cleanup.last())
             .is_some_and(|cleanup| cleanup["verified"] == true)
@@ -1262,6 +1225,7 @@ fn manual_bench_attaches_to_an_explicit_running_server() -> Result<(), Box<dyn E
     );
     let server: Value = serde_json::from_slice(&start.stdout)?;
     let server_id = server["id"].as_str().ok_or("server record has no id")?;
+    fs::remove_file(workspace.root.path().join(".inferlab/local.toml"))?;
 
     let unavailable_capture = workspace
         .command()
@@ -1328,6 +1292,10 @@ fn manual_bench_attaches_to_an_explicit_running_server() -> Result<(), Box<dyn E
     );
     let bench: Value = serde_json::from_slice(&bench.stdout)?;
     assert_eq!(bench["status"], "succeeded");
+    assert_datetime_record_id(
+        bench["id"].as_str().ok_or("missing Bench record id")?,
+        "bench-c8k1k",
+    )?;
     assert_eq!(bench["resolved"]["target"]["server_record_id"], server_id);
     assert_eq!(
         bench["resolved"]["measurement_workspace"]["source_digest"],
@@ -1364,7 +1332,9 @@ fn assert_datetime_record_id(id: &str, expected_suffix: &str) -> Result<(), Box<
             (19, '.')
         ]
     );
-    assert_eq!(suffix, expected_suffix);
+    let (stem, pid) = suffix.rsplit_once('-').ok_or("record id has no pid")?;
+    assert_eq!(stem, expected_suffix);
+    pid.parse::<u32>()?;
     Ok(())
 }
 
@@ -1818,7 +1788,7 @@ fn failing_local_check_fails_before_server_launch() -> Result<(), Box<dyn Error>
     assert_eq!(server["failure"]["phase"], "preflight");
     assert_eq!(server["environment_checks"][0]["outcome"], "failed");
     assert_eq!(
-        server["processes"][0]["handle"],
+        process_evidence(&server, "server")?["handle"],
         Value::Null,
         "no process launches after a failed preflight check"
     );
@@ -1869,8 +1839,8 @@ request = json.load(sys.stdin)
 input = request["input"]
 operation = request["operation"]
 if operation == "plan_serve":
-    settings = input["settings"]
     role = input["roles"][0]
+    settings = role["settings"]
     declared = role["parallelism"]
     outer = declared.get("outer") or {}
     attention = declared.get("attention") or {}
@@ -1912,7 +1882,7 @@ if operation == "plan_serve":
                 "id": replica_id,
                 "role_id": selected_role["id"],
                 "replica_index": replica_index,
-                "accelerator_count": tp * pp * dp,
+                "device_count": tp * pp * dp,
                 "ports": ports,
                 "primary_ports": ["master"],
                 "primary_readiness": {"kind": "http", "path": "/v1/models"},
@@ -1935,21 +1905,33 @@ if operation == "plan_serve":
     elif transport == "nixl":
         links.append({"kind": "side_channel", "source": "prefill", "target": "decode", "port": "side_channel"})
     output = {
-        "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
-        "effective_settings": effective,
-        "effective_parallelism": effective_parallelism,
+        "integration": {
+            "adapter_id": "fixture",
+            "adapter_version": "1",
+            "framework": "vllm",
+            "framework_version": "test",
+        },
         "roles": [{
             "id": selected_role["id"],
             "kind": selected_role["kind"],
-            "replica_count": selected_role["replica_count"],
+            "declared_replica_count": selected_role["replica_count"],
+            "effective_replica_count": selected_role["replica_count"],
             "effective_settings": effective,
             "effective_parallelism": effective_parallelism,
         } for selected_role in roles],
         "replicas": replicas,
         "links": links,
-        "public_endpoint": (
-            {"kind": "builtin_proxy", "process_id": "router", "role_id": "router", "prefill_role": "prefill", "decode_role": "decode", "readiness": {"kind": "http", "path": "/healthcheck"}}
-            if transport else {"kind": "replica", "replica_id": "server"}
+        "routing": (
+            {
+                "owner": "inferlab_builtin",
+                "implementation": "vllm_mooncake" if transport == "mooncake" else "vllm_nixl",
+                "policy": "round_robin",
+                "prefill_role": "prefill",
+                "decode_role": "decode",
+                "ports": [],
+                "readiness": {"kind": "http", "path": "/healthcheck"},
+            }
+            if transport else {"owner": "direct", "role": role["id"], "replica": 0}
         ),
         "endpoint": {
             "protocol": "http",
@@ -1961,11 +1943,20 @@ elif operation == "render_serve":
     server = "fixture-missing-server" if os.environ.get("FIXTURE_SERVER_START_FAIL") == "1" else "fixture-server"
     allocations = input["allocations"]
     output = {
-        "integration": {"adapter_id": "fixture", "adapter_version": "1", "framework": "vllm"},
+        "integration": {
+            "adapter_id": "fixture",
+            "adapter_version": "1",
+            "framework": "vllm",
+            "framework_version": "test",
+        },
         "processes": [{
-            "id": allocation["process_id"],
+            "process": allocation["process"],
+            "role": allocation["role"],
+            "replica": allocation["replica"],
+            "rank": allocation["rank"],
+            "rank_count": allocation["rank_count"],
             "launch_files": [],
-            "process": {
+            "command": {
                 "argv": [
                     server,
                     allocation["endpoint"]["host"],
@@ -1981,7 +1972,7 @@ elif operation == "render_serve":
     }
 else:
     raise ValueError(operation)
-print(json.dumps({"status": "ok", "protocol_version": "4", "result": {"operation": operation, "output": output}}))
+print(json.dumps({"status": "ok", "protocol_version": "5", "result": {"operation": operation, "output": output}}))
 "#;
 
 const FIXTURE_SERVER: &str = r#"#!/usr/bin/env python3

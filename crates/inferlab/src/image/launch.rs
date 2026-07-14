@@ -8,6 +8,7 @@
 //! record already owns.
 
 use crate::InferlabError;
+use crate::image::record::{AssemblyOutcome, ImageRecord};
 use crate::resolve::ResolvedExecution;
 use crate::workspace::LoadedWorkspace;
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use std::path::Path;
 /// in the execution's own workspace snapshot, so drift between the revision
 /// that qualified the image and the revision that launches it stays
 /// observable.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImageLaunchPlan {
     pub record_id: String,
     pub image_id: String,
@@ -33,7 +34,7 @@ pub struct ImageLaunchPlan {
 /// explicitly not-qualified realization. The observed framework version is
 /// the only qualification-adjacent evidence available and is filled during
 /// resolution.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExternalImagePlan {
     pub id: String,
     pub reference: String,
@@ -43,72 +44,26 @@ pub struct ExternalImagePlan {
     pub framework_version: Option<String>,
 }
 
-/// The stored image-record facts the selection consumes, deserialized
-/// narrowly so execution evidence never enters the launch contract.
-#[derive(Deserialize)]
-struct StoredImageRecord {
-    resolved: StoredResolvedBuild,
-    assemblies: Vec<StoredAssembly>,
-}
-
-#[derive(Deserialize)]
-struct StoredResolvedBuild {
-    workspace: StoredWorkspace,
-    image: StoredImagePlan,
-}
-
-#[derive(Deserialize)]
-struct StoredWorkspace {
-    revision: String,
-}
-
-#[derive(Deserialize)]
-struct StoredImagePlan {
-    environment: String,
-    source_set: String,
-}
-
-#[derive(Deserialize)]
-struct StoredAssembly {
-    platform: String,
-    outcome: StoredAssemblyOutcome,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "status", rename_all = "kebab-case")]
-enum StoredAssemblyOutcome {
-    Pending,
-    Assembled { image_id: String },
-    Failed { message: String },
-}
-
 /// Validate an image selection against the recipe's workspace facts and the
 /// stored record, before resolution begins: every fact these rejections need
 /// is already known, so an incompatible selection never reaches an
 /// integration invocation ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
 pub fn select(
     workspace: &LoadedWorkspace,
-    recipe_id: &str,
+    server_id: &str,
     record_id: &str,
 ) -> Result<ImageLaunchPlan, InferlabError> {
-    let Some(recipe) = workspace.config.recipes.get(recipe_id) else {
+    let Some(server) = workspace.config.servers.get(server_id) else {
         return Err(InferlabError::InvalidConfig {
-            message: format!("unknown recipe {recipe_id:?}"),
+            message: format!("unknown server {server_id:?}"),
         });
     };
     let record = load_record(&workspace.root, record_id)?;
-    if record.resolved.image.environment != recipe.environment {
+    if record.resolved.image.stack != server.stack {
         return Err(reject(format!(
-            "image build record {record_id} built environment {:?} but recipe {recipe_id:?} \
+            "image build record {record_id} built stack {:?} but server {server_id:?} \
              selects {:?}; an image-backed launch must run the serving stack the image contains",
-            record.resolved.image.environment, recipe.environment
-        )));
-    }
-    if record.resolved.image.source_set != recipe.source_set {
-        return Err(reject(format!(
-            "image build record {record_id} built source set {:?} but recipe {recipe_id:?} \
-             selects {:?}; an image-backed launch must run the serving stack the image contains",
-            record.resolved.image.source_set, recipe.source_set
+            record.resolved.image.stack, server.stack
         )));
     }
     let (image_id, platform) = host_assembly(&record, record_id)?;
@@ -123,10 +78,7 @@ pub fn select(
 /// The record's successful assembly for the launching host's platform, the
 /// shared precondition of every image-backed execution
 /// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
-fn host_assembly(
-    record: &StoredImageRecord,
-    record_id: &str,
-) -> Result<(String, String), InferlabError> {
+fn host_assembly(record: &ImageRecord, record_id: &str) -> Result<(String, String), InferlabError> {
     let platform = host_platform();
     let Some(assembly) = record
         .assemblies
@@ -144,14 +96,14 @@ fn host_assembly(
         )));
     };
     let image_id = match &assembly.outcome {
-        StoredAssemblyOutcome::Assembled { image_id } => image_id.clone(),
-        StoredAssemblyOutcome::Pending => {
+        AssemblyOutcome::Assembled { image_id, .. } => image_id.clone(),
+        AssemblyOutcome::Pending => {
             return Err(reject(format!(
                 "the {platform} assembly of image build record {record_id} did not succeed \
                  (never assembled)"
             )));
         }
-        StoredAssemblyOutcome::Failed { message } => {
+        AssemblyOutcome::Failed { message } => {
             return Err(reject(format!(
                 "the {platform} assembly of image build record {record_id} did not succeed: \
                  {message}"
@@ -174,16 +126,16 @@ pub(crate) fn select_for_adhoc(root: &Path, record_id: &str) -> Result<String, I
 
 /// Validate an external-image selection against workspace facts, before
 /// resolution begins ([[RFC-0003:C-RUNTIME-WORKFLOWS]]): the declaration
-/// must exist, its integration claim must match the recipe's serve profile,
+/// must exist, its integration claim must match the server stack's integration,
 /// and the image must already be present locally — Inferlab never pulls.
 pub fn select_external(
     workspace: &LoadedWorkspace,
-    recipe_id: &str,
+    server_id: &str,
     external_id: &str,
 ) -> Result<ExternalImagePlan, InferlabError> {
-    let Some(recipe) = workspace.config.recipes.get(recipe_id) else {
+    let Some(server) = workspace.config.servers.get(server_id) else {
         return Err(InferlabError::InvalidConfig {
-            message: format!("unknown recipe {recipe_id:?}"),
+            message: format!("unknown server {server_id:?}"),
         });
     };
     let Some(declaration) = workspace.config.external_images.get(external_id) else {
@@ -192,17 +144,17 @@ pub fn select_external(
              workspace"
         )));
     };
-    let Some(profile) = workspace.config.serve_profiles.get(&recipe.serve_profile) else {
+    let Some(stack) = workspace.config.stacks.get(&server.stack) else {
         return Err(InferlabError::InvalidConfig {
-            message: format!("unknown serve profile {:?}", recipe.serve_profile),
+            message: format!("unknown stack {:?}", server.stack),
         });
     };
-    if profile.integration != declaration.integration {
+    if stack.integration != declaration.integration {
         return Err(reject(format!(
-            "external image {external_id:?} claims integration {:?} but recipe {recipe_id:?} \
+            "external image {external_id:?} claims integration {:?} but server {server_id:?} \
              serves through integration {:?}; an external image must answer the serving stack \
-             the recipe expects",
-            declaration.integration, profile.integration
+             the server expects",
+            declaration.integration, stack.integration
         )));
     }
     probe_local_presence(external_id, &declaration.reference)?;
@@ -246,9 +198,11 @@ pub(crate) fn gate_placement(
 /// server process, so the capture would claim a profile it never took;
 /// rejected until an in-container profiler contract exists
 /// ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
-fn gate_capture(processes: &[crate::resolve::ProcessPlan]) -> Result<(), InferlabError> {
+fn gate_capture<'a>(
+    processes: impl IntoIterator<Item = &'a crate::resolve::ProcessPlan>,
+) -> Result<(), InferlabError> {
     if let Some(process) = processes
-        .iter()
+        .into_iter()
         .find(|process| process.capture_target.is_some())
     {
         return Err(reject(format!(
@@ -273,7 +227,7 @@ pub(crate) fn apply_external(
     machines: &std::collections::BTreeMap<String, crate::workspace::MachineBinding>,
     adapter: &crate::workspace::AdapterBinding,
 ) -> Result<(), InferlabError> {
-    gate_capture(&execution.server.processes)?;
+    gate_capture(execution.server.processes())?;
     let framework = execution.server.integration.framework.clone();
     let version = crate::adapter::probe_external_framework(
         &external.reference,
@@ -301,7 +255,7 @@ pub(crate) fn apply(
     image: &ImageLaunchPlan,
     machines: &std::collections::BTreeMap<String, crate::workspace::MachineBinding>,
 ) -> Result<(), InferlabError> {
-    gate_capture(&execution.server.processes)?;
+    gate_capture(execution.server.processes())?;
     containerize(execution, &image.image_id, machines, false);
     execution.server.image = Some(image.clone());
     Ok(())
@@ -329,10 +283,10 @@ fn probe_local_presence(external_id: &str, reference: &str) -> Result<(), Inferl
 /// launch surface's integration agreement has no counterpart to check
 /// against; the execution is not qualified by this workspace either way.
 pub(crate) fn select_external_for_adhoc(
-    workspace: &LoadedWorkspace,
+    config: &crate::workspace::WorkspaceConfig,
     external_id: &str,
 ) -> Result<String, InferlabError> {
-    let Some(declaration) = workspace.config.external_images.get(external_id) else {
+    let Some(declaration) = config.external_images.get(external_id) else {
         return Err(reject(format!(
             "unknown external image {external_id:?}; declare it under [external_images] in the \
              workspace"
@@ -346,7 +300,7 @@ fn reject(message: String) -> InferlabError {
     InferlabError::ImageSelection { message }
 }
 
-fn load_record(root: &Path, record_id: &str) -> Result<StoredImageRecord, InferlabError> {
+fn load_record(root: &Path, record_id: &str) -> Result<ImageRecord, InferlabError> {
     let plain = !matches!(record_id, "" | "." | "..")
         && record_id
             .bytes()
@@ -383,7 +337,7 @@ fn host_platform() -> String {
 
 /// Substitute the built image for the locally installed serving environment:
 /// every Pixi-activated server process runs inside `docker run` with host
-/// networking, its allocated GPUs, and its model weights and runtime cache
+/// networking, its allocated devices, and its model weights and runtime cache
 /// mounted at their host paths. Inferlab-owned processes (the built-in proxy)
 /// keep their host command.
 pub(crate) fn containerize(
@@ -405,7 +359,13 @@ pub(crate) fn containerize(
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or_default()
     );
-    for process in &mut execution.server.processes {
+    for process in execution
+        .server
+        .roles
+        .iter_mut()
+        .flat_map(|role| &mut role.replicas)
+        .flat_map(|replica| &mut replica.ranks)
+    {
         let argv = &process.command.argv;
         if argv.first().map(String::as_str) != Some("pixi") {
             continue;
@@ -425,18 +385,19 @@ pub(crate) fn containerize(
         if inner.is_empty() {
             continue;
         }
+        let container_name = format!("inferlab-{}-{nonce}", process.id);
         let mut container = vec![
             "docker".to_owned(),
             "run".to_owned(),
             "--rm".to_owned(),
             "--init".to_owned(),
             "--name".to_owned(),
-            format!("inferlab-{}-{nonce}", process.id),
+            container_name.clone(),
             "--network".to_owned(),
             "host".to_owned(),
             // Host-process semantics extend to IPC: multi-rank frameworks
             // bootstrap NCCL over shared memory, and docker's default 64MB
-            // /dev/shm kills the first multi-GPU launch (verified with
+            // /dev/shm kills the first multi-device launch (verified with
             // SGLang DP attention on real hardware).
             "--ipc".to_owned(),
             "host".to_owned(),
@@ -449,7 +410,7 @@ pub(crate) fn containerize(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            container.extend(crate::container::gpu_device_args(&devices));
+            container.extend(crate::container::docker_device_args(&devices));
         }
         let binding = machines
             .get(&process.machine)
@@ -472,8 +433,12 @@ pub(crate) fn containerize(
                 container.push(capability.clone());
             }
         }
-        let locator = &process.allocation.model_locator;
-        if locator.starts_with('/') {
+        if let Some(locator) = process
+            .allocation
+            .model_locator
+            .as_deref()
+            .filter(|locator| locator.starts_with('/'))
+        {
             // The explicit --mount form, not the -v shorthand: at least one
             // site docker proxy mis-parses the shorthand's `:ro` suffix on
             // same-path binds and silently drops the mount (verified on real
@@ -581,5 +546,9 @@ pub(crate) fn containerize(
             container.extend(inner);
         }
         process.command.argv = container;
+        process.container = Some(crate::resolve::ContainerPlan {
+            name: container_name,
+            image: image_id.to_owned(),
+        });
     }
 }

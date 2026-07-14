@@ -1,11 +1,11 @@
 {
   "status": "ok",
-  "protocol_version": "4",
+  "protocol_version": "5",
   "result": {
     "operation": "plan_serve",
     "output": {
       "resources": {
-        "accelerator_count": 4
+        "device_count": 4
       }
     }
   }

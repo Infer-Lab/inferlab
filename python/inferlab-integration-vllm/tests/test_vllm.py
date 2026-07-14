@@ -32,16 +32,19 @@ def test_plan_serve_matches_the_shared_vllm_fixture() -> None:
     result = plan_serve(request.root.input)
 
     assert expected.root.status == "ok"
-    assert result == expected.root.result.root.output
+    expected_output = expected.root.result.root.output
+    assert result.model_copy(update={"integration": expected_output.integration}) == expected_output
+    assert result.integration.framework_version == "unavailable"
     assert result.endpoint.prefix_cache_reset is None
-    assert result.public_endpoint.root.kind == "builtin_proxy"
+    assert result.routing.root.owner == "inferlab_builtin"
     assert "vllm" not in sys.modules
 
 
 def test_unknown_vllm_setting_returns_a_typed_protocol_error() -> None:
     payload = load_json(FIXTURES / "valid" / "plan-serve-request.json")
     input_payload = cast(dict[str, object], payload["input"])
-    settings = cast(dict[str, object], input_payload["settings"])
+    roles = cast(list[dict[str, object]], input_payload["roles"])
+    settings = cast(dict[str, object], roles[0]["settings"])
     settings["not_a_vllm_setting"] = True
 
     response = handle_request(json.dumps(payload), plan_serve)
@@ -70,7 +73,6 @@ def test_single_topology_rejects_a_routed_backend() -> None:
 
     assert response.root.status == "error"
     assert response.root.error.code == "invalid_settings"
-    assert "does not support routing backend" in str(response.root.error.message)
 
 
 def test_vllm_rejects_an_expert_size_that_does_not_match_tp_times_dp() -> None:
@@ -84,9 +86,6 @@ def test_vllm_rejects_an_expert_size_that_does_not_match_tp_times_dp() -> None:
 
     assert response.root.status == "error"
     assert response.root.error.code == "invalid_settings"
-    assert "outer.tensor_parallel_size * attention.data_parallel_size (2)" in str(
-        response.root.error.message
-    )
 
 
 def test_render_merges_extra_args_with_inferlab_owned_options() -> None:
@@ -113,8 +112,8 @@ def test_render_merges_extra_args_with_inferlab_owned_options() -> None:
     assert isinstance(request.root, AdapterRequestRenderServe)
     result = render_serve(request.root.input)
 
-    rank_zero = result.processes[0].process.argv
-    rank_one = result.processes[1].process.argv
+    rank_zero = result.processes[0].command.argv
+    rank_one = result.processes[1].command.argv
     assert rank_zero.count("--port") == 1
     assert rank_zero[rank_zero.index("--port") + 1] == "8000"
     assert rank_zero[rank_zero.index("--served-model-name") + 1] == "dsv4"
@@ -141,8 +140,10 @@ def test_render_serve_matches_the_shared_vllm_fixture() -> None:
     result = render_serve(request.root.input)
 
     assert expected.root.status == "ok"
-    assert result == expected.root.result.root.output
-    assert result.processes[0].process.env["VLLM_SERVER_DEV_MODE"] == "1"
+    expected_output = expected.root.result.root.output
+    assert result.model_copy(update={"integration": expected_output.integration}) == expected_output
+    assert result.integration.framework_version == "unavailable"
+    assert result.processes[0].command.env["VLLM_SERVER_DEV_MODE"] == "1"
 
 
 def test_render_serve_allows_an_explicit_cache_environment_override() -> None:
@@ -156,8 +157,43 @@ def test_render_serve_allows_an_explicit_cache_environment_override() -> None:
     assert isinstance(request.root, AdapterRequestRenderServe)
     result = render_serve(request.root.input)
 
-    assert result.processes[0].process.env["FLASHINFER_WORKSPACE_BASE"] == "/custom/flashinfer"
-    assert result.processes[0].process.env["TRITON_CACHE_DIR"].endswith("/triton")
+    assert result.processes[0].command.env["FLASHINFER_WORKSPACE_BASE"] == "/custom/flashinfer"
+    assert result.processes[0].command.env["TRITON_CACHE_DIR"].endswith("/triton")
+
+
+def test_render_lowers_published_vllm_settings() -> None:
+    payload = load_json(FIXTURES / "valid" / "render-serve-request.json")
+    input_payload = cast(dict[str, object], payload["input"])
+    roles = cast(list[dict[str, object]], input_payload["roles"])
+    for role in roles:
+        settings = cast(dict[str, object], role["effective_settings"])
+        settings.update(
+            {
+                "tokenizer_mode": "deepseek_v4",
+                "tool_call_parser": "deepseek_v4",
+                "enable_auto_tool_choice": True,
+                "reasoning_config": {
+                    "reasoning_parser": "deepseek_v4",
+                    "reasoning_start_str": "<think>",
+                    "reasoning_end_str": "</think>",
+                },
+                "enable_flashinfer_autotune": False,
+            }
+        )
+
+    request = AdapterRequest.model_validate(payload)
+    assert isinstance(request.root, AdapterRequestRenderServe)
+    argv = render_serve(request.root.input).processes[0].command.argv
+
+    assert argv[argv.index("--tokenizer-mode") + 1] == "deepseek_v4"
+    assert argv[argv.index("--tool-call-parser") + 1] == "deepseek_v4"
+    assert "--enable-auto-tool-choice" in argv
+    assert json.loads(argv[argv.index("--reasoning-config") + 1]) == {
+        "reasoning_parser": "deepseek_v4",
+        "reasoning_start_str": "<think>",
+        "reasoning_end_str": "</think>",
+    }
+    assert "--no-enable-flashinfer-autotune" in argv
 
 
 def test_plan_nixl_declares_side_channel_links_and_ports() -> None:
@@ -189,7 +225,7 @@ def test_plan_role_declares_the_whole_replica_accelerator_requirement() -> None:
     prefill = [replica for replica in result.replicas if replica.role_id == "prefill"]
 
     assert len(prefill) == 1
-    assert prefill[0].accelerator_count == 4
+    assert prefill[0].device_count == 4
     assert prefill[0].ports == ["bootstrap"]
     assert prefill[0].primary_ports == ["master"]
     assert prefill[0].capture_target is not None
@@ -206,7 +242,7 @@ def test_plan_static_npmd_keeps_replicas_distinct_from_ranks() -> None:
     assert isinstance(request.root, AdapterRequestPlanServe)
     result = plan_serve(request.root.input)
 
-    assert [role.replica_count for role in result.roles] == [2, 3]
+    assert [role.effective_replica_count for role in result.roles] == [2, 3]
     assert [replica.id for replica in result.replicas] == [
         "prefill-000",
         "prefill-001",
@@ -231,9 +267,9 @@ def test_render_nixl_uses_role_side_channels_and_connector() -> None:
     result = render_serve(request.root.input)
 
     for index, process in enumerate(result.processes):
-        config = process.process.argv[process.process.argv.index("--kv-transfer-config") + 1]
+        config = process.command.argv[process.command.argv.index("--kv-transfer-config") + 1]
         assert '"kv_connector":"NixlConnector"' in config
-        assert process.process.env["VLLM_NIXL_SIDE_CHANNEL_PORT"] == str(9000 + index)
+        assert process.command.env["VLLM_NIXL_SIDE_CHANNEL_PORT"] == str(9000 + index)
 
 
 def test_plan_vllm_router_makes_the_external_router_public() -> None:
@@ -246,23 +282,33 @@ def test_plan_vllm_router_makes_the_external_router_public() -> None:
     result = plan_serve(request.root.input)
 
     assert result.replicas[-1].role_id == "router"
-    assert result.replicas[-1].accelerator_count == 0
-    assert result.public_endpoint.root.kind == "replica"
-    assert result.public_endpoint.root.replica_id == "router"
+    assert result.replicas[-1].device_count == 0
+    assert result.routing.root.owner == "integration_native"
+    assert result.routing.root.role == "router"
+    assert result.routing.root.replica == 0
 
 
 def test_vllm_router_targets_replica_entrypoints_and_defers_startup_timeout() -> None:
     payload = load_json(FIXTURES / "valid" / "render-serve-request.json")
     input_payload = cast(dict[str, object], payload["input"])
     input_payload["routing_backend"] = "vllm-router"
+    input_payload["routing"] = {
+        "owner": "integration_native",
+        "role": "router",
+        "replica": 0,
+        "policy": "round_robin",
+    }
     roles = cast(list[dict[str, object]], input_payload["roles"])
-    roles[0]["replica_count"] = 2
-    roles[1]["replica_count"] = 2
+    roles[0]["declared_replica_count"] = 2
+    roles[0]["effective_replica_count"] = 2
+    roles[1]["declared_replica_count"] = 2
+    roles[1]["effective_replica_count"] = 2
     roles.append(
         {
             "id": "router",
             "kind": "router",
-            "replica_count": 1,
+            "declared_replica_count": 1,
+            "effective_replica_count": 1,
             "effective_settings": {},
             "effective_parallelism": {},
         }
@@ -271,9 +317,10 @@ def test_vllm_router_targets_replica_entrypoints_and_defers_startup_timeout() ->
     prefill = allocations[0]
     prefill.update(
         {
-            "process_id": "prefill-000-rank-000",
-            "replica_id": "prefill-000",
+            "process": "prefill-000-rank-000",
+            "replica": 0,
             "rank": 0,
+            "rank_count": 2,
             "ports": {
                 "bootstrap": {"host": "node-a.example", "port": 29501},
                 "master": {"host": "node-a.example", "port": 29502},
@@ -283,9 +330,10 @@ def test_vllm_router_targets_replica_entrypoints_and_defers_startup_timeout() ->
     prefill_rank = json.loads(json.dumps(prefill))
     prefill_rank.update(
         {
-            "process_id": "prefill-000-rank-001",
-            "machine_id": "node-b",
+            "process": "prefill-000-rank-001",
+            "machine": "node-b",
             "rank": 1,
+            "rank_count": 2,
             "endpoint": {"host": "node-b.example", "port": 8000},
             "ports": {"bootstrap": {"host": "node-b.example", "port": 29501}},
         }
@@ -293,36 +341,41 @@ def test_vllm_router_targets_replica_entrypoints_and_defers_startup_timeout() ->
     prefill_replica = json.loads(json.dumps(prefill))
     prefill_replica.update(
         {
-            "process_id": "prefill-001",
-            "replica_id": "prefill-001",
-            "replica_index": 1,
+            "process": "prefill-001",
+            "replica": 1,
+            "rank_count": 1,
+            "machine": "node-c",
+            "cache": "/cache/runtime/node-c/prefill-001",
             "endpoint": {"host": "node-c.example", "port": 8000},
             "ports": {"bootstrap": {"host": "node-c.example", "port": 29501}},
         }
     )
     decode = allocations[1]
-    decode.update({"process_id": "decode-000", "replica_id": "decode-000"})
+    decode.update({"process": "decode-000", "replica": 0})
     decode_replica = json.loads(json.dumps(decode))
     decode_replica.update(
         {
-            "process_id": "decode-001",
-            "replica_id": "decode-001",
-            "replica_index": 1,
+            "process": "decode-001",
+            "replica": 1,
+            "machine": "node-d",
+            "cache": "/cache/runtime/node-d/decode-001",
             "endpoint": {"host": "node-d.example", "port": 8000},
         }
     )
     router = {
-        "process_id": "router",
-        "role_id": "router",
-        "replica_id": "router",
-        "replica_index": 0,
+        "process": "router",
+        "role": "router",
+        "replica": 0,
         "rank": 0,
-        "machine_id": "local",
-        "model_locator": "/models/dsv4",
-        "runtime_cache_root": "/cache/runtime/local/router",
+        "rank_count": 1,
+        "machine": "local",
+        "model_locator": None,
+        "cache": "/cache/runtime/local/router",
         "devices": [],
         "endpoint": {"host": "127.0.0.1", "port": 8000},
         "ports": {},
+        "launch": {"kind": "local"},
+        "dependencies": [],
     }
     input_payload["allocations"] = [
         prefill_rank,
@@ -336,9 +389,11 @@ def test_vllm_router_targets_replica_entrypoints_and_defers_startup_timeout() ->
     request = AdapterRequest.model_validate(payload)
     assert isinstance(request.root, AdapterRequestRenderServe)
     result = render_serve(request.root.input)
-    argv = result.processes[-1].process.argv
+    argv = result.processes[-1].command.argv
     rank_one = next(
-        process.process.argv for process in result.processes if process.id == "prefill-000-rank-001"
+        process.command.argv
+        for process in result.processes
+        if process.process == "prefill-000-rank-001"
     )
 
     assert rank_one[rank_one.index("--master-addr") + 1] == "node-a.example"

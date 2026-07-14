@@ -21,7 +21,7 @@ pub(crate) const REMOVAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// comma-joined list). The literal quotes are part of the value: docker's
 /// `--gpus` parser splits an unquoted `device=0,1` on the comma and exposes
 /// only the first device (verified on real hardware in v1.5).
-pub(crate) fn gpu_device_args(spec: &str) -> [String; 2] {
+pub(crate) fn docker_device_args(spec: &str) -> [String; 2] {
     ["--gpus".to_owned(), format!("\"device={spec}\"")]
 }
 

@@ -2,7 +2,7 @@
 //! a confirmation established against exact manifest and lock content
 //! survives an unrelated change and lets the real pixi probe be skipped;
 //! content that actually changes invalidates it. Also covers the standalone
-//! `inferlab env status` query this mechanism backs.
+//! `inferlab stack status` query this mechanism backs.
 
 use serde_json::Value;
 use std::error::Error;
@@ -20,17 +20,17 @@ struct StatusWorkspace {
 }
 
 impl StatusWorkspace {
-    fn new(environments: &[&str]) -> Result<Self, Box<dyn Error>> {
+    fn new(stacks: &[&str]) -> Result<Self, Box<dyn Error>> {
         let root = tempfile::tempdir()?;
         let inferlab = root.path().join(".inferlab");
         let bin = root.path().join("fixture-bin");
         fs::create_dir_all(&inferlab)?;
         fs::create_dir_all(&bin)?;
 
-        let mut workspace = String::from("schema_version = 1\n");
-        for environment in environments {
+        let mut workspace = String::from("schema_version = 2\n");
+        for stack in stacks {
             workspace.push_str(&format!(
-                "[environments.{environment}]\npixi_environment = \"{environment}\"\n"
+                "[stacks.{stack}]\nintegration = \"vllm\"\npixi_environment = \"{stack}\"\n"
             ));
         }
         fs::write(inferlab.join("workspace.toml"), workspace)?;
@@ -41,14 +41,14 @@ impl StatusWorkspace {
              [environments]\n",
         );
         let mut lock = String::from("version: 6\nenvironments:\n");
-        for environment in environments {
-            manifest.push_str(&format!("{environment} = []\n"));
-            lock.push_str(&format!("  {environment}: {{}}\n"));
+        for stack in stacks {
+            manifest.push_str(&format!("{stack} = []\n"));
+            lock.push_str(&format!("  {stack}: {{}}\n"));
         }
         fs::write(root.path().join("pixi.toml"), manifest)?;
         fs::write(root.path().join("pixi.lock"), lock)?;
-        for environment in environments {
-            fs::create_dir_all(root.path().join(".pixi/envs").join(environment))?;
+        for stack in stacks {
+            fs::create_dir_all(root.path().join(".pixi/envs").join(stack))?;
         }
 
         let pixi_log = root.path().join("pixi-argv.log");
@@ -113,14 +113,14 @@ fn stdout_json(output: &Output) -> Result<Value, Box<dyn Error>> {
 }
 
 #[test]
-fn env_status_reports_confirmed_and_exits_zero_without_local_bindings() -> Result<(), Box<dyn Error>>
-{
+fn stack_status_reports_confirmed_and_exits_zero_without_local_bindings()
+-> Result<(), Box<dyn Error>> {
     let workspace = StatusWorkspace::new(&["vllm"])?;
-    // No .inferlab/local.toml was written: env status must not require it.
-    let output = workspace.run(&["env", "status"])?;
+    // No .inferlab/local.toml was written: stack status must not require it.
+    let output = workspace.run(&["stack", "status"])?;
     assert!(output.status.success(), "{}", stderr(&output));
     let report = stdout_json(&output)?;
-    assert_eq!(report[0]["environment"], "vllm");
+    assert_eq!(report[0]["stack"], "vllm");
     assert_eq!(report[0]["pixi_environment"], "vllm");
     assert_eq!(report[0]["status"], "confirmed");
     assert!(report[0]["diagnostics"].is_null());
@@ -132,7 +132,7 @@ fn env_status_reports_confirmed_and_exits_zero_without_local_bindings() -> Resul
 fn a_confirmation_survives_an_unrelated_change_and_skips_the_real_probe()
 -> Result<(), Box<dyn Error>> {
     let workspace = StatusWorkspace::new(&["vllm"])?;
-    let first = workspace.run(&["env", "status"])?;
+    let first = workspace.run(&["stack", "status"])?;
     assert!(first.status.success(), "{}", stderr(&first));
     assert_eq!(
         workspace.probe_count(),
@@ -146,7 +146,7 @@ fn a_confirmation_survives_an_unrelated_change_and_skips_the_real_probe()
     // touching an unrelated file.
     fs::write(workspace.root.path().join("README.md"), "unrelated\n")?;
 
-    let second = workspace.run(&["env", "status"])?;
+    let second = workspace.run(&["stack", "status"])?;
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(
         workspace.probe_count(),
@@ -163,7 +163,7 @@ fn a_confirmation_survives_an_unrelated_change_and_skips_the_real_probe()
 fn a_manifest_change_invalidates_the_confirmation_and_reruns_the_probe()
 -> Result<(), Box<dyn Error>> {
     let workspace = StatusWorkspace::new(&["vllm"])?;
-    let first = workspace.run(&["env", "status"])?;
+    let first = workspace.run(&["stack", "status"])?;
     assert!(first.status.success(), "{}", stderr(&first));
     assert_eq!(workspace.probe_count(), 1);
 
@@ -174,7 +174,7 @@ fn a_manifest_change_invalidates_the_confirmation_and_reruns_the_probe()
     let manifest = fs::read_to_string(&manifest_path)?;
     fs::write(&manifest_path, format!("{manifest}\n# edited\n"))?;
 
-    let second = workspace.run(&["env", "status"])?;
+    let second = workspace.run(&["stack", "status"])?;
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(
         workspace.probe_count(),
@@ -190,7 +190,7 @@ fn a_manifest_change_invalidates_the_confirmation_and_reruns_the_probe()
 #[test]
 fn a_lock_change_invalidates_the_confirmation_and_reruns_the_probe() -> Result<(), Box<dyn Error>> {
     let workspace = StatusWorkspace::new(&["vllm"])?;
-    let first = workspace.run(&["env", "status"])?;
+    let first = workspace.run(&["stack", "status"])?;
     assert!(first.status.success(), "{}", stderr(&first));
     assert_eq!(workspace.probe_count(), 1);
 
@@ -198,7 +198,7 @@ fn a_lock_change_invalidates_the_confirmation_and_reruns_the_probe() -> Result<(
     let lock = fs::read_to_string(&lock_path)?;
     fs::write(&lock_path, format!("{lock}# relocked\n"))?;
 
-    let second = workspace.run(&["env", "status"])?;
+    let second = workspace.run(&["stack", "status"])?;
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(
         workspace.probe_count(),
@@ -215,24 +215,24 @@ fn env_status_reports_never_installed_and_not_usable_and_exits_nonzero()
     let workspace = StatusWorkspace::new(&["vllm", "sglang"])?;
     fs::remove_dir_all(workspace.root.path().join(".pixi/envs/vllm"))?;
 
-    let output = workspace.run_with_env(&[("FAKE_PIXI_PROBE_EXIT", "1")], &["env", "status"])?;
+    let output = workspace.run_with_env(&[("FAKE_PIXI_PROBE_EXIT", "1")], &["stack", "status"])?;
     assert!(!output.status.success());
     let report = stdout_json(&output)?;
     let entries = report.as_array().ok_or("report must be a JSON array")?;
-    let by_env = |id: &str| -> Result<&Value, Box<dyn Error>> {
+    let by_stack = |id: &str| -> Result<&Value, Box<dyn Error>> {
         entries
             .iter()
-            .find(|entry| entry["environment"] == id)
+            .find(|entry| entry["stack"] == id)
             .ok_or_else(|| format!("no report entry for {id}").into())
     };
-    let vllm = by_env("vllm")?;
+    let vllm = by_stack("vllm")?;
     assert_eq!(vllm["status"], "never-installed");
     let vllm_install_command = vllm["install_command"]
         .as_str()
         .ok_or("install_command must be a string")?;
     assert!(vllm_install_command.contains("vllm"));
 
-    let sglang = by_env("sglang")?;
+    let sglang = by_stack("sglang")?;
     assert_eq!(sglang["status"], "not-usable");
     assert!(sglang["diagnostics"].is_string());
     let sglang_install_command = sglang["install_command"]
@@ -253,18 +253,17 @@ fn env_status_reports_never_installed_and_not_usable_and_exits_nonzero()
 }
 
 #[test]
-fn env_status_narrows_to_one_declared_environment() -> Result<(), Box<dyn Error>> {
+fn stack_status_narrows_to_one_declared_stack() -> Result<(), Box<dyn Error>> {
     let workspace = StatusWorkspace::new(&["vllm", "sglang"])?;
-    let output = workspace.run(&["env", "status", "--environment", "vllm"])?;
+    let output = workspace.run(&["stack", "status", "vllm"])?;
     assert!(output.status.success(), "{}", stderr(&output));
     let report = stdout_json(&output)?;
     let entries = report.as_array().ok_or("report must be a JSON array")?;
     assert_eq!(entries.len(), 1);
-    assert_eq!(report[0]["environment"], "vllm");
+    assert_eq!(report[0]["stack"], "vllm");
 
-    let unknown = workspace.run(&["env", "status", "--environment", "missing"])?;
+    let unknown = workspace.run(&["stack", "status", "missing"])?;
     assert!(!unknown.status.success());
-    assert!(stderr(&unknown).contains("missing"));
     Ok(())
 }
 

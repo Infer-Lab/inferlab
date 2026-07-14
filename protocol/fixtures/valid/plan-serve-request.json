@@ -1,18 +1,14 @@
 {
   "operation": "plan_serve",
-  "protocol_version": "4",
+  "protocol_version": "5",
   "input": {
     "model": {
-      "locator": "/models/dsv4",
+      "id": "dsv4",
       "served_name": "dsv4"
     },
     "topology": "prefill_decode",
     "routing_backend": "builtin",
     "kv_transfer": "mooncake",
-    "parallelism": {},
-    "settings": {
-      "trust_remote_code": true
-    },
     "roles": [
       {
         "id": "prefill",
@@ -21,7 +17,7 @@
         "parallelism": {
           "outer": {"tensor_parallel_size": 2}
         },
-        "settings": {}
+        "settings": {"trust_remote_code": true}
       },
       {
         "id": "decode",
@@ -30,7 +26,7 @@
         "parallelism": {
           "outer": {"tensor_parallel_size": 2}
         },
-        "settings": {}
+        "settings": {"trust_remote_code": true}
       }
     ],
     "profiling": true

@@ -15,7 +15,7 @@ Status meanings:
 - **—**: rejected by the integration or not exposed by Inferlab.
 
 A qualified baseline is evidence for that concrete shape, not blanket
-certification of every framework version, model, GPU, or parallel configuration.
+certification of every framework version, model, device, or parallel configuration.
 
 ## Serving And Control
 

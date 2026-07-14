@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-14
+
+### Changed
+
+- Workspace schema version 2 replaces source sets, serving environments, serve profiles, and recipe-owned cases with stacks, independently launchable servers, server-owned cases, and recipes that compose one server with one workload suite. Local placements can bind explicit role/replica/rank allocations, including zero-device proxy ranks and machine-specific model locators.
+- The matching CLI uses `workspace lock`, `stack status [STACK]`, `run --stack`, and `serve start <SERVER>`; serve, recipe, and image workflows accept explicit local placement selection.
+- Adapter protocol version 5 plans canonical role/replica/rank hierarchies. Each role is the sole authority for effective settings and parallelism; concrete process allocations carry only placement and launch facts. Dry-run, execution, and records now share concrete resolved types, and lifecycle commands reload their complete authority from records without consulting current workspace configuration.
+- Ad-hoc `run` resolves only committed stack and image declarations and no longer loads machine-local bindings. Server overrides mirror the typed workspace shape, keep backend values under explicit common or role `settings` paths, and accept quoted TOML key segments including setting names containing literal dots.
+- Record identifiers include the workflow and selected server, recipe, Bench, or image name, plus the selected case where applicable and the creating process ID.
+
+### Fixed
+
+- Device hardware evidence now invokes NVIDIA's native `nvidia-smi --query-gpu` spelling while keeping Inferlab's public resource terminology consistently device-based.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
@@ -16,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TensorRT-LLM prefill/decode serving can use its native disaggregated frontend or the Inferlab built-in proxy over NIXL.
 - Framework integrations can render content-addressed launch files; the control plane validates, records, and atomically materializes them for local, SSH, and container launches.
 - TensorRT-LLM is now a supported serving framework: the new `inferlab-integration-tensorrt-llm` package plans and renders `trtllm-serve` launches (declare `integration = "tensorrt-llm"` in a serve profile). It maps the shared parallelism vocabulary onto TensorRT-LLM's semantics — attention data parallelism is all-or-nothing (`--enable_attention_dp`), expert parallelism divides the tensor-parallel world — and rejects shapes TensorRT-LLM cannot serve (context parallel, MoE data parallel, dense tensor parallel) at planning time. Framework knobs only reachable through TensorRT-LLM's extra-LLM-API-options YAML (MoE backends, attention-DP balancing, KV block-reuse control) pass through the `extra_llm_api_options` path setting. Note: TensorRT-LLM exposes no prefix-cache flush endpoint, so benches against it cannot request `reset_prefix_cache`; disable KV block reuse at launch instead when a case needs cache isolation. The adapter boundary was smoke-validated against the official release image; the maintained DeepSeek-V4 SM120 baseline is source-built.
-- `inferlab run [--environment ID] [--image RECORD | --external-image ID] [--mount PATH[:rw]]... [--gpus SPEC] -- CMD...` runs one ad-hoc command inside a serving environment — a local Pixi install, a built image, or an external image — attached to your terminal and exiting with the command's own status. There are no default mounts; `--mount` binds an absolute host path read-only unless suffixed `:rw`, and `--gpus` exposes an explicit device selection to a container.
+- `inferlab run [--environment ID] [--image RECORD | --external-image ID] [--mount PATH[:rw]]... [--gpus SPEC] -- CMD...` runs one ad-hoc command inside a serving environment — a local Pixi install, a built image, or an external image — attached to your terminal and exiting with the command's own status. There are no default mounts; `--mount` binds an absolute host path read-only unless suffixed `:rw`, and `--gpus` exposes an explicit GPU selection to a container.
 - `inferlab env status [--environment ID]` reports whether each declared serving environment is `confirmed`, `never-installed`, or `not-usable`, as JSON, without needing local machine bindings or installing anything — useful right after a fresh checkout or a `git pull` to check before you launch anything. Exits non-zero if any environment isn't confirmed.
 - A successful environment check is now remembered against the exact Pixi manifest and lock content that produced it, so a launch that finds nothing changed skips re-probing Pixi entirely; any edit to the manifest or lock invalidates the memory and forces a fresh check. `inferlab run` deliberately does not participate in this — it neither trusts nor produces this evidence, so an ad-hoc command can never make a real launch skip a check it should have made, or vice versa.
 - `inferlab agent install` no longer needs a repository checkout: the Claude Code / Codex plugin package now ships embedded in the binary itself, so `inferlab agent install --agent all` works immediately after installing the CLI, offline. `--from-checkout <DIR>` is still available for testing local edits to the plugin before a release.

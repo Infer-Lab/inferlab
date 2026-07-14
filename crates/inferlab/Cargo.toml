@@ -17,8 +17,8 @@ clap.workspace = true
 ctrlc.workspace = true
 flate2.workspace = true
 fs2.workspace = true
-inferlab-protocol = { path = "../inferlab-protocol", version = "0.2.0" }
-inferlab-proxy = { path = "../inferlab-proxy", version = "0.2.0" }
+inferlab-protocol = { path = "../inferlab-protocol", version = "0.3" }
+inferlab-proxy = { path = "../inferlab-proxy", version = "0.3" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

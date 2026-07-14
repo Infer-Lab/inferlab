@@ -4,20 +4,21 @@ use schemars::generate::SchemaSettings;
 
 pub use wire::{
     AdapterError, AdapterErrorCode, AdapterProtocol, AdapterRequest, AdapterResponse,
-    AdapterResult, BenchCaseInput, BenchClientRequest, BenchClientResult, BenchDefinitionInput,
-    BenchLoadInput, CaptureControlRequirement, CaptureTargetRequirement, ClientEndpointInput,
-    ClientStatus, EndpointAssignment, EndpointProtocol, EndpointRequirement, EvalClientRequest,
-    EvalClientResult, EvalDefinitionInput, HttpActionSpec, HttpMethod, HttpTargetRegistryReadiness,
-    IntegrationIdentity, KvTransferMechanism, LaunchFileDeclaration, Parallelism,
-    ParallelismAttention, ParallelismExperts, ParallelismOuter, PlanServeInput, PlanServeResult,
-    ProcessSpec, ProtocolVersion, PublicEndpointRequirement, RawArtifact, ReadinessProbe,
+    AdapterResult, AllocationLaunch, BenchCaseInput, BenchClientRequest, BenchClientResult,
+    BenchDefinitionInput, BenchLoadInput, BuiltinRouterKind, CaptureControlRequirement,
+    CaptureTargetRequirement, ClientEndpointInput, ClientStatus, EndpointAssignment,
+    EndpointProtocol, EndpointRequirement, EvalClientRequest, EvalClientResult,
+    EvalDefinitionInput, HttpActionSpec, HttpMethod, HttpTargetRegistryReadiness,
+    IntegrationIdentity, KvTransferMechanism, LaunchFileDeclaration, MeasurementModelInput,
+    Parallelism, ParallelismAttention, ParallelismExperts, ParallelismOuter, PlanServeInput,
+    PlanServeResult, ProcessSpec, ProtocolVersion, RawArtifact, ReadinessProbe,
     RenderInputDeclaration, RenderServeInput, RenderServeResult, RenderedServeProcess,
-    ServeModelInput, ServeProcessAllocation, ServeReplicaRequirement, ServeRoleInput,
-    ServeRoleKind, ServeRoleLink, ServeRoleResult, ServeTopology, SettingValue,
+    RoutingResult, ServeModelInput, ServeProcessAllocation, ServeReplicaRequirement,
+    ServeRoleInput, ServeRoleKind, ServeRoleLink, ServeRoleResult, ServeTopology, SettingValue,
     SuppliedRenderInput, TargetEndpointScheme,
 };
 
-pub const PROTOCOL_SCHEMA_ID: &str = "https://inferlab.dev/schema/adapter-protocol/v4";
+pub const PROTOCOL_SCHEMA_ID: &str = "https://inferlab.dev/schema/adapter-protocol/v5";
 
 #[must_use]
 pub fn protocol_schema() -> schemars::Schema {

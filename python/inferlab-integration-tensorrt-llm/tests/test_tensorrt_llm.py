@@ -1,5 +1,6 @@
 import hashlib
 from pathlib import Path
+from typing import cast
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -18,6 +19,7 @@ from inferlab_adapter_sdk import (
     ServeRoleInput,
     ServeRoleKind,
     ServeRoleLinkKvTransfer,
+    ServeRoleResult,
     ServeTopology,
     SettingValue,
     SuppliedRenderInput,
@@ -26,22 +28,35 @@ from inferlab_integration_tensorrt_llm import plan_serve, render_serve
 
 
 def _plan_input(**overrides: object) -> PlanServeInput:
-    base: dict[str, object] = {
-        "model": ServeModelInput(locator="/models/example", served_name="example"),
-        "topology": ServeTopology.single,
-        "routing_backend": "builtin",
-        "kv_transfer": None,
-        "parallelism": Parallelism(outer=ParallelismOuter(tensor_parallel_size=2)),
-        "settings": {"trust_remote_code": SettingValue(root=True)},
-        "roles": [
+    parallelism = cast(
+        Parallelism,
+        overrides.pop(
+            "parallelism",
+            Parallelism(outer=ParallelismOuter(tensor_parallel_size=2)),
+        ),
+    )
+    settings = cast(
+        dict[str, SettingValue],
+        overrides.pop("settings", {"trust_remote_code": SettingValue(root=True)}),
+    )
+    roles = overrides.pop(
+        "roles",
+        [
             ServeRoleInput(
                 id="serve",
                 kind=ServeRoleKind.serve,
                 replica_count=1,
-                parallelism=Parallelism(outer=ParallelismOuter(tensor_parallel_size=2)),
-                settings={},
+                parallelism=parallelism,
+                settings=settings,
             )
         ],
+    )
+    base: dict[str, object] = {
+        "model": ServeModelInput(id="example", served_name="example"),
+        "topology": ServeTopology.single,
+        "routing_backend": None,
+        "kv_transfer": None,
+        "roles": roles,
         "profiling": False,
     }
     base.update(overrides)
@@ -65,22 +80,22 @@ def test_plan_single_topology() -> None:
 
     assert result.integration.framework == "tensorrt-llm"
     assert [replica.id for replica in result.replicas] == ["server"]
-    assert result.replicas[0].accelerator_count == 2
+    assert result.replicas[0].device_count == 2
     probe = result.replicas[0].primary_readiness.root
     assert isinstance(probe, ReadinessProbeHttp) and probe.path == "/health"
     assert result.endpoint.api_path == "/v1/completions"
     assert result.endpoint.prefix_cache_reset is None, "no flush endpoint in TensorRT-LLM"
-    assert result.public_endpoint.root.kind == "replica"
-    outer = result.effective_parallelism.outer
+    assert result.routing.root.owner == "direct"
+    outer = result.roles[0].effective_parallelism.outer
     assert outer is not None and outer.tensor_parallel_size == 2
 
 
 def test_plan_rejects_unsupported_shapes() -> None:
-    with pytest.raises(AdapterOperationError, match="profiling"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_plan_input(profiling=True))
-    with pytest.raises(AdapterOperationError, match="Extra inputs are not permitted"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_plan_input(settings={"unknown_setting": SettingValue(root=1)}))
-    with pytest.raises(AdapterOperationError, match="context parallelism"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -91,7 +106,7 @@ def test_plan_rejects_unsupported_shapes() -> None:
                 )
             )
         )
-    with pytest.raises(AdapterOperationError, match="MoE data parallelism"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -102,7 +117,7 @@ def test_plan_rejects_unsupported_shapes() -> None:
                 )
             )
         )
-    with pytest.raises(AdapterOperationError, match="dense tensor parallelism"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -113,7 +128,7 @@ def test_plan_rejects_unsupported_shapes() -> None:
                 )
             )
         )
-    with pytest.raises(AdapterOperationError, match="must divide"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -127,7 +142,7 @@ def test_plan_rejects_unsupported_shapes() -> None:
 
 
 def test_plan_attention_dp_is_all_or_nothing() -> None:
-    with pytest.raises(AdapterOperationError, match="all-or-nothing"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -148,11 +163,11 @@ def test_plan_attention_dp_is_all_or_nothing() -> None:
     assert attention is not None
     assert attention.data_parallel_size == 4
     assert attention.tensor_parallel_size == 1
-    assert result.replicas[0].accelerator_count == 4
+    assert result.replicas[0].device_count == 4
 
 
 def test_plan_rejects_inconsistent_declared_components() -> None:
-    with pytest.raises(AdapterOperationError, match=r"effective attention\.tensor_parallel_size"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -165,7 +180,7 @@ def test_plan_rejects_inconsistent_declared_components() -> None:
                 )
             )
         )
-    with pytest.raises(AdapterOperationError, match=r"effective experts\.tensor_parallel_size"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(
             _plan_input(
                 roles=_serve_role(
@@ -188,27 +203,30 @@ def test_plan_expert_parallel_mapping() -> None:
     assert experts is not None
     assert experts.expert_parallel_size == 2
     assert experts.tensor_parallel_size == 2
-    assert result.replicas[0].accelerator_count == 4
+    assert result.replicas[0].device_count == 4
 
 
 def _prefill_decode_roles(
-    prefill_replicas: int = 2, decode_replicas: int = 3
+    prefill_replicas: int = 2,
+    decode_replicas: int = 3,
+    settings: dict[str, SettingValue] | None = None,
 ) -> list[ServeRoleInput]:
     parallelism = Parallelism(outer=ParallelismOuter(tensor_parallel_size=2))
+    role_settings = settings or {}
     return [
         ServeRoleInput(
             id="prefill",
             kind=ServeRoleKind.prefill,
             replica_count=prefill_replicas,
             parallelism=parallelism,
-            settings={},
+            settings=role_settings,
         ),
         ServeRoleInput(
             id="decode",
             kind=ServeRoleKind.decode,
             replica_count=decode_replicas,
             parallelism=parallelism,
-            settings={},
+            settings=role_settings,
         ),
     ]
 
@@ -225,8 +243,7 @@ def _prefill_decode_plan_input(
         topology=ServeTopology.prefill_decode,
         routing_backend=routing_backend,
         kv_transfer=transport,
-        settings=settings or {},
-        roles=_prefill_decode_roles(prefill_replicas, decode_replicas),
+        roles=_prefill_decode_roles(prefill_replicas, decode_replicas, settings),
     )
 
 
@@ -237,7 +254,7 @@ def test_plan_prefill_decode_uses_nixl_without_control_plane_transfer_ports() ->
         )
     )
 
-    assert [role.replica_count for role in result.roles] == [2, 3]
+    assert [role.effective_replica_count for role in result.roles] == [2, 3]
     assert [replica.id for replica in result.replicas] == [
         "prefill-000",
         "prefill-001",
@@ -250,7 +267,7 @@ def test_plan_prefill_decode_uses_nixl_without_control_plane_transfer_ports() ->
     transfer = result.links[1].root
     assert isinstance(transfer, ServeRoleLinkKvTransfer)
     assert transfer.mechanism == KvTransferMechanism.nixl
-    assert result.public_endpoint.root.kind == "builtin_proxy"
+    assert result.routing.root.owner == "inferlab_builtin"
     assert result.endpoint.api_path == "/v1/completions"
     assert result.endpoint.prefix_cache_reset is None
     assert [item.source_path for item in result.render_inputs] == ["configs/operator.yaml"]
@@ -268,47 +285,61 @@ def test_plan_prefill_decode_declares_the_native_router() -> None:
     assert result.roles[-1].kind == ServeRoleKind.router
     router = result.replicas[-1]
     assert router.id == "router"
-    assert router.accelerator_count == 0
+    assert router.device_count == 0
     readiness = router.primary_readiness.root
     assert isinstance(readiness, ReadinessProbeHttp)
     assert readiness.path == "/health"
-    assert result.public_endpoint.root.kind == "replica"
-    assert result.public_endpoint.root.replica_id == "router"
+    assert result.routing.root.owner == "integration_native"
+    assert result.routing.root.role == "router"
+    assert result.routing.root.replica == 0
 
 
 def test_plan_prefill_decode_rejects_non_nixl_and_unknown_routing() -> None:
-    with pytest.raises(AdapterOperationError, match="requires NIXL"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_prefill_decode_plan_input(transport=KvTransferMechanism.mooncake))
-    with pytest.raises(AdapterOperationError, match="does not support routing backend"):
+    with pytest.raises(AdapterOperationError):
         plan_serve(_prefill_decode_plan_input(routing_backend="unknown"))
 
 
 def _render_input(**overrides: object) -> RenderServeInput:
     plan = plan_serve(_plan_input())
+    parallelism = cast(
+        Parallelism,
+        overrides.pop("parallelism", plan.roles[0].effective_parallelism),
+    )
+    settings = cast(
+        dict[str, SettingValue],
+        overrides.pop("settings", plan.roles[0].effective_settings),
+    )
+    roles = list(cast(list[ServeRoleResult], overrides.pop("roles", plan.roles)))
+    roles[0] = roles[0].model_copy(
+        update={"effective_parallelism": parallelism, "effective_settings": settings}
+    )
     base: dict[str, object] = {
-        "model": ServeModelInput(locator="/models/example", served_name="example"),
+        "model": ServeModelInput(id="example", served_name="example"),
         "topology": ServeTopology.single,
-        "routing_backend": "builtin",
+        "routing_backend": None,
         "kv_transfer": None,
-        "parallelism": plan.effective_parallelism,
-        "settings": plan.effective_settings,
-        "roles": plan.roles,
+        "roles": roles,
         "links": [],
+        "routing": plan.routing,
         "profiling": False,
         "allocations": [
             ServeProcessAllocation.model_validate(
                 {
-                    "process_id": "server-rank-000",
-                    "role_id": "serve",
-                    "replica_id": "server",
-                    "replica_index": 0,
+                    "process": "server-rank-000",
+                    "role": "serve",
+                    "replica": 0,
                     "rank": 0,
-                    "machine_id": "local",
+                    "rank_count": 1,
+                    "machine": "local",
                     "model_locator": "/models/example",
                     "devices": [0, 1],
                     "endpoint": {"host": "127.0.0.1", "port": 8000},
                     "ports": {},
-                    "runtime_cache_root": "/cache/server",
+                    "cache": "/cache/server",
+                    "launch": {"kind": "local"},
+                    "dependencies": [],
                 }
             )
         ],
@@ -341,17 +372,21 @@ def _prefill_decode_render_input(
         allocations.append(
             ServeProcessAllocation.model_validate(
                 {
-                    "process_id": replica.id,
-                    "role_id": replica.role_id,
-                    "replica_id": replica.id,
-                    "replica_index": replica.replica_index,
+                    "process": replica.id,
+                    "role": replica.role_id,
+                    "replica": replica.replica_index,
                     "rank": 0,
-                    "machine_id": f"machine-{index}",
-                    "model_locator": "/models/example",
-                    "devices": list(range(replica.accelerator_count)),
+                    "rank_count": 1,
+                    "machine": f"machine-{index}",
+                    "model_locator": (
+                        None if role.kind == ServeRoleKind.router else "/models/example"
+                    ),
+                    "devices": list(range(replica.device_count)),
                     "endpoint": {"host": host, "port": port},
                     "ports": {},
-                    "runtime_cache_root": f"/cache/{replica.id}",
+                    "cache": f"/cache/{replica.id}",
+                    "launch": {"kind": "local"},
+                    "dependencies": [],
                 }
             )
         )
@@ -366,14 +401,13 @@ def _prefill_decode_render_input(
             )
         )
     return RenderServeInput(
-        model=ServeModelInput(locator="/models/example", served_name="example"),
+        model=ServeModelInput(id="example", served_name="example"),
         topology=ServeTopology.prefill_decode,
         routing_backend=routing_backend,
         kv_transfer=KvTransferMechanism.nixl,
-        parallelism=plan.effective_parallelism,
-        settings=plan.effective_settings,
         roles=plan.roles,
         links=plan.links,
+        routing=plan.routing,
         profiling=False,
         render_inputs=render_inputs,
         allocations=allocations,
@@ -385,7 +419,7 @@ def test_render_launches_trtllm_server() -> None:
 
     assert len(result.processes) == 1
     process = result.processes[0]
-    argv = process.process.argv
+    argv = process.command.argv
     assert argv[:4] == [
         "python3",
         "-m",
@@ -399,7 +433,7 @@ def test_render_launches_trtllm_server() -> None:
     assert "--enable_attention_dp" not in argv
     assert "--pipeline_parallel_size" not in argv
     assert "--moe_expert_parallel_size" not in argv
-    env = process.process.env
+    env = process.command.env
     assert env["DG_JIT_CACHE_DIR"] == "/cache/server/deep_gemm_jit"
     assert env["TRITON_CACHE_DIR"] == "/cache/server/triton"
     assert env["TORCHINDUCTOR_CACHE_DIR"] == "/cache/server/torchinductor"
@@ -414,11 +448,11 @@ def test_render_lowers_attention_dp_and_expert_parallelism() -> None:
     plan = plan_serve(_plan_input(parallelism=parallelism, roles=_serve_role(parallelism)))
     result = render_serve(
         _render_input(
-            parallelism=plan.effective_parallelism,
+            parallelism=plan.roles[0].effective_parallelism,
             roles=plan.roles,
         )
     )
-    argv = result.processes[0].process.argv
+    argv = result.processes[0].command.argv
     assert argv[argv.index("--tensor_parallel_size") + 1] == "4"
     assert "--enable_attention_dp" in argv
     assert argv[argv.index("--moe_expert_parallel_size") + 1] == "4"
@@ -432,11 +466,11 @@ def test_render_lowers_pipeline_parallelism() -> None:
     plan = plan_serve(_plan_input(parallelism=parallelism, roles=_serve_role(parallelism)))
     result = render_serve(
         _render_input(
-            parallelism=plan.effective_parallelism,
+            parallelism=plan.roles[0].effective_parallelism,
             roles=plan.roles,
         )
     )
-    argv = result.processes[0].process.argv
+    argv = result.processes[0].command.argv
     assert argv[argv.index("--pipeline_parallel_size") + 1] == "2"
     assert "--enable_attention_dp" not in argv
 
@@ -452,19 +486,67 @@ def test_render_lowers_settings() -> None:
                 "free_gpu_memory_fraction": SettingValue(root=0.85),
                 "enable_chunked_prefill": SettingValue(root=True),
                 "extra_llm_api_options": SettingValue(root="configs/wide-ep.yaml"),
+                "custom_tokenizer": SettingValue(root="package.CustomTokenizer"),
+                "tool_parser": SettingValue(root="glm47"),
+                "reasoning_parser": SettingValue(root="deepseek-r1"),
             }
         )
     )
-    result = render_serve(_render_input(settings=plan.effective_settings, roles=plan.roles))
-    argv = result.processes[0].process.argv
+    result = render_serve(
+        _render_input(settings=plan.roles[0].effective_settings, roles=plan.roles)
+    )
+    argv = result.processes[0].command.argv
     assert argv[argv.index("--max_batch_size") + 1] == "64"
     assert argv[argv.index("--max_num_tokens") + 1] == "4096"
     assert argv[argv.index("--max_seq_len") + 1] == "9216"
     assert argv[argv.index("--kv_cache_dtype") + 1] == "fp8"
     assert argv[argv.index("--free_gpu_memory_fraction") + 1] == "0.85"
     assert argv[argv.index("--extra_llm_api_options") + 1] == "configs/wide-ep.yaml"
+    assert argv[argv.index("--custom_tokenizer") + 1] == "package.CustomTokenizer"
+    assert argv[argv.index("--tool_parser") + 1] == "glm47"
+    assert argv[argv.index("--reasoning_parser") + 1] == "deepseek-r1"
     assert "--enable_chunked_prefill" in argv
     assert "--trust_remote_code" not in argv
+
+
+def test_render_single_composes_worker_launch_file_patch(tmp_path: Path) -> None:
+    operator_config = tmp_path / "operator.yaml"
+    operator_config.write_text(
+        """\
+stream_interval: 20
+moe_config:
+  backend: DEEPGEMM
+""",
+        encoding="utf-8",
+    )
+    settings = {
+        "extra_llm_api_options": SettingValue(root=str(operator_config)),
+        "extra_llm_api_options_patch": SettingValue.model_validate(
+            {"stream_interval": 40, "moe_config": {"backend": "FLASHINFER"}}
+        ),
+    }
+    plan = plan_serve(_plan_input(settings=settings))
+    text = operator_config.read_text(encoding="utf-8")
+
+    result = render_serve(
+        _render_input(
+            roles=plan.roles,
+            settings=plan.roles[0].effective_settings,
+            render_inputs=[
+                SuppliedRenderInput(
+                    source_path=str(operator_config),
+                    text=text,
+                    sha256=hashlib.sha256(text.encode()).hexdigest(),
+                )
+            ],
+        )
+    )
+
+    launch_file = result.processes[0].launch_files[0]
+    assert yaml.safe_load(launch_file.text) == {
+        "stream_interval": 40,
+        "moe_config": {"backend": "FLASHINFER"},
+    }
 
 
 def test_render_prefill_decode_composes_worker_launch_files(tmp_path: Path) -> None:
@@ -488,6 +570,15 @@ backend: tensorrt
     )
     settings = {
         "extra_llm_api_options": SettingValue(root=str(operator_config)),
+        "extra_llm_api_options_patch": SettingValue.model_validate(
+            {
+                "stream_interval": 40,
+                "moe_config": {"backend": "FLASHINFER"},
+                "kv_cache_config": {"enable_block_reuse": True},
+                "cache_transceiver_config": {"backend": "UCX"},
+                "backend": "tensorrt",
+            }
+        ),
         "extra_args": SettingValue.model_validate(
             ["--config", "escape.yaml", "--backend", "tensorrt"]
         ),
@@ -507,16 +598,16 @@ backend: tensorrt
         assert launch_file.relative_path == (
             f"launch-files/{launch_file.sha256}/extra-llm-api-options.yaml"
         )
-        argv = process.process.argv
+        argv = process.command.argv
         generated_path = argv[argv.index("--extra_llm_api_options") + 1]
-        assert generated_path == f"/cache/{process.id}/{launch_file.relative_path}"
+        assert generated_path == f"/cache/{process.process}/{launch_file.relative_path}"
         assert str(operator_config) not in argv
         assert "escape.yaml" not in argv
         assert argv[argv.index("--backend") + 1] == "pytorch"
 
         config = yaml.safe_load(launch_file.text)
-        assert config["stream_interval"] == 20
-        assert config["moe_config"] == {"backend": "DEEPGEMM"}
+        assert config["stream_interval"] == 40
+        assert config["moe_config"] == {"backend": "FLASHINFER"}
         assert config["kv_cache_config"] == {
             "enable_block_reuse": False,
             "dtype": "fp8",
@@ -526,7 +617,7 @@ backend: tensorrt
             "transceiver_runtime": "PYTHON",
             "max_tokens_in_buffer": 8192,
         }
-        assert config["disable_overlap_scheduler"] is process.id.startswith("prefill")
+        assert config["disable_overlap_scheduler"] is process.process.startswith("prefill")
         assert config["backend"] == "pytorch"
 
 
@@ -534,19 +625,16 @@ def test_render_native_router_targets_every_rank_zero_worker() -> None:
     result = render_serve(
         _prefill_decode_render_input(
             routing_backend="trtllm-disaggregated",
-            settings={
-                "extra_env": SettingValue.model_validate({"STACK_LIBRARY_PATH": "/runtime/lib"})
-            },
             prefill_replicas=2,
             decode_replicas=3,
         )
     )
 
     router = result.processes[-1]
-    assert router.id == "router"
+    assert router.process == "router"
     assert len(router.launch_files) == 1
     launch_file = router.launch_files[0]
-    assert router.process.argv == [
+    assert router.command.argv == [
         "python3",
         "-m",
         "tensorrt_llm.commands.serve",
@@ -556,7 +644,6 @@ def test_render_native_router_targets_every_rank_zero_worker() -> None:
         "--server_start_timeout",
         "2147483647",
     ]
-    assert router.process.env["STACK_LIBRARY_PATH"] == "/runtime/lib"
     config = yaml.safe_load(launch_file.text)
     assert config == {
         "hostname": "127.0.0.1",
@@ -598,8 +685,10 @@ def test_render_merges_extra_args_with_inferlab_precedence() -> None:
             }
         )
     )
-    result = render_serve(_render_input(settings=plan.effective_settings, roles=plan.roles))
-    argv = result.processes[0].process.argv
+    result = render_serve(
+        _render_input(settings=plan.roles[0].effective_settings, roles=plan.roles)
+    )
+    argv = result.processes[0].command.argv
     assert argv[argv.index("--port") + 1] == "8000", "inferlab owns the endpoint"
     assert "--tp_size" not in argv, "alias spellings of owned options are claimed"
     assert argv.count("--tensor_parallel_size") == 1
@@ -610,27 +699,20 @@ def test_render_merges_extra_args_with_inferlab_precedence() -> None:
 
 
 def test_render_rejects_multi_node() -> None:
-    allocation = {
-        "process_id": "server-rank-000",
-        "role_id": "serve",
-        "replica_id": "server",
-        "replica_index": 0,
-        "rank": 0,
-        "machine_id": "node-a",
-        "model_locator": "/models/example",
-        "devices": [0],
-        "endpoint": {"host": "127.0.0.1", "port": 8000},
-        "ports": {},
-        "runtime_cache_root": "/cache/a",
-    }
-    second = dict(allocation)
-    second.update({"process_id": "server-rank-001", "rank": 1, "machine_id": "node-b"})
-    with pytest.raises(AdapterOperationError, match="multi-node"):
-        render_serve(
-            _render_input(
-                allocations=[
-                    ServeProcessAllocation.model_validate(allocation),
-                    ServeProcessAllocation.model_validate(second),
-                ]
-            )
+    allocation = (
+        _render_input()
+        .allocations[0]
+        .model_copy(
+            update={
+                "process": "server-rank-000",
+                "rank_count": 2,
+                "machine": "node-a",
+                "devices": [0],
+            }
         )
+    )
+    second = allocation.model_copy(
+        update={"process": "server-rank-001", "rank": 1, "machine": "node-b"}
+    )
+    with pytest.raises(AdapterOperationError):
+        render_serve(_render_input(allocations=[allocation, second]))

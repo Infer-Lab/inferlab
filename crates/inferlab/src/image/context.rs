@@ -2,7 +2,7 @@
 //!
 //! Inferlab derives the context from resolved workspace facts: the committed
 //! Pixi lock environment (rendered as a hash-pinned explicit spec), framework
-//! wheels built locally from the workspace source set (copied by bytes,
+//! wheels built locally from the stack sources (copied by bytes,
 //! installed with pinned hashes), and the digest-resolved base image. The
 //! workspace never authors container build files, and machine-private facts
 //! are rejected before assembly by the portable-output guard.
@@ -323,7 +323,7 @@ pub struct ContextInputs<'a> {
     pub base_image_digest: &'a str,
     /// The rendered activation entrypoint script.
     pub entrypoint: &'a str,
-    /// Wheels built from the workspace source set, copied by bytes.
+    /// Wheels built from the stack sources, copied by bytes.
     pub built_wheels: &'a [BuiltWheel],
     /// Declared environment checks, copied by bytes and executed as RUN
     /// layers through the entrypoint ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
@@ -452,8 +452,8 @@ pub fn locked_closure_digest(packages: &[PackageSpec]) -> String {
     format!("{:x}", Sha256::digest(canonical.join("\u{1e}").as_bytes()))
 }
 
-/// Content identities for editable packages installed outside the source set
-/// ([[RFC-0007:C-IMAGE-BUILD]]): source-set editables are covered exactly by
+/// Content identities for editable packages installed outside the stack sources
+/// ([[RFC-0007:C-IMAGE-BUILD]]): stack-source editables are covered exactly by
 /// committed git identities, but external path dependencies (for example
 /// Inferlab's own adapter and integration packages from a sibling repository)
 /// sit in the build environment with no other identity, so their tree content
@@ -849,10 +849,9 @@ pub fn guard_portable_text(
         workspace.root.display().to_string(),
     ));
     for (id, weight) in &workspace.local.model_weights {
-        forbidden.push((
-            format!("model weight locator {id:?}"),
-            weight.locator.clone(),
-        ));
+        if let Some(locator) = &weight.locator {
+            forbidden.push((format!("model weight locator {id:?}"), locator.clone()));
+        }
         for locator in weight.machine_locators.values() {
             forbidden.push((format!("model weight locator {id:?}"), locator.clone()));
         }
@@ -1409,7 +1408,7 @@ nodef = { features = [\"a\"], no-default-feature = true }\n";
         model_weights.insert(
             "dsv4".to_owned(),
             ModelWeightBinding {
-                locator: "/secret/weights/dsv4".to_owned(),
+                locator: Some("/secret/weights/dsv4".to_owned()),
                 machine_locators: BTreeMap::new(),
             },
         );
@@ -1418,9 +1417,8 @@ nodef = { features = [\"a\"], no-default-feature = true }\n";
             "remote".to_owned(),
             MachineBinding {
                 host: "gpu-node-7".to_owned(),
-                port: 8000,
-                extra_ports: Vec::new(),
                 devices: vec![0],
+                ports: vec![8000],
                 workspace: None,
                 cache_root: None,
                 container: None,
@@ -1433,11 +1431,10 @@ nodef = { features = [\"a\"], no-default-feature = true }\n";
             root: PathBuf::from("/work/dsv4-workspace"),
             config: WorkspaceConfig {
                 external_images: BTreeMap::new(),
-                schema_version: 1,
+                schema_version: 2,
                 models: BTreeMap::new(),
-                serve_profiles: BTreeMap::new(),
-                source_sets: BTreeMap::new(),
-                environments: BTreeMap::new(),
+                stacks: BTreeMap::new(),
+                servers: BTreeMap::new(),
                 evals: BTreeMap::new(),
                 benches: BTreeMap::new(),
                 workload_suites: BTreeMap::new(),
@@ -1446,7 +1443,7 @@ nodef = { features = [\"a\"], no-default-feature = true }\n";
             },
             local: LocalBindings {
                 adapter: crate::workspace::AdapterBinding::default(),
-                default_placement: "local".to_owned(),
+                default_placement: Some("local".to_owned()),
                 model_weights,
                 machines,
                 placements: BTreeMap::new(),

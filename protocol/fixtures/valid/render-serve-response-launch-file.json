@@ -1,17 +1,22 @@
 {
   "status": "ok",
-  "protocol_version": "4",
+  "protocol_version": "5",
   "result": {
     "operation": "render_serve",
     "output": {
       "integration": {
         "adapter_id": "fixture",
         "adapter_version": "0.2.0",
-        "framework": "fixture"
+        "framework": "fixture",
+        "framework_version": "test"
       },
       "processes": [
         {
-          "id": "server",
+          "process": "server",
+          "role": "serve",
+          "replica": 0,
+          "rank": 0,
+          "rank_count": 1,
           "launch_files": [
             {
               "relative_path": "launch-files/2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281/generation.yaml",
@@ -19,7 +24,7 @@
               "sha256": "2bcf56a7e1129e7b0dfbe7ef153a720f020a3dd076700069f9efe53ad9a6d281"
             }
           ],
-          "process": {
+          "command": {
             "argv": [
               "fixture-server",
               "--generation-config",

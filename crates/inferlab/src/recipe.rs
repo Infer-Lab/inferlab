@@ -1,11 +1,10 @@
 use crate::InferlabError;
 use crate::interrupt;
-use crate::record::{RECORD_FILE, RECORDS_DIR, now_unix_ms, utc_timestamp};
+use crate::record::{RECORD_FILE, RECORDS_DIR, RecordIdentity, now_unix_ms, record_id};
 use crate::resolve::ResolvedExecution;
 use crate::server::{self, ServerRecord, ServerStatus};
 use crate::workload::{self, WorkloadStatus};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -50,13 +49,17 @@ pub struct RecipeRecord {
     pub status: RecipeStatus,
     pub started_unix_ms: u64,
     pub finished_unix_ms: Option<u64>,
-    pub resolved: Value,
+    pub resolved: ResolvedExecution,
     pub server: ServerRecordRef,
     pub evals: Vec<WorkloadRecordRef>,
     pub benches: Vec<WorkloadRecordRef>,
     pub interrupted: bool,
     pub errors: Vec<String>,
     pub cleanup: Option<RecipeCleanupEvidence>,
+}
+
+impl RecipeRecord {
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, InferlabError> {
@@ -178,7 +181,7 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 workload::WorkloadServerAccess::RecipeOwned {
                     record_id: &server_id,
                 },
-                plan,
+                workload::ResolvedWorkloadPlan::Bench(Box::new(plan.clone())),
             )
         };
         match outcome {
@@ -278,15 +281,15 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
 }
 
 fn server_cleanup_summary(record: &ServerRecord) -> (bool, Option<String>) {
-    let verified = record.processes.iter().all(|process| {
+    let verified = record.process_evidence.values().all(|process| {
         process
             .cleanup
             .last()
             .map_or(process.handle.is_none(), |cleanup| cleanup.verified)
     });
     let error = record
-        .processes
-        .iter()
+        .process_evidence
+        .values()
         .filter_map(|process| process.cleanup.last())
         .find_map(|cleanup| cleanup.error.clone());
     (verified, error)
@@ -305,25 +308,44 @@ impl RecipeRecordSession {
             source,
         })?;
         let started_unix_ms = now_unix_ms()?;
-        let id = allocate_record_dir(
-            &records_dir,
+        let recipe = resolved
+            .recipe
+            .as_ref()
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: "recipe execution resolved without a recipe identity".to_owned(),
+            })?;
+        let case = resolved.server.case.as_ref().map(|case| case.id.as_str());
+        let id = record_id(
+            RecordIdentity::Recipe {
+                recipe: &recipe.id,
+                case,
+            },
             started_unix_ms,
-            &resolved.recipe.id,
-            &resolved.recipe.case.id,
+        )?;
+        let record_dir = records_dir.join(&id);
+        fs::create_dir(&record_dir).map_err(|source| InferlabError::RecordIo {
+            path: record_dir,
+            source,
+        })?;
+        let server_record_id = record_id(
+            RecordIdentity::Serve {
+                server: &resolved.server.id,
+                case,
+            },
+            started_unix_ms,
         )?;
         let record = RecipeRecord {
-            schema_version: 1,
+            schema_version: RecipeRecord::SCHEMA_VERSION,
             inferlab_version: env!("CARGO_PKG_VERSION").to_owned(),
             server: ServerRecordRef {
-                id: format!("{id}-serve"),
+                id: server_record_id,
                 status: None,
             },
             id,
             status: RecipeStatus::Running,
             started_unix_ms,
             finished_unix_ms: None,
-            resolved: serde_json::to_value(resolved)
-                .map_err(|source| InferlabError::RecordEncode { source })?,
+            resolved: resolved.clone(),
             evals: Vec::new(),
             benches: Vec::new(),
             interrupted: false,
@@ -364,50 +386,4 @@ impl RecipeRecordSession {
 fn write_record(root: &Path, record: &RecipeRecord) -> Result<(), InferlabError> {
     let path = root.join(RECORDS_DIR).join(&record.id).join(RECORD_FILE);
     crate::record::write_json(&path, record)
-}
-
-fn allocate_record_dir(
-    records_dir: &Path,
-    started_unix_ms: u64,
-    recipe_id: &str,
-    case_id: &str,
-) -> Result<String, InferlabError> {
-    let base = format!(
-        "{}-recipe-{recipe_id}-{case_id}",
-        utc_timestamp(started_unix_ms)?
-    );
-    for suffix in 0..1000_u32 {
-        let id = if suffix == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{suffix}")
-        };
-        let path = records_dir.join(&id);
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(id),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(source) => return Err(InferlabError::RecordIo { path, source }),
-        }
-    }
-    Err(InferlabError::ServerLifecycle {
-        message: "failed to allocate a unique recipe record id".to_owned(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::allocate_record_dir;
-
-    #[test]
-    fn readable_recipe_record_id_adds_numeric_collision_suffix()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let records = tempfile::tempdir()?;
-
-        let first = allocate_record_dir(records.path(), 0, "dsv4-qualify", "tp2")?;
-        let second = allocate_record_dir(records.path(), 0, "dsv4-qualify", "tp2")?;
-
-        assert_eq!(first, "1970-01-01T00-00-00.000Z-recipe-dsv4-qualify-tp2");
-        assert_eq!(second, "1970-01-01T00-00-00.000Z-recipe-dsv4-qualify-tp2-1");
-        Ok(())
-    }
 }

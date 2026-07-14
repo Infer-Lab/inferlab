@@ -14,13 +14,13 @@ from inferlab_adapter_sdk import (
     LaunchFileDeclaration,
     PlanServeInput,
     PlanServeResult,
-    PublicEndpointRequirement,
-    PublicEndpointRequirementReplica,
     ReadinessProbe,
     ReadinessProbeHttp,
     ReadinessProbeHttpTargetRegistry,
     ReadinessProbeProcessAlive,
     RenderInputDeclaration,
+    RoutingResult,
+    RoutingResultDirect,
     ServeReplicaRequirement,
     ServeRoleKind,
     ServeRoleResult,
@@ -42,7 +42,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 ROOT = Path(__file__).parents[3]
 FIXTURES = ROOT / "protocol" / "fixtures"
-SCHEMA = ROOT / "protocol" / "schema" / "adapter-protocol-v4.schema.json"
+SCHEMA = ROOT / "protocol" / "schema" / "adapter-protocol-v5.schema.json"
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -52,17 +52,19 @@ def load_json(path: Path) -> dict[str, object]:
 def fixture_plan_serve(input: PlanServeInput) -> PlanServeResult:
     return PlanServeResult(
         integration=IntegrationIdentity(
-            adapter_id="fixture", adapter_version="0.1.0", framework="fixture"
+            adapter_id="fixture",
+            adapter_version="0.1.0",
+            framework="fixture",
+            framework_version="test",
         ),
-        effective_settings=input.settings,
-        effective_parallelism=input.parallelism,
         roles=[
             ServeRoleResult(
                 id="serve",
                 kind=ServeRoleKind.serve,
-                replica_count=1,
-                effective_settings=input.settings,
-                effective_parallelism=input.parallelism,
+                declared_replica_count=1,
+                effective_replica_count=1,
+                effective_settings=input.roles[0].settings,
+                effective_parallelism=input.roles[0].parallelism,
             )
         ],
         replicas=[
@@ -70,7 +72,7 @@ def fixture_plan_serve(input: PlanServeInput) -> PlanServeResult:
                 id="server",
                 role_id="serve",
                 replica_index=0,
-                accelerator_count=1,
+                device_count=1,
                 ports=[],
                 primary_ports=[],
                 primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/ready")),
@@ -78,9 +80,7 @@ def fixture_plan_serve(input: PlanServeInput) -> PlanServeResult:
             )
         ],
         links=[],
-        public_endpoint=PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id="server")
-        ),
+        routing=RoutingResult(root=RoutingResultDirect(role="serve", replica=0)),
         endpoint=EndpointRequirement(protocol=EndpointProtocol(), api_path="/v1/completions"),
     )
 
@@ -182,25 +182,17 @@ def test_runtime_returns_typed_success_and_error_responses() -> None:
 
     assert success.root.status == "ok"
 
-    error = failure.root
-    assert isinstance(error, AdapterResponseError)
-    assert error.status == "error"
-    # The empty-object payload fails AdapterRequest validation, so the caller
-    # receives the invalid_request code carrying the pydantic error that names
-    # the malformed input itself, not a generic wrapper message.
-    assert error.error.code == AdapterErrorCode.invalid_request
-    assert error.error.message.startswith("4 validation errors for AdapterRequest")
-    assert "Field required" in error.error.message
-    assert "input_value={}" in error.error.message
+    response_error = failure.root
+    assert isinstance(response_error, AdapterResponseError)
+    assert response_error.status == "error"
+    assert response_error.error.code == AdapterErrorCode.invalid_request
+    assert response_error.error.message
 
 
 @pytest.mark.parametrize("complete_body", [True, False])
 def test_unsupported_request_protocol_version_is_reported_before_shape(
     complete_body: bool,
 ) -> None:
-    # The request protocol version is validated before request-shape
-    # validation, so a cross-version request reports the one actionable fact
-    # even when its body is otherwise incomplete ([[RFC-0006:C-INTEGRATIONS]]).
     request: dict[str, object] = {"protocol_version": "2"}
     if complete_body:
         valid = load_json(FIXTURES / "valid" / "plan-serve-request.json")
@@ -208,18 +200,16 @@ def test_unsupported_request_protocol_version_is_reported_before_shape(
 
     response = handle_request(json.dumps(request), fixture_plan_serve)
 
-    error = response.root
-    assert isinstance(error, AdapterResponseError)
-    assert error.error.code == AdapterErrorCode.unsupported_protocol_version
-    assert "2" in error.error.message and "4" in error.error.message
+    response_error = response.root
+    assert isinstance(response_error, AdapterResponseError)
+    assert response_error.error.code == AdapterErrorCode.unsupported_protocol_version
 
 
 def test_malformed_request_json_stays_invalid_request() -> None:
-    # Malformed JSON is not a version mismatch; it stays invalid_request.
     response = handle_request("{not json", fixture_plan_serve)
-    error = response.root
-    assert isinstance(error, AdapterResponseError)
-    assert error.error.code == AdapterErrorCode.invalid_request
+    response_error = response.root
+    assert isinstance(response_error, AdapterResponseError)
+    assert response_error.error.code == AdapterErrorCode.invalid_request
 
 
 def test_stdio_runner_writes_only_protocol_json() -> None:

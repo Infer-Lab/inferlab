@@ -4,14 +4,14 @@
 //! the fixture `pixi` and adapter pattern.
 
 use crate::InferlabError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 
 /// One executed native builder command, preserved as record evidence
 /// ([[RFC-0007:C-IMAGE-BUILD]]).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NativeCommand {
     pub argv: Vec<String>,
     /// Record-relative path of the streamed command log, when one exists.

@@ -1,5 +1,5 @@
 {
-  "$id": "https://inferlab.dev/schema/adapter-protocol/v4",
+  "$id": "https://inferlab.dev/schema/adapter-protocol/v5",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AdapterProtocol",
   "description": "The schema root aggregating every wire type. It exists to generate one\ncommitted JSON schema (and the Python SDK models); its optional client\nfields are never all populated in a single message.",
@@ -244,6 +244,41 @@
         }
       ]
     },
+    "AllocationLaunch": {
+      "description": "The machine-local launch channel selected by the control plane.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "local"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ssh"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "target"
+          ]
+        }
+      ]
+    },
     "BenchCaseInput": {
       "description": "A single Bench case: its load shape and the number of requests to send.",
       "type": "object",
@@ -280,7 +315,7 @@
           "$ref": "#/$defs/ClientEndpointInput"
         },
         "model": {
-          "$ref": "#/$defs/ServeModelInput"
+          "$ref": "#/$defs/MeasurementModelInput"
         },
         "protocol_version": {
           "$ref": "#/$defs/ProtocolVersion"
@@ -474,6 +509,16 @@
         }
       ]
     },
+    "BuiltinRouterKind": {
+      "description": "An Inferlab-owned routing implementation with stable target semantics.",
+      "type": "string",
+      "enum": [
+        "vllm_mooncake",
+        "vllm_nixl",
+        "sglang",
+        "trtllm"
+      ]
+    },
     "CaptureControlRequirement": {
       "description": "The HTTP paths a capture target exposes to open and close a capture window.",
       "type": "object",
@@ -618,7 +663,7 @@
           "$ref": "#/$defs/ClientEndpointInput"
         },
         "model": {
-          "$ref": "#/$defs/ServeModelInput"
+          "$ref": "#/$defs/MeasurementModelInput"
         },
         "protocol_version": {
           "$ref": "#/$defs/ProtocolVersion"
@@ -840,13 +885,17 @@
         },
         "framework": {
           "type": "string"
+        },
+        "framework_version": {
+          "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
         "adapter_id",
         "adapter_version",
-        "framework"
+        "framework",
+        "framework_version"
       ]
     },
     "KvTransferMechanism": {
@@ -883,6 +932,23 @@
         "relative_path",
         "text",
         "sha256"
+      ]
+    },
+    "MeasurementModelInput": {
+      "description": "The model identity used by measurement clients. Unlike integration\nplanning, a benchmark client may need a controller-visible tokenizer\nlocator.",
+      "type": "object",
+      "properties": {
+        "locator": {
+          "type": "string"
+        },
+        "served_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "locator",
+        "served_name"
       ]
     },
     "Parallelism": {
@@ -935,7 +1001,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         },
         "data_parallel_size": {
@@ -944,7 +1009,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         },
         "tensor_parallel_size": {
@@ -953,7 +1017,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         }
       },
@@ -969,7 +1032,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         },
         "dense_tensor_parallel_size": {
@@ -978,7 +1040,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         },
         "expert_parallel_size": {
@@ -987,7 +1048,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         },
         "tensor_parallel_size": {
@@ -996,7 +1056,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         }
       },
@@ -1012,7 +1071,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         },
         "tensor_parallel_size": {
@@ -1021,7 +1079,6 @@
             "null"
           ],
           "format": "uint32",
-          "default": null,
           "minimum": 1
         }
       },
@@ -1044,9 +1101,6 @@
         "model": {
           "$ref": "#/$defs/ServeModelInput"
         },
-        "parallelism": {
-          "$ref": "#/$defs/Parallelism"
-        },
         "profiling": {
           "type": "boolean",
           "default": false
@@ -1058,13 +1112,10 @@
           }
         },
         "routing_backend": {
-          "type": "string"
-        },
-        "settings": {
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/SettingValue"
-          }
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "topology": {
           "$ref": "#/$defs/ServeTopology"
@@ -1074,9 +1125,6 @@
       "required": [
         "model",
         "topology",
-        "routing_backend",
-        "parallelism",
-        "settings",
         "roles"
       ]
     },
@@ -1084,15 +1132,6 @@
       "description": "The lowered topology returned by a `PlanServe`: the effective server-level\nshape, per-role resolution, whole-replica requirements, role links, and the\npublic and per-role endpoint requirements the control plane then allocates.",
       "type": "object",
       "properties": {
-        "effective_parallelism": {
-          "$ref": "#/$defs/Parallelism"
-        },
-        "effective_settings": {
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/SettingValue"
-          }
-        },
         "endpoint": {
           "$ref": "#/$defs/EndpointRequirement"
         },
@@ -1104,9 +1143,6 @@
           "items": {
             "$ref": "#/$defs/ServeRoleLink"
           }
-        },
-        "public_endpoint": {
-          "$ref": "#/$defs/PublicEndpointRequirement"
         },
         "render_inputs": {
           "type": "array",
@@ -1126,17 +1162,18 @@
           "items": {
             "$ref": "#/$defs/ServeRoleResult"
           }
+        },
+        "routing": {
+          "$ref": "#/$defs/RoutingResult"
         }
       },
       "additionalProperties": false,
       "required": [
         "integration",
-        "effective_settings",
-        "effective_parallelism",
         "roles",
         "replicas",
         "links",
-        "public_endpoint",
+        "routing",
         "endpoint"
       ]
     },
@@ -1164,69 +1201,12 @@
       ]
     },
     "ProtocolVersion": {
-      "description": "The shared protocol version used by framework integrations and release-owned\nmeasurement clients. The only accepted value is `4` (serialized as the\nstring `\"4\"`); a mismatch is rejected before lowering.",
+      "description": "The shared protocol version used by framework integrations and release-owned\nmeasurement clients. The only accepted value is `5` (serialized as the\nstring `\"5\"`); a mismatch is rejected before lowering.",
       "oneOf": [
         {
-          "description": "Protocol version 4.",
+          "description": "Protocol version 5.",
           "type": "string",
-          "const": "4"
-        }
-      ]
-    },
-    "PublicEndpointRequirement": {
-      "description": "How the topology's public workload endpoint is exposed.",
-      "oneOf": [
-        {
-          "description": "The endpoint is served directly by a single replica.",
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
-              "const": "replica"
-            },
-            "replica_id": {
-              "type": "string"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "kind",
-            "replica_id"
-          ]
-        },
-        {
-          "description": "The endpoint is fronted by an Inferlab-owned built-in proxy routing\nacross the named prefill and decode roles.",
-          "type": "object",
-          "properties": {
-            "decode_role": {
-              "type": "string"
-            },
-            "kind": {
-              "type": "string",
-              "const": "builtin_proxy"
-            },
-            "prefill_role": {
-              "type": "string"
-            },
-            "process_id": {
-              "type": "string"
-            },
-            "readiness": {
-              "$ref": "#/$defs/ReadinessProbe"
-            },
-            "role_id": {
-              "type": "string"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "kind",
-            "process_id",
-            "role_id",
-            "prefill_role",
-            "decode_role",
-            "readiness"
-          ]
+          "const": "5"
         }
       ]
     },
@@ -1388,9 +1368,6 @@
         "model": {
           "$ref": "#/$defs/ServeModelInput"
         },
-        "parallelism": {
-          "$ref": "#/$defs/Parallelism"
-        },
         "profiling": {
           "type": "boolean",
           "default": false
@@ -1408,14 +1385,14 @@
             "$ref": "#/$defs/ServeRoleResult"
           }
         },
-        "routing_backend": {
-          "type": "string"
+        "routing": {
+          "$ref": "#/$defs/RoutingResult"
         },
-        "settings": {
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/SettingValue"
-          }
+        "routing_backend": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "topology": {
           "$ref": "#/$defs/ServeTopology"
@@ -1425,10 +1402,8 @@
       "required": [
         "model",
         "topology",
-        "routing_backend",
-        "parallelism",
-        "settings",
         "roles",
+        "routing",
         "links",
         "allocations"
       ]
@@ -1457,8 +1432,8 @@
       "description": "A rendered process bound to the allocation `id` it was produced for.",
       "type": "object",
       "properties": {
-        "id": {
-          "type": "string"
+        "command": {
+          "$ref": "#/$defs/ProcessSpec"
         },
         "launch_files": {
           "type": "array",
@@ -1467,21 +1442,138 @@
           }
         },
         "process": {
-          "$ref": "#/$defs/ProcessSpec"
+          "type": "string"
+        },
+        "rank": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "rank_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "replica": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "role": {
+          "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "id",
+        "process",
+        "role",
+        "replica",
+        "rank",
+        "rank_count",
         "launch_files",
-        "process"
+        "command"
+      ]
+    },
+    "RoutingResult": {
+      "description": "The closed routing owner selected during integration planning.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "owner": {
+              "type": "string",
+              "const": "direct"
+            },
+            "replica": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "role": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "owner",
+            "role",
+            "replica"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "decode_role": {
+              "type": "string"
+            },
+            "implementation": {
+              "$ref": "#/$defs/BuiltinRouterKind"
+            },
+            "owner": {
+              "type": "string",
+              "const": "inferlab_builtin"
+            },
+            "policy": {
+              "type": "string"
+            },
+            "ports": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "prefill_role": {
+              "type": "string"
+            },
+            "readiness": {
+              "$ref": "#/$defs/ReadinessProbe"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "owner",
+            "implementation",
+            "policy",
+            "prefill_role",
+            "decode_role",
+            "readiness"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "owner": {
+              "type": "string",
+              "const": "integration_native"
+            },
+            "policy": {
+              "type": "string"
+            },
+            "replica": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "role": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "owner",
+            "role",
+            "replica",
+            "policy"
+          ]
+        }
       ]
     },
     "ServeModelInput": {
-      "description": "The model to serve: its resolved locator and the name it is served under.",
+      "description": "The logical model supplied during serving planning and rendering.",
       "type": "object",
       "properties": {
-        "locator": {
+        "id": {
           "type": "string"
         },
         "served_name": {
@@ -1490,7 +1582,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "locator",
+        "id",
         "served_name"
       ]
     },
@@ -1498,6 +1590,16 @@
       "description": "One concrete process the control plane placed, supplied to `RenderServe`:\nits identity, rank, machine, devices, model locator, and allocated\nendpoints and named ports.",
       "type": "object",
       "properties": {
+        "cache": {
+          "type": "string"
+        },
+        "dependencies": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "devices": {
           "type": "array",
           "items": {
@@ -1507,13 +1609,26 @@
           }
         },
         "endpoint": {
-          "$ref": "#/$defs/EndpointAssignment"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointAssignment"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
-        "machine_id": {
+        "launch": {
+          "$ref": "#/$defs/AllocationLaunch"
+        },
+        "machine": {
           "type": "string"
         },
         "model_locator": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "ports": {
           "type": "object",
@@ -1521,7 +1636,7 @@
             "$ref": "#/$defs/EndpointAssignment"
           }
         },
-        "process_id": {
+        "process": {
           "type": "string"
         },
         "rank": {
@@ -1529,45 +1644,38 @@
           "format": "uint32",
           "minimum": 0
         },
-        "replica_id": {
-          "type": "string"
-        },
-        "replica_index": {
+        "rank_count": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
-        "role_id": {
-          "type": "string"
+        "replica": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
-        "runtime_cache_root": {
+        "role": {
           "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "process_id",
-        "role_id",
-        "replica_id",
-        "replica_index",
+        "process",
+        "role",
+        "replica",
         "rank",
-        "machine_id",
-        "model_locator",
-        "runtime_cache_root",
+        "rank_count",
+        "machine",
         "devices",
-        "endpoint",
-        "ports"
+        "ports",
+        "cache",
+        "launch"
       ]
     },
     "ServeReplicaRequirement": {
       "description": "A whole-replica resource and readiness requirement the integration declares\nwithout choosing placement, ranks, or concrete endpoints.",
       "type": "object",
       "properties": {
-        "accelerator_count": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
-        },
         "capture_target": {
           "anyOf": [
             {
@@ -1577,6 +1685,11 @@
               "type": "null"
             }
           ]
+        },
+        "device_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
         "id": {
           "type": "string"
@@ -1613,7 +1726,7 @@
         "id",
         "role_id",
         "replica_index",
-        "accelerator_count",
+        "device_count",
         "ports",
         "primary_ports",
         "primary_readiness",
@@ -1791,8 +1904,18 @@
       "description": "A role as the integration resolved it: preserved identity and cardinality\nwith the complete effective settings and parallelism.",
       "type": "object",
       "properties": {
+        "declared_replica_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
         "effective_parallelism": {
           "$ref": "#/$defs/Parallelism"
+        },
+        "effective_replica_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
         },
         "effective_settings": {
           "type": "object",
@@ -1805,18 +1928,14 @@
         },
         "kind": {
           "$ref": "#/$defs/ServeRoleKind"
-        },
-        "replica_count": {
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0
         }
       },
       "additionalProperties": false,
       "required": [
         "id",
         "kind",
-        "replica_count",
+        "declared_replica_count",
+        "effective_replica_count",
         "effective_settings",
         "effective_parallelism"
       ]

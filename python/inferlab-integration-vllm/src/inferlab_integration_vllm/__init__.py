@@ -6,6 +6,7 @@ from pathlib import Path
 from inferlab_adapter_sdk import (
     AdapterErrorCode,
     AdapterOperationError,
+    BuiltinRouterKind,
     CaptureControlRequirement,
     CaptureTargetRequirement,
     EndpointProtocol,
@@ -21,15 +22,16 @@ from inferlab_adapter_sdk import (
     PlanServeInput,
     PlanServeResult,
     ProcessSpec,
-    PublicEndpointRequirement,
-    PublicEndpointRequirementBuiltinProxy,
-    PublicEndpointRequirementReplica,
     ReadinessProbe,
     ReadinessProbeHttp,
     ReadinessProbeProcessAlive,
     RenderedServeProcess,
     RenderServeInput,
     RenderServeResult,
+    RoutingResult,
+    RoutingResultDirect,
+    RoutingResultInferlabBuiltin,
+    RoutingResultIntegrationNative,
     ServeProcessAllocation,
     ServeReplicaRequirement,
     ServeRoleInput,
@@ -57,7 +59,9 @@ _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--block-size": 1,
     "--compilation-config": 1,
     "--data-parallel-size": 1,
+    "--enable-auto-tool-choice": 0,
     "--enable-expert-parallel": 0,
+    "--enable-flashinfer-autotune": 0,
     "--gpu-memory-utilization": 1,
     "--headless": 0,
     "--host": 1,
@@ -66,12 +70,16 @@ _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--master-port": 1,
     "--max-model-len": 1,
     "--nnodes": 1,
+    "--no-enable-flashinfer-autotune": 0,
     "--node-rank": 1,
     "--pipeline-parallel-size": 1,
     "--port": 1,
     "--profiler-config": 1,
+    "--reasoning-config": 1,
     "--served-model-name": None,
     "--tensor-parallel-size": 1,
+    "--tokenizer-mode": 1,
+    "--tool-call-parser": 1,
     "--trust-remote-code": 0,
     "--kv-transfer-config": 1,
 }
@@ -99,6 +107,11 @@ class VllmServeSettings(BaseModel):
     block_size: int | None = Field(default=None, ge=1)
     trust_remote_code: bool = False
     compilation_config: dict[str, JsonValue] | None = None
+    tokenizer_mode: str | None = None
+    tool_call_parser: str | None = None
+    enable_auto_tool_choice: bool | None = None
+    reasoning_config: dict[str, JsonValue] | None = None
+    enable_flashinfer_autotune: bool | None = None
     kv_transfer_protocol: str | None = None
     mooncake_num_workers: int | None = Field(default=None, ge=1)
     extra_args: list[str] | None = None
@@ -122,14 +135,6 @@ def _settings(values: dict[str, SettingValue]) -> VllmServeSettings:
         raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
 
 
-def _merged_settings(
-    base: dict[str, SettingValue], overrides: dict[str, SettingValue]
-) -> VllmServeSettings:
-    merged = dict(base)
-    merged.update(overrides)
-    return _settings(merged)
-
-
 def _effective_settings(settings: VllmServeSettings) -> dict[str, SettingValue]:
     return {
         key: SettingValue(root=value)
@@ -138,24 +143,29 @@ def _effective_settings(settings: VllmServeSettings) -> dict[str, SettingValue]:
 
 
 def _adapter_version() -> str:
-    try:
-        return version("inferlab-integration-vllm")
-    except PackageNotFoundError:
-        # Raw source-tree execution with no installed distribution
-        # metadata: the adjacent pyproject is the version authority.
-        # External-image lowering mounts each package's dist-info beside
-        # its module, so importlib.metadata resolves there instead.
-        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    if pyproject.is_file():
         with pyproject.open("rb") as handle:
             project_version: str = tomllib.load(handle)["project"]["version"]
         return project_version
+    try:
+        return version("inferlab-integration-vllm")
+    except PackageNotFoundError:
+        # External-image lowering mounts each package's dist-info beside
+        # its module, so importlib.metadata resolves there instead.
+        return "unavailable"
 
 
 def _identity() -> IntegrationIdentity:
+    try:
+        framework_version = version("vllm")
+    except PackageNotFoundError:
+        framework_version = "unavailable"
     return IntegrationIdentity(
         adapter_id="inferlab-vllm",
         adapter_version=_adapter_version(),
         framework="vllm",
+        framework_version=framework_version,
     )
 
 
@@ -253,7 +263,7 @@ def _replica_id(role: ServeRoleInput, replica_index: int) -> str:
     return f"{base}-{replica_index:03d}"
 
 
-def _accelerator_count(parallelism: Parallelism) -> int:
+def _device_count(parallelism: Parallelism) -> int:
     outer = parallelism.outer or ParallelismOuter()
     attention = parallelism.attention or ParallelismAttention()
     return (
@@ -273,9 +283,9 @@ def _plan_role(
             AdapterErrorCode.invalid_settings,
             f"role {role.id!r} replica count must be positive",
         )
-    settings = _merged_settings(input.settings, role.settings)
+    settings = _settings(role.settings)
     parallelism = _effective_parallelism(role.parallelism)
-    accelerator_count = _accelerator_count(parallelism)
+    device_count = _device_count(parallelism)
     replicas = []
     for replica_index in range(role.replica_count):
         replica_id = _replica_id(role, replica_index)
@@ -294,7 +304,7 @@ def _plan_role(
                 id=replica_id,
                 role_id=role.id,
                 replica_index=replica_index,
-                accelerator_count=accelerator_count,
+                device_count=device_count,
                 ports=list(role_ports),
                 primary_ports=["master"],
                 primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/v1/models")),
@@ -306,7 +316,8 @@ def _plan_role(
         ServeRoleResult(
             id=role.id,
             kind=role.kind,
-            replica_count=role.replica_count,
+            declared_replica_count=role.replica_count,
+            effective_replica_count=role.replica_count,
             effective_settings=_effective_settings(settings),
             effective_parallelism=parallelism,
         ),
@@ -320,7 +331,7 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             "single topology does not use a KV-transfer mechanism",
         )
-    if input.routing_backend != "builtin":
+    if input.routing_backend is not None:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
             f"vLLM single topology does not support routing backend {input.routing_backend!r}",
@@ -329,14 +340,10 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
     role_result, replicas = _plan_role(input, role, [])
     return PlanServeResult(
         integration=_identity(),
-        effective_settings=_effective_settings(_settings(input.settings)),
-        effective_parallelism=_effective_parallelism(input.parallelism),
         roles=[role_result],
         replicas=replicas,
         links=[],
-        public_endpoint=PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id=replicas[0].id)
-        ),
+        routing=RoutingResult(root=RoutingResultDirect(role=role.id, replica=0)),
         endpoint=EndpointRequirement(
             protocol=EndpointProtocol(),
             api_path="/v1/completions",
@@ -355,7 +362,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             "prefill_decode topology requires a KV-transfer mechanism",
         )
-    if input.routing_backend not in {"builtin", "vllm-router"}:
+    routing_backend = input.routing_backend or "builtin"
+    if routing_backend not in {"builtin", "vllm-router"}:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
             f"vLLM does not support routing backend {input.routing_backend!r}",
@@ -404,13 +412,18 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             )
         )
 
-    if input.routing_backend == "builtin":
-        public_endpoint = PublicEndpointRequirement(
-            root=PublicEndpointRequirementBuiltinProxy(
-                process_id="proxy",
-                role_id="router",
+    if routing_backend == "builtin":
+        routing = RoutingResult(
+            root=RoutingResultInferlabBuiltin(
+                implementation=(
+                    BuiltinRouterKind.vllm_mooncake
+                    if transport == KvTransferMechanism.mooncake
+                    else BuiltinRouterKind.vllm_nixl
+                ),
+                policy="round_robin",
                 prefill_role=prefill.id,
                 decode_role=decode.id,
+                ports=[],
                 readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/healthcheck")),
             )
         )
@@ -419,7 +432,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             ServeRoleResult(
                 id="router",
                 kind=ServeRoleKind.router,
-                replica_count=1,
+                declared_replica_count=1,
+                effective_replica_count=1,
                 effective_settings={},
                 effective_parallelism=Parallelism(),
             )
@@ -429,25 +443,23 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
                 id="router",
                 role_id="router",
                 replica_index=0,
-                accelerator_count=0,
+                device_count=0,
                 ports=[],
                 primary_ports=[],
                 primary_readiness=ReadinessProbe(root=ReadinessProbeHttp(path="/v1/models")),
                 worker_readiness=ReadinessProbe(root=ReadinessProbeProcessAlive()),
             )
         )
-        public_endpoint = PublicEndpointRequirement(
-            root=PublicEndpointRequirementReplica(replica_id="router")
+        routing = RoutingResult(
+            root=RoutingResultIntegrationNative(role="router", replica=0, policy="round_robin")
         )
 
     return PlanServeResult(
         integration=_identity(),
-        effective_settings=_effective_settings(_settings(input.settings)),
-        effective_parallelism=_effective_parallelism(input.parallelism),
         roles=roles,
         replicas=replicas,
         links=links,
-        public_endpoint=public_endpoint,
+        routing=routing,
         endpoint=EndpointRequirement(protocol=EndpointProtocol(), api_path="/v1/completions"),
     )
 
@@ -469,6 +481,12 @@ def _render_process(
     outer = role.effective_parallelism.outer or ParallelismOuter()
     attention = role.effective_parallelism.attention or ParallelismAttention()
     experts = role.effective_parallelism.experts or ParallelismExperts()
+    if allocation.model_locator is None or allocation.endpoint is None:
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request,
+            f"serving allocation {allocation.process!r} is missing its model or endpoint",
+        )
+    endpoint = allocation.endpoint
     argv = [
         # python3, not python: conda-family realizations carry both, while
         # Debian-family external serving images ship no bare `python`.
@@ -480,9 +498,9 @@ def _render_process(
     ]
     inferlab_args = [
         "--host",
-        allocation.endpoint.host,
+        endpoint.host,
         "--port",
-        str(allocation.endpoint.port),
+        str(endpoint.port),
         "--served-model-name",
         input.model.served_name,
         "--tensor-parallel-size",
@@ -506,6 +524,23 @@ def _render_process(
     append_option(inferlab_args, "--kv-cache-dtype", settings.kv_cache_dtype)
     append_option(inferlab_args, "--gpu-memory-utilization", settings.gpu_memory_utilization)
     append_option(inferlab_args, "--block-size", settings.block_size)
+    append_option(inferlab_args, "--tokenizer-mode", settings.tokenizer_mode)
+    append_option(inferlab_args, "--tool-call-parser", settings.tool_call_parser)
+    if settings.enable_auto_tool_choice:
+        inferlab_args.append("--enable-auto-tool-choice")
+    if settings.reasoning_config is not None:
+        inferlab_args.extend(
+            [
+                "--reasoning-config",
+                json.dumps(settings.reasoning_config, sort_keys=True, separators=(",", ":")),
+            ]
+        )
+    if settings.enable_flashinfer_autotune is not None:
+        inferlab_args.append(
+            "--enable-flashinfer-autotune"
+            if settings.enable_flashinfer_autotune
+            else "--no-enable-flashinfer-autotune"
+        )
     if settings.trust_remote_code:
         inferlab_args.append("--trust-remote-code")
     if (experts.expert_parallel_size or 1) > 1:
@@ -526,7 +561,7 @@ def _render_process(
 
     process_env = {
         "VLLM_SERVER_DEV_MODE": "1",
-        **_runtime_cache_env(allocation.runtime_cache_root),
+        **_runtime_cache_env(allocation.cache),
     }
     process_env.update(settings.extra_env or {})
     if input.topology == ServeTopology.prefill_decode:
@@ -536,7 +571,7 @@ def _render_process(
             if bootstrap is None:
                 raise AdapterOperationError(
                     AdapterErrorCode.invalid_request,
-                    f"prefill process {allocation.process_id!r} is missing its bootstrap port",
+                    f"prefill process {allocation.process!r} is missing its bootstrap port",
                 )
             process_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(bootstrap.port)
         if input.kv_transfer == KvTransferMechanism.nixl:
@@ -544,7 +579,7 @@ def _render_process(
             if side_channel is None:
                 raise AdapterOperationError(
                     AdapterErrorCode.invalid_request,
-                    f"process {allocation.process_id!r} is missing its NIXL side-channel port",
+                    f"process {allocation.process!r} is missing its NIXL side-channel port",
                 )
             process_env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = side_channel.host
             process_env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(side_channel.port)
@@ -573,9 +608,13 @@ def _render_process(
             inferlab_args.append("--headless")
     argv.extend(merge_serve_args(settings.extra_args or [], inferlab_args, _INFERLAB_OPTION_ARITY))
     return RenderedServeProcess(
-        id=allocation.process_id,
+        process=allocation.process,
+        role=allocation.role,
+        replica=allocation.replica,
+        rank=allocation.rank,
+        rank_count=allocation.rank_count,
         launch_files=[],
-        process=ProcessSpec(argv=argv, env=process_env),
+        command=ProcessSpec(argv=argv, env=process_env),
     )
 
 
@@ -641,20 +680,29 @@ def _render_router(
 ) -> RenderedServeProcess:
     prefill_roles = {role.id for role in input.roles if role.kind == ServeRoleKind.prefill}
     decode_roles = {role.id for role in input.roles if role.kind == ServeRoleKind.decode}
-    prefill = [
-        item for item in input.allocations if item.role_id in prefill_roles and item.rank == 0
+    prefill = [item for item in input.allocations if item.role in prefill_roles and item.rank == 0]
+    decode_allocations = [
+        item for item in input.allocations if item.role in decode_roles and item.rank == 0
     ]
+    if allocation.endpoint is None or any(
+        item.endpoint is None for item in [*prefill, *decode_allocations]
+    ):
+        raise AdapterOperationError(
+            AdapterErrorCode.invalid_request,
+            "vLLM Router allocations require public endpoints",
+        )
+    endpoint = allocation.endpoint
     decode = [
         f"http://{item.endpoint.host}:{item.endpoint.port}"
-        for item in input.allocations
-        if item.role_id in decode_roles and item.rank == 0
+        for item in decode_allocations
+        if item.endpoint is not None
     ]
     argv = [
         "vllm-router",
         "--host",
-        allocation.endpoint.host,
+        endpoint.host,
         "--port",
-        str(allocation.endpoint.port),
+        str(endpoint.port),
         "--worker-startup-timeout-secs",
         str(_ROUTER_WORKER_STARTUP_TIMEOUT_SECS),
         "--vllm-pd-disaggregation",
@@ -665,17 +713,23 @@ def _render_router(
             "vLLM Router render is missing its KV-transfer mechanism",
         )
     for item in prefill:
-        argv.extend(["--prefill", f"http://{item.endpoint.host}:{item.endpoint.port}"])
+        item_endpoint = item.endpoint
+        if item_endpoint is None:
+            raise AdapterOperationError(
+                AdapterErrorCode.invalid_request,
+                f"prefill allocation {item.process!r} has no endpoint",
+            )
+        argv.extend(["--prefill", f"http://{item_endpoint.host}:{item_endpoint.port}"])
         if input.kv_transfer == KvTransferMechanism.mooncake:
             bootstrap = item.ports.get("bootstrap")
             if bootstrap is None:
                 raise AdapterOperationError(
                     AdapterErrorCode.invalid_request,
-                    f"prefill replica {item.replica_id!r} is missing its bootstrap port",
+                    f"prefill replica {item.replica!r} is missing its bootstrap port",
                 )
             argv.append(str(bootstrap.port))
-    for endpoint in decode:
-        argv.extend(["--decode", endpoint])
+    for decode_endpoint in decode:
+        argv.extend(["--decode", decode_endpoint])
     argv.extend(
         [
             "--kv-connector",
@@ -685,9 +739,13 @@ def _render_router(
         ]
     )
     return RenderedServeProcess(
-        id=allocation.process_id,
+        process=allocation.process,
+        role=allocation.role,
+        replica=allocation.replica,
+        rank=allocation.rank,
+        rank_count=allocation.rank_count,
         launch_files=[],
-        process=ProcessSpec(argv=argv, env={}),
+        command=ProcessSpec(argv=argv, env={}),
     )
 
 
@@ -698,25 +756,25 @@ def render_serve(input: RenderServeInput) -> RenderServeResult:
         )
     roles = {role.id: role for role in input.roles}
     allocations_by_replica = {
-        allocation.replica_id: [
+        (allocation.role, allocation.replica): [
             candidate
             for candidate in input.allocations
-            if candidate.replica_id == allocation.replica_id
+            if candidate.role == allocation.role and candidate.replica == allocation.replica
         ]
         for allocation in input.allocations
     }
     processes = []
     for allocation in input.allocations:
-        role = roles.get(allocation.role_id)
+        role = roles.get(allocation.role)
         if role is None:
             raise AdapterOperationError(
                 AdapterErrorCode.invalid_request,
-                f"allocation references unknown role {allocation.role_id!r}",
+                f"allocation references unknown role {allocation.role!r}",
             )
         if role.kind == ServeRoleKind.router:
             processes.append(_render_router(input, allocation))
             continue
-        role_allocations = allocations_by_replica[allocation.replica_id]
+        role_allocations = allocations_by_replica[(allocation.role, allocation.replica)]
         processes.append(
             _render_process(
                 input,

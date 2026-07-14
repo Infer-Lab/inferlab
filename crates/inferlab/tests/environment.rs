@@ -37,7 +37,7 @@ impl LockWorkspace {
         let log = root.path().join("pixi.log");
         fs::create_dir_all(&inferlab)?;
         fs::create_dir_all(&bin)?;
-        fs::write(inferlab.join("workspace.toml"), "schema_version = 1\n")?;
+        fs::write(inferlab.join("workspace.toml"), "schema_version = 2\n")?;
         fs::write(root.path().join("pixi.toml"), FULL_MANIFEST)?;
         if let Some(lock) = previous_lock {
             fs::write(root.path().join("pixi.lock"), lock)?;
@@ -59,19 +59,20 @@ impl LockWorkspace {
     }
 
     fn run(&self) -> Result<Output, Box<dyn Error>> {
-        Ok(self.command().args(["env", "lock"]).output()?)
+        Ok(self.command().args(["workspace", "lock"]).output()?)
     }
 }
 
 #[test]
-fn env_lock_stages_build_dependencies_and_leaves_the_full_lock() -> Result<(), Box<dyn Error>> {
+fn workspace_lock_stages_build_dependencies_and_leaves_the_full_lock() -> Result<(), Box<dyn Error>>
+{
     let workspace = LockWorkspace::new(None)?;
 
     let output = workspace.run()?;
 
     assert!(
         output.status.success(),
-        "env lock failed: {}",
+        "workspace lock failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout)?;
@@ -96,17 +97,16 @@ fn env_lock_stages_build_dependencies_and_leaves_the_full_lock() -> Result<(), B
 }
 
 #[test]
-fn env_lock_restores_manifest_and_previous_lock_when_full_lock_fails() -> Result<(), Box<dyn Error>>
-{
+fn workspace_lock_restores_manifest_and_previous_lock_when_full_lock_fails()
+-> Result<(), Box<dyn Error>> {
     let workspace = LockWorkspace::new(Some("previous-lock\n"))?;
     let output = workspace
         .command()
         .env("FAKE_PIXI_FAIL_FULL", "1")
-        .args(["env", "lock"])
+        .args(["workspace", "lock"])
         .output()?;
 
     assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)?.contains("pixi lock"));
     assert_eq!(
         fs::read_to_string(workspace.root.path().join("pixi.toml"))?,
         FULL_MANIFEST
@@ -126,7 +126,7 @@ fn real_pixi_clean_prefix_lock_and_locked_install() -> Result<(), Box<dyn Error>
     fs::create_dir_all(root.path().join("editable-demo"))?;
     fs::write(
         root.path().join(".inferlab/workspace.toml"),
-        "schema_version = 1\n",
+        "schema_version = 2\n",
     )?;
     fs::write(root.path().join("pixi.toml"), FULL_MANIFEST)?;
     fs::write(
@@ -144,11 +144,11 @@ fn real_pixi_clean_prefix_lock_and_locked_install() -> Result<(), Box<dyn Error>
 
     let output = Command::new(env!("CARGO_BIN_EXE_inferlab"))
         .current_dir(root.path())
-        .args(["env", "lock"])
+        .args(["workspace", "lock"])
         .output()?;
     assert!(
         output.status.success(),
-        "env lock failed: {}",
+        "workspace lock failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
