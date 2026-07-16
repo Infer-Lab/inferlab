@@ -1,4 +1,4 @@
-use super::runtime::{CleanupEvidence, ProcessHandle, ReadinessEvidence};
+use super::runtime::{CleanupEvidence, ProcessHandle, ReadinessEvidence, ReadinessFailure};
 use crate::InferlabError;
 use crate::profiler::{CaptureActionRecord, ProfilerCleanupRecord, ProfilerTargetRecord};
 use crate::record::{
@@ -48,10 +48,30 @@ pub struct ServerProcessEvidence {
     pub profiler_cleanup: Option<ProfilerCleanupRecord>,
     pub handle: Option<ProcessHandle>,
     pub readiness: Option<ReadinessEvidence>,
+    pub readiness_failure: Option<ReadinessFailure>,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
     pub log_sync_error: Option<String>,
+    pub log_sync: Option<LogSyncEvidence>,
     pub cleanup: Vec<CleanupEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogSyncEvidence {
+    pub elapsed_ms: u64,
+    pub deadline_ms: Option<u64>,
+    pub succeeded: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterOperationEvidence {
+    pub operation: String,
+    pub request_sha256: String,
+    pub response_sha256: String,
+    pub timing: crate::time_bound::OperationTimingEvidence,
 }
 
 /// Device hardware identity of one machine hosting serving processes, probed at
@@ -94,11 +114,15 @@ pub struct ServerRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hardware: BTreeMap<String, MachineHardwareEvidence>,
     pub process_evidence: BTreeMap<String, ServerProcessEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adapter_operations: Vec<AdapterOperationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_framework_probe: Option<crate::time_bound::OperationTimingEvidence>,
     pub failure: Option<FailureEvidence>,
 }
 
 impl ServerRecord {
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     pub(crate) fn process(&self, id: &str) -> Result<&ServerProcessEvidence, InferlabError> {
         self.process_evidence
@@ -194,9 +218,11 @@ impl ServerRecordSession {
                     profiler_cleanup: None,
                     handle: None,
                     readiness: None,
+                    readiness_failure: None,
                     stdout: relative_record_path(&id, &stdout),
                     stderr: relative_record_path(&id, &stderr),
                     log_sync_error: None,
+                    log_sync: None,
                     cleanup: Vec::new(),
                 };
                 (process.id.clone(), evidence)
@@ -218,6 +244,12 @@ impl ServerRecordSession {
             environment_checks: Vec::new(),
             hardware: BTreeMap::new(),
             process_evidence,
+            adapter_operations: adapter_operation_evidence(resolved),
+            external_framework_probe: resolved
+                .server
+                .external_image
+                .as_ref()
+                .and_then(|external| external.framework_probe_timing.clone()),
             failure: None,
         };
         let session = Self {
@@ -280,6 +312,34 @@ impl ServerRecordSession {
     pub fn into_record(self) -> ServerRecord {
         self.record
     }
+}
+
+fn adapter_operation_evidence(resolved: &ResolvedExecution) -> Vec<AdapterOperationEvidence> {
+    let integration = &resolved.server.integration;
+    [
+        (
+            "plan_serve",
+            &integration.plan_request_sha256,
+            &integration.plan_response_sha256,
+            integration.plan_timing.as_ref(),
+        ),
+        (
+            "render_serve",
+            &integration.render_request_sha256,
+            &integration.render_response_sha256,
+            integration.render_timing.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(operation, request, response, timing)| {
+        timing.map(|timing| AdapterOperationEvidence {
+            operation: operation.to_owned(),
+            request_sha256: request.clone(),
+            response_sha256: response.clone(),
+            timing: timing.clone(),
+        })
+    })
+    .collect()
 }
 
 pub(super) fn load_record(root: &Path, id: &str) -> Result<ServerRecord, InferlabError> {

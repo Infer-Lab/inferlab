@@ -68,6 +68,54 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
 
+  # Execute the packaged static binaries on their native glibc hosts. This is
+  # intentionally downstream of packaging: a GNU development binary cannot
+  # qualify the runtime host detection used by the published musl assets.
+  qualify:
+    name: qualify ${{ matrix.asset }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: inferlab-x86_64-linux
+            runner: ubuntu-24.04
+            platform: linux-x86_64
+          - asset: inferlab-aarch64-linux
+            runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.asset }}
+      - name: Qualify packaged measurement toolchain admission
+        env:
+          ASSET: ${{ matrix.asset }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          chmod +x "${ASSET}"
+          fixture_root=$(mktemp -d)
+          trap 'rm -rf "${fixture_root}"' EXIT
+          mkdir -p "${fixture_root}/bin"
+          cp crates/inferlab/tests/fixtures/bin/pixi.sh "${fixture_root}/bin/pixi"
+          chmod +x "${fixture_root}/bin/pixi"
+          PATH="${fixture_root}/bin:${PATH}" \
+            XDG_DATA_HOME="${fixture_root}/data" \
+            "./${ASSET}" toolchain install > "${fixture_root}/report.json"
+          python3 - "${fixture_root}/report.json" "${EXPECTED_PLATFORM}" <<'PYTHON'
+          import json
+          import pathlib
+          import sys
+
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          expected = sys.argv[2]
+          assert report["state"] == "installed", report
+          assert report["eval"]["platform"] == expected, report
+          assert report["bench"]["platform"] == expected, report
+          PYTHON
+
   # Patch install.sh's version default with the actual tag so curl-piped
   # installs land on a pinned version.
   installer:
@@ -117,7 +165,7 @@ jobs:
   release:
     name: publish release
     runs-on: ubuntu-latest
-    needs: [build, installer, plugin]
+    needs: [build, qualify, installer, plugin]
     permissions:
       contents: write
     steps:

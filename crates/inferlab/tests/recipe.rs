@@ -250,6 +250,61 @@ impl TestWorkspace {
         Ok(())
     }
 
+    fn configure_gsm8k_timeout(&self, seconds: u64) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let text = fs::read_to_string(&manifest)?;
+        let (prefix, gsm8k_and_rest) = text
+            .split_once("[evals.gsm8k]\n")
+            .ok_or("fixture has no gsm8k Eval section")?;
+        let gsm8k_and_rest = gsm8k_and_rest.replacen(
+            "timeout_seconds = 900",
+            &format!("timeout_seconds = {seconds}"),
+            1,
+        );
+        let text = format!("{prefix}[evals.gsm8k]\n{gsm8k_and_rest}");
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn configure_c8k_without_reset(&self, timeout_seconds: u64) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let text = fs::read_to_string(&manifest)?;
+        let (prefix, bench_and_rest) = text
+            .split_once("[benches.c8k1k]\n")
+            .ok_or("fixture has no c8k1k Bench section")?;
+        let bench_and_rest = bench_and_rest
+            .replacen("reset_prefix_cache = true", "reset_prefix_cache = false", 1)
+            .replacen(
+                "timeout_seconds = 900",
+                &format!("timeout_seconds = {timeout_seconds}"),
+                1,
+            );
+        let text = format!("{prefix}[benches.c8k1k]\n{bench_and_rest}");
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn configure_static_slo_failure(&self) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let text = fs::read_to_string(&manifest)?.replacen(
+            "[benches.c8k1k]\nkind = \"serving\"",
+            "[benches.c8k1k]\nkind = \"serving\"\naggregate_slos = [{ metric = \"request_throughput\", at_least = 2.0 }]",
+            1,
+        );
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
+    fn configure_legacy_adaptive_target(&self) -> Result<(), Box<dyn Error>> {
+        let manifest = self.root.path().join(".inferlab/workspace.toml");
+        let text = fs::read_to_string(&manifest)?.replace(
+            "aggregate_slos = [\n    { metric = \"request_throughput\", at_least = 1.0 },\n    { metric = \"p99_ttft_ms\", at_most = 1000.0 },\n]\nrequest_slo = { ttft_ms = 900.0, minimum_good_request_ratio = 0.99 }\nmax_search_steps = 3",
+            "target_metric = \"p99_ttft_ms\"\ntarget_threshold = 1000.0\nmax_refinement_steps = 3",
+        );
+        fs::write(manifest, text)?;
+        Ok(())
+    }
+
     fn configure_capture_deadline(&self, seconds: u64) -> Result<(), Box<dyn Error>> {
         let manifest = self.root.path().join(".inferlab/workspace.toml");
         let text = fs::read_to_string(&manifest)?.replacen(
@@ -333,8 +388,17 @@ fn recipe_runs_eval_and_bench_then_stops_the_server() -> Result<(), Box<dyn Erro
         .as_str()
         .ok_or("missing matrix bench record id")?;
     let matrix = workspace.load_record(matrix_id)?;
-    assert_eq!(matrix["schema_version"], 3);
+    assert_eq!(matrix["schema_version"], 7);
+    assert_eq!(matrix["kind"], "bench");
+    assert_eq!(matrix["passed"], true);
+    assert!(
+        matrix["cases"]
+            .as_array()
+            .is_some_and(|cases| { cases.iter().all(|case| case.get("slo").is_none()) })
+    );
     assert_eq!(matrix["cases"][0]["prefix_cache_reset"]["succeeded"], true);
+    assert!(matrix["cases"][0].get("eval_gate").is_none());
+    assert!(matrix["cases"][0].get("eval_trial_summary").is_none());
     assert!(
         matrix["cases"][0]["prefix_cache_reset"]
             .get("status")
@@ -344,33 +408,75 @@ fn recipe_runs_eval_and_bench_then_stops_the_server() -> Result<(), Box<dyn Erro
         .as_str()
         .ok_or("missing adaptive bench record id")?;
     let adaptive = workspace.load_record(adaptive_id)?;
-    assert_eq!(adaptive["summary"]["target_metric"], "p99_ttft_ms");
-    let probes = adaptive["summary"]["probes"]
-        .as_array()
-        .ok_or("adaptive summary has no probes array")?;
-    assert!(!probes.is_empty(), "the adaptive search recorded probes");
-    // Every probe measured the target metric at a concrete request rate.
-    let mut probed_rates = Vec::with_capacity(probes.len());
-    for probe in probes {
-        assert!(
-            probe["statistic"].as_f64().is_some(),
-            "probe carries a measured target-metric value: {probe}"
-        );
-        probed_rates.push(
-            probe["request_rate"]
-                .as_f64()
-                .ok_or("probe has no request rate")?,
-        );
-    }
-    // The selected rate is one the search actually probed, not an invented one.
-    let selected_rate = adaptive["summary"]["selected_rate"]
-        .as_f64()
-        .ok_or("adaptive summary has no selected rate")?;
-    assert!(
-        probed_rates.contains(&selected_rate),
-        "selected rate {selected_rate} is one of the probed rates {probed_rates:?}"
+    assert_eq!(adaptive["summary"]["policy"], "highest-feasible-rate-v1");
+    assert_eq!(adaptive["summary"]["boundary_bracketed"], true);
+    assert_eq!(
+        adaptive["summary"]["normal_termination_reason"],
+        "search_budget_exhausted"
     );
+    let case_ids = adaptive["summary"]["case_ids"]
+        .as_array()
+        .ok_or("adaptive summary has no case_ids array")?;
+    assert_eq!(
+        case_ids.len(),
+        adaptive["cases"].as_array().map_or(0, Vec::len)
+    );
+    assert!(adaptive["cases"].as_array().is_some_and(|cases| {
+        cases.iter().all(|case| {
+            case["status"] == "succeeded" && case["slo"]["request_slo"]["ratio_outcome"] == "passed"
+        })
+    }));
+    assert_eq!(adaptive["summary"]["selected_rate"], 8.0);
     assert!(workspace.bench_marker.is_file());
+    Ok(())
+}
+
+#[test]
+fn static_slo_failure_keeps_measurement_status_and_runs_every_case() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_static_slo_failure()?;
+
+    let output = workspace.run()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let matrix_id = recipe["benches"][0]["id"]
+        .as_str()
+        .ok_or("missing matrix Bench record")?;
+    let matrix = workspace.load_record(matrix_id)?;
+
+    assert_eq!(matrix["status"], "succeeded");
+    assert_eq!(matrix["passed"], false);
+    let cases = matrix["cases"].as_array().ok_or("missing matrix cases")?;
+    assert_eq!(cases.len(), 4);
+    assert!(cases.iter().all(|case| {
+        case["status"] == "succeeded"
+            && case["slo"]["passed"] == false
+            && case["slo"]["aggregate_slos"][0]["outcome"] == "failed"
+    }));
+    Ok(())
+}
+
+#[test]
+fn legacy_adaptive_target_fields_are_rejected_before_execution() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_legacy_adaptive_target()?;
+
+    let output = workspace
+        .command()
+        .args(["recipe", "run", "dsv4-qualify", "--dry-run"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown field `max_refinement_steps`"),
+        "{stderr}"
+    );
+    assert!(!workspace.bench_marker.exists());
     Ok(())
 }
 
@@ -416,6 +522,8 @@ fn smoke_only_recipe_needs_no_measurement_toolchain() -> Result<(), Box<dyn Erro
         .as_str()
         .ok_or("smoke Eval has no record id")?;
     let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["schema_version"], 7);
+    assert_eq!(eval["kind"], "eval");
     assert_eq!(eval["resolved"]["execution"]["kind"], "native_openai_smoke");
     assert_eq!(eval["cases"][0]["process"], Value::Null);
     assert_eq!(eval["cases"][0]["stdout"], Value::Null);
@@ -429,6 +537,10 @@ fn smoke_only_recipe_needs_no_measurement_toolchain() -> Result<(), Box<dyn Erro
             .is_some_and(|elapsed| elapsed >= 0.0)
     );
     assert_eq!(eval["cases"][0]["metrics"]["choices_count"], 1.0);
+    assert!(eval.get("request_source").is_none());
+    assert!(eval.get("summary").is_none());
+    assert!(eval["cases"][0].get("completed_requests").is_none());
+    assert!(eval["cases"][0].get("normalization_schema").is_none());
     assert_eq!(
         eval["cases"][0]["raw_artifacts"][0]["kind"],
         "openai-response"
@@ -444,6 +556,7 @@ fn smoke_only_recipe_needs_no_measurement_toolchain() -> Result<(), Box<dyn Erro
     assert_eq!(request["body"]["max_tokens"], 16);
     assert_eq!(request["body"]["temperature"], 0.0);
     assert_eq!(request["body"]["stream"], false);
+    assert_eq!(request["body"]["n"], 1);
     let response_path = eval["cases"][0]["raw_artifacts"][0]["path"]
         .as_str()
         .ok_or("smoke case has no raw response path")?;
@@ -534,6 +647,7 @@ fn recipe_captures_one_selected_bench_and_verifies_static_ranges() -> Result<(),
         "finalize-collection"
     );
     assert_eq!(server_evidence["profiler_cleanup"]["verified"], true);
+    assert_eq!(server_evidence["profiler_cleanup"]["trigger"], "stop");
     assert_eq!(recipe["cleanup"]["verified"], true);
     // A no-escape server record carries none of the escape fields — exactly
     // the shape written before they existed — so this capture attaching to
@@ -545,6 +659,43 @@ fn recipe_captures_one_selected_bench_and_verifies_static_ranges() -> Result<(),
             .get("profiler_escapes")
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn captured_bench_without_reset_starts_its_budget_after_the_window_opens()
+-> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_c8k_without_reset(1)?;
+    workspace.configure_capture_deadline(30)?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_START_PROFILE_DELAY_SECONDS", "2")
+        .args([
+            "recipe",
+            "run",
+            "dsv4-qualify",
+            "--capture",
+            "c8k1k",
+            "--set",
+            "benches.c8k1k.concurrency=[1]",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "profiler window latency must not consume a no-reset case budget: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let bench = workspace.load_record(
+        recipe["benches"][0]["id"]
+            .as_str()
+            .ok_or("captured Bench has no record id")?,
+    )?;
+    assert_eq!(bench["cases"][0]["status"], "succeeded");
+    assert_eq!(bench["cases"][0]["process"]["timed_out"], false);
+    assert_eq!(bench["capture"]["status"], "succeeded");
     Ok(())
 }
 
@@ -961,7 +1112,7 @@ fn capture_control_deadline_bounds_slow_window_starts() -> Result<(), Box<dyn Er
     assert!(
         bench["capture"]["windows"][0]["start"][0]["error"]
             .as_str()
-            .is_some_and(|error| error.contains("failed to read profiler response")),
+            .is_some_and(|error| error.contains("profiler control deadline expired")),
         "a window start slower than the deadline must fail the capture: {}",
         bench["capture"]
     );
@@ -1391,6 +1542,81 @@ fn unsupported_eval_result_envelope_version_fails_the_case() -> Result<(), Box<d
 }
 
 #[test]
+fn successful_eval_envelope_cannot_override_client_process_failure() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_EVAL_EXIT_CODE", "7")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let eval_id = recipe["evals"][1]["id"]
+        .as_str()
+        .ok_or("failed Eval has no record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["cases"][0]["status"], "failed");
+    assert_eq!(eval["cases"][0]["process"]["exit_code"], 7);
+    assert!(
+        eval["cases"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("client exited with status"))
+    );
+    assert_eq!(recipe["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
+fn eval_client_deadline_rejects_a_late_result_and_cleans_up_after_timeout()
+-> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    workspace.configure_gsm8k_timeout(1)?;
+    let output = workspace
+        .command()
+        .env("FIXTURE_EVAL_WAIT", "1")
+        .env("FIXTURE_EVAL_NATIVE_CHECKPOINT", "1")
+        .args(["recipe", "run", "dsv4-qualify"])
+        .output()?;
+
+    assert!(!output.status.success());
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    let eval_id = recipe["evals"][1]["id"]
+        .as_str()
+        .ok_or("timed-out Eval has no record id")?;
+    let eval = workspace.load_record(eval_id)?;
+    assert_eq!(eval["cases"][0]["status"], "failed");
+    assert_eq!(eval["cases"][0]["process"]["timed_out"], true);
+    assert_eq!(eval["cases"][0]["process"]["interrupted"], false);
+    assert_eq!(eval["cases"][0]["process"]["termination"]["verified"], true);
+    assert_eq!(eval["cases"][0]["timing"]["budget"]["configured_ms"], 1_000);
+    assert_eq!(eval["cases"][0]["timing"]["terminal_cause"], "timed_out");
+    assert_eq!(eval["cases"][0]["native_command"][0], "fixture-eval");
+    assert_eq!(eval["cases"][0]["native_timed_out"], Value::Null);
+    assert_eq!(eval["cases"][0]["native_interrupted"], Value::Null);
+    assert!(
+        eval["cases"][0]["timing"]["elapsed_ms"]
+            .as_u64()
+            .is_some_and(|elapsed| elapsed <= 1_000)
+    );
+    assert_eq!(
+        eval["cases"][0]["process"]["termination"]["status_deadline_ms"],
+        0
+    );
+    assert_eq!(
+        eval["cases"][0]["process"]["termination"]["term_grace_ms"],
+        2_000
+    );
+    assert!(
+        eval["cases"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("measurement-case budget"))
+    );
+    assert_eq!(recipe["cleanup"]["verified"], true);
+    Ok(())
+}
+
+#[test]
 fn failed_bench_is_recorded_before_server_cleanup() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
     let output = workspace
@@ -1433,6 +1659,13 @@ fn partial_prefix_cache_reset_fails_the_bench_with_http_evidence() -> Result<(),
     assert_eq!(bench["cases"][0]["prefix_cache_reset"]["succeeded"], false);
     assert_eq!(bench["cases"][0]["prefix_cache_reset"]["http_status"], 206);
     assert_eq!(bench["cases"][0]["error"], "prefix-cache reset failed");
+    assert!(bench["cases"][0].get("metrics").is_none());
+    assert!(bench["cases"][0].get("completed_requests").is_none());
+    assert!(bench["cases"][0].get("failed_requests").is_none());
+    assert!(bench["cases"][0].get("normalization_schema").is_none());
+    assert!(bench["cases"][0].get("native_command").is_none());
+    assert!(bench["cases"][0].get("native_exit_code").is_none());
+    assert!(bench["cases"][0].get("raw_artifacts").is_none());
     assert_eq!(recipe["cleanup"]["verified"], true);
     Ok(())
 }
@@ -1558,6 +1791,7 @@ fn interruption_records_remaining_measurements_and_cleans_up() -> Result<(), Box
     let mut child = workspace
         .command()
         .env("FIXTURE_EVAL_WAIT", "1")
+        .env("FIXTURE_EVAL_NATIVE_CHECKPOINT", "1")
         .args(["recipe", "run", "dsv4-qualify"])
         .stdout(stdout.reopen()?)
         .stderr(stderr.reopen()?)
@@ -1607,10 +1841,83 @@ fn interruption_records_remaining_measurements_and_cleans_up() -> Result<(), Box
         interrupted_eval["cases"][0]["process"]["termination"]["verified"],
         true
     );
+    assert_eq!(
+        interrupted_eval["cases"][0]["native_command"][0],
+        "fixture-eval"
+    );
+    assert_eq!(
+        interrupted_eval["cases"][0]["native_interrupted"],
+        Value::Null
+    );
+    assert_eq!(
+        interrupted_eval["cases"][0]["native_timed_out"],
+        Value::Null
+    );
+    let raw_artifacts = interrupted_eval["cases"][0]["raw_artifacts"]
+        .as_array()
+        .ok_or("interrupted Eval has no raw artifacts")?;
+    assert!(
+        raw_artifacts
+            .iter()
+            .any(|artifact| artifact["kind"] == "directory")
+    );
+    assert!(
+        raw_artifacts
+            .iter()
+            .any(|artifact| artifact["kind"] == "lm-eval-process")
+    );
     wait_for_pid_exit(eval_child_pid, Duration::from_secs(5))?;
     assert_eq!(record["server"]["status"], "stopped");
     assert_eq!(record["cleanup"]["verified"], true);
     assert!(!workspace.bench_marker.exists());
+    Ok(())
+}
+
+#[test]
+fn interruption_during_builtin_smoke_preserves_the_interrupted_terminal_cause()
+-> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let marker = workspace.root.path().join("smoke-started");
+    let stdout = NamedTempFile::new()?;
+    let stderr = NamedTempFile::new()?;
+    let mut child = workspace
+        .command()
+        .env("FIXTURE_SMOKE_DELAY_SECONDS", "60")
+        .env("FIXTURE_SMOKE_MARKER", &marker)
+        .args(["recipe", "run", "dsv4-qualify"])
+        .stdout(stdout.reopen()?)
+        .stderr(stderr.reopen()?)
+        .spawn()?;
+    wait_for_path(&marker, Duration::from_secs(5))?;
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    assert!(signal.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait()?.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+        return Err("interrupted smoke recipe did not finish within 10 seconds".into());
+    }
+    let output = read_spooled_output(child, &stdout, &stderr)?;
+
+    assert!(!output.status.success());
+    let recipe: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(recipe["interrupted"], true);
+    let smoke = workspace.load_record(
+        recipe["evals"][0]["id"]
+            .as_str()
+            .ok_or("interrupted smoke Eval has no record id")?,
+    )?;
+    assert_eq!(smoke["cases"][0]["timing"]["terminal_cause"], "interrupted");
+    assert_eq!(smoke["cases"][0]["process"], Value::Null);
+    assert!(
+        smoke["cases"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("OpenAI smoke interrupted"))
+    );
     Ok(())
 }
 
@@ -1662,6 +1969,14 @@ fn interrupted_bench_preserves_native_evidence_and_cleans_its_group() -> Result<
         bench["cases"][0]["process"]["termination"]["verified"],
         true
     );
+    assert_eq!(bench["cases"][0]["timing"]["terminal_cause"], "interrupted");
+    let business_elapsed = bench["cases"][0]["timing"]["elapsed_ms"]
+        .as_u64()
+        .ok_or("interrupted Bench has no business elapsed time")?;
+    let cleanup_elapsed = bench["cases"][0]["process"]["termination"]["elapsed_ms"]
+        .as_u64()
+        .ok_or("interrupted Bench has no cleanup elapsed time")?;
+    assert!(business_elapsed < cleanup_elapsed);
     assert_eq!(bench["cases"][0]["native_command"][0], "fixture-bench");
     assert_eq!(bench["cases"][0]["native_exit_code"], 143);
     assert_eq!(bench["cases"][0]["raw_artifacts"][0]["name"], "partial");
@@ -1796,13 +2111,22 @@ fn failing_local_check_fails_before_server_launch() -> Result<(), Box<dyn Error>
 }
 
 const PIXI: &str = r#"#!/bin/sh
+if [ "$1" = info ] && [ "$2" = --json ]; then
+  case "$(uname -m)" in
+    x86_64) platform=linux-64 ;;
+    aarch64) platform=linux-aarch64 ;;
+    *) platform=unsupported ;;
+  esac
+  printf '{"platform":"%s","virtual_packages":["__unix=0=0","__linux=6.11.0=0","__glibc=2.35=0"]}\n' "$platform"
+  exit 0
+fi
 if [ "$1" = install ] && [ "$2" = --manifest-path ] && [ "$4" = --all ] && [ "$5" = --locked ]; then
   prefix="$(dirname "$3")"
   mkdir -p "$prefix/.pixi/envs/eval/bin" "$prefix/.pixi/envs/bench/bin"
   cat > "$prefix/.pixi/envs/eval/bin/python" <<'PYTHON'
 #!/bin/sh
 if [ "$2" = --handshake ]; then
-  printf '{"runner_version":"0.1.0","lm_eval_version":"0.4.12"}\n'
+  printf '{"runner_version":"0.3.0","lm_eval_version":"0.4.12"}\n'
   exit 0
 fi
 shift
@@ -1811,7 +2135,7 @@ PYTHON
   cat > "$prefix/.pixi/envs/bench/bin/python" <<'PYTHON'
 #!/bin/sh
 if [ "$2" = --handshake ]; then
-  printf '{"runner_version":"0.1.0","aiperf_version":"0.10.0"}\n'
+  printf '{"runner_version":"0.3.0","aiperf_version":"0.11.0"}\n'
   exit 0
 fi
 shift
@@ -1935,7 +2259,8 @@ if operation == "plan_serve":
         ),
         "endpoint": {
             "protocol": "http",
-            "api_path": "/v1/completions",
+            "completions_path": "/v1/completions",
+            "chat_completions_path": "/v1/chat/completions",
             "prefix_cache_reset": {"method": "post", "path": "/reset_prefix_cache"},
         },
     }
@@ -1972,7 +2297,7 @@ elif operation == "render_serve":
     }
 else:
     raise ValueError(operation)
-print(json.dumps({"status": "ok", "protocol_version": "5", "result": {"operation": operation, "output": output}}))
+print(json.dumps({"status": "ok", "protocol_version": "6", "result": {"operation": operation, "output": output}}))
 "#;
 
 const FIXTURE_SERVER: &str = r#"#!/usr/bin/env python3
@@ -2039,6 +2364,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
+            marker = os.environ.get("FIXTURE_SMOKE_MARKER")
+            if marker:
+                with open(f"{marker}.tmp", "w") as handle:
+                    handle.write("started")
+                os.replace(f"{marker}.tmp", marker)
+            time.sleep(float(os.environ.get("FIXTURE_SMOKE_DELAY_SECONDS", "0")))
             response = {
                 "id": "fixture-completion",
                 "object": "text_completion",
@@ -2130,20 +2461,55 @@ parser.add_argument("--output", required=True)
 args = parser.parse_args()
 request = json.load(open(args.input))
 if os.environ.get("FIXTURE_EVAL_WAIT") == "1":
-    child = subprocess.Popen([sys.executable, "-c", "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)", os.environ["FIXTURE_EVAL_MARKER"]])
+    if os.environ.get("FIXTURE_EVAL_NATIVE_CHECKPOINT") == "1":
+        artifact_dir = os.path.join(os.path.dirname(args.output), "artifacts")
+        raw_output_dir = os.path.join(artifact_dir, "lm-eval-output")
+        process_path = os.path.join(artifact_dir, "lm-eval-process.json")
+        os.makedirs(raw_output_dir, exist_ok=True)
+        json.dump({"native_command": ["fixture-eval"], "outcome": "running"}, open(process_path, "w"))
+        checkpoint = {
+            "schema_version": 1,
+            "status": "failed",
+            "metrics": {},
+            "normalized_metrics": {},
+            "gate": None,
+            "native_command": ["fixture-eval"],
+            "native_exit_code": None,
+            "native_timed_out": False,
+            "raw_artifacts": [
+                {"name": "lm_eval_output", "kind": "directory", "path": raw_output_dir},
+                {"name": "lm_eval_process", "kind": "lm-eval-process", "path": process_path},
+            ],
+            "error": "fixture native attempt did not finalize",
+        }
+        json.dump(checkpoint, open(args.output, "w"))
+    child = subprocess.Popen([sys.executable, "-c", "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); marker=sys.argv[1]; open(marker + '.tmp', 'w').write(str(os.getpid())); os.replace(marker + '.tmp', marker); time.sleep(60)", os.environ["FIXTURE_EVAL_MARKER"]])
     time.sleep(60)
 else:
     open(os.environ["FIXTURE_EVAL_MARKER"], "w").write("ran")
 kind = request["definition"]["kind"]
 metrics = {"completed": 1.0}
+normalized_metrics = {}
+gate = None
 if kind == "lm_eval":
-    metrics = {"exact_match": float(os.environ.get("FIXTURE_GATE_SCORE", "0.95"))}
+    definition = request["definition"]
+    score = float(os.environ.get("FIXTURE_GATE_SCORE", "0.95"))
+    source = definition["task"].get("name", "custom")
+    metric = definition["metric"]
+    metric_filter = definition.get("metric_filter") or "none"
+    native_key = f"{metric},{metric_filter}"
+    normalized = {"source_identity": source, "metric": metric, "filter": metric_filter, "native_metric_key": native_key, "value": score, "higher_is_better": True}
+    metrics = {f"{source}:{native_key}": score}
+    normalized_metrics = {f"{source}:{native_key}": normalized}
+    gate = {"metric": normalized, "threshold": definition["threshold"], "comparison": "at_least", "conclusion": "passed" if score >= definition["threshold"] else "failed"}
 schema_version = int(os.environ.get("FIXTURE_EVAL_SCHEMA_VERSION", "1"))
-result = {"schema_version": schema_version, "status": "succeeded", "metrics": metrics, "native_command": ["fixture-eval"], "raw_artifacts": [], "error": None}
+result = {"schema_version": schema_version, "status": "succeeded", "metrics": metrics, "normalized_metrics": normalized_metrics, "gate": gate, "native_command": ["fixture-eval"], "native_exit_code": 0 if kind == "lm_eval" else None, "native_timed_out": False, "raw_artifacts": [], "error": None}
 if os.environ.get("FIXTURE_EVAL_ENVELOPE_EVOLVED"):
     # A future envelope: new version, unknown fields, none of the v1 fields.
     result = {"schema_version": 2, "frontier_field": {"nested": True}}
 json.dump(result, open(args.output, "w"))
+if os.environ.get("FIXTURE_EVAL_EXIT_CODE"):
+    sys.exit(int(os.environ["FIXTURE_EVAL_EXIT_CODE"]))
 "#;
 
 const BENCH_CLIENT: &str = r#"#!/usr/bin/env python3
@@ -2162,6 +2528,21 @@ request = json.load(open(args.input))
 failed = os.environ.get("FIXTURE_BENCH_FAIL") == "1"
 load = request["case"]["load_shape"]
 rate = float(load.get("request_rate", 1.0))
+request_count = request["case"]["request_count"]
+request_slo = request["definition"].get("request_slo")
+request_slo_result = None
+if request_slo is not None:
+    duration = request_count / rate
+    request_slo_result = {
+        "good_requests": request_count,
+        "good_request_ratio": 1.0,
+        "goodput": rate,
+        "profiling_duration_seconds": duration,
+        "profiling_duration_source": "native-profiling-request-window",
+        "request_count_reconciled": True,
+        "native_aggregate_good_request_count": request_count,
+        "native_aggregate_good_request_count_consistent": True,
+    }
 artifacts = []
 if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1":
     artifact = os.path.join(os.path.dirname(args.output), "artifacts", "partial.txt")
@@ -2172,7 +2553,7 @@ if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1":
 result = {
     "schema_version": int(os.environ.get("FIXTURE_BENCH_SCHEMA_VERSION", "1")),
     "status": "failed" if failed else "succeeded",
-    "completed_requests": request["case"]["request_count"],
+    "completed_requests": request_count,
     "failed_requests": 1 if failed else 0,
     "normalization_schema": "aiperf-summary-v1",
     "metrics": {
@@ -2180,12 +2561,32 @@ result = {
         "output_throughput": rate * 1000.0,
         "total_token_throughput": rate * 9000.0,
         "mean_request_latency_ms": rate * 90.0,
+        "min_request_latency_ms": rate * 70.0,
+        "max_request_latency_ms": rate * 120.0,
+        "stddev_request_latency_ms": rate * 10.0,
+        "p50_request_latency_ms": rate * 90.0,
+        "p90_request_latency_ms": rate * 100.0,
+        "p95_request_latency_ms": rate * 105.0,
         "p99_request_latency_ms": rate * 110.0,
         "mean_ttft_ms": rate * 80.0,
+        "min_ttft_ms": rate * 60.0,
+        "max_ttft_ms": rate * 110.0,
+        "stddev_ttft_ms": rate * 10.0,
+        "p50_ttft_ms": rate * 80.0,
+        "p90_ttft_ms": rate * 90.0,
+        "p95_ttft_ms": rate * 95.0,
         "p99_ttft_ms": rate * 100.0,
-        "mean_itl_ms": rate * 10.0,
-        "p99_itl_ms": rate * 12.0,
+        "mean_tpot_ms": rate * 10.0,
+        "min_tpot_ms": rate * 8.0,
+        "max_tpot_ms": rate * 13.0,
+        "stddev_tpot_ms": rate,
+        "p50_tpot_ms": rate * 10.0,
+        "p90_tpot_ms": rate * 11.0,
+        "p95_tpot_ms": rate * 11.5,
+        "p99_tpot_ms": rate * 12.0,
+        **({"good_request_ratio": 1.0, "goodput": rate} if request_slo else {}),
     },
+    "request_slo": request_slo_result,
     "native_command": ["fixture-bench"],
     "native_exit_code": 143 if os.environ.get("FIXTURE_BENCH_INTERRUPT_WAIT") == "1" else 0,
     "raw_artifacts": artifacts,

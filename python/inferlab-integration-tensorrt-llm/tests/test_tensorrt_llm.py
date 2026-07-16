@@ -83,7 +83,8 @@ def test_plan_single_topology() -> None:
     assert result.replicas[0].device_count == 2
     probe = result.replicas[0].primary_readiness.root
     assert isinstance(probe, ReadinessProbeHttp) and probe.path == "/health"
-    assert result.endpoint.api_path == "/v1/completions"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is None, "no flush endpoint in TensorRT-LLM"
     assert result.routing.root.owner == "direct"
     outer = result.roles[0].effective_parallelism.outer
@@ -268,7 +269,8 @@ def test_plan_prefill_decode_uses_nixl_without_control_plane_transfer_ports() ->
     assert isinstance(transfer, ServeRoleLinkKvTransfer)
     assert transfer.mechanism == KvTransferMechanism.nixl
     assert result.routing.root.owner == "inferlab_builtin"
-    assert result.endpoint.api_path == "/v1/completions"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is None
     assert [item.source_path for item in result.render_inputs] == ["configs/operator.yaml"]
 

@@ -81,6 +81,10 @@ fn install_validates_the_shipped_package_and_drives_both_clis() -> Result<(), Bo
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("progress:"),
+        "fast agent operations must stay on the shared batch path without progress instrumentation"
+    );
     let rows = report["rows"].as_array().ok_or("rows")?;
     assert_eq!(rows.len(), 2);
     // Every native command the operation ran — readiness probes included —

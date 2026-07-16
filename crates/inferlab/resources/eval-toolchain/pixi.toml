@@ -8,6 +8,7 @@ pydantic = "==2.13.4"
 
 [feature.eval.pypi-dependencies]
 lm-eval = { version = "==0.4.12", extras = ["api"] }
+transformers = "==5.12.1"
 
 [feature.bench.dependencies]
 python = "3.12.*"
@@ -17,7 +18,7 @@ pydantic = "==2.13.4"
 c-compiler = "1.*"
 
 [feature.bench.pypi-dependencies]
-aiperf = "==0.10.0"
+aiperf = "==0.11.0"
 
 [environments]
 eval = ["eval"]

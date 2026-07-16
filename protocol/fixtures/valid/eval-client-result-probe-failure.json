@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "metrics": {},
+  "native_command": [],
+  "raw_artifacts": [
+    {
+      "name": "prompt_logprob_probe",
+      "kind": "prompt-logprob-probe",
+      "path": "/records/eval/artifacts/prompt-logprob-probe.json"
+    }
+  ],
+  "failure_kind": "probe_generated_only_logprobs",
+  "error": "endpoint returned generated-token logprobs without scored prompt positions"
+}

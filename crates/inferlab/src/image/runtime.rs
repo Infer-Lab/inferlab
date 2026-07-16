@@ -14,6 +14,7 @@ use super::{EligibilityPlan, ResolvedImageBuild};
 use crate::adapter::AdapterClient;
 use crate::environment;
 use crate::interrupt;
+use crate::progress::{Phase, Progress};
 use crate::recipe::{self, RecipeStatus};
 use crate::record::{RecordIdentity, new_record_id};
 use crate::resolve::{ResolveRequest, Workflow, resolve};
@@ -36,6 +37,7 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
     resolved: ResolvedImageBuild,
     tool: &T,
     adapter: &C,
+    progress: &Progress,
 ) -> Result<ImageBuildReport, InferlabError> {
     environment::ensure_usable(&workspace.root, &resolved.image.pixi_environment)?;
     interrupt::prepare().map_err(|message| InferlabError::ImageBuild { message })?;
@@ -43,20 +45,15 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
         image: &resolved.image.id,
     })?;
     let mut store = ImageRecordStore::begin(&workspace.root, id, resolved)?;
-    // Operator progress goes to the diagnostic stream as phases begin;
-    // stdout stays a single final report ([[RFC-0007:C-IMAGE-BUILD]]).
-    eprintln!(
-        "image record {}: {}",
-        store.record().id,
-        store.dir().display()
-    );
-    for skipped in &store.record().resolved.skipped_platforms {
-        eprintln!(
-            "image {}: skipping {} ({})",
-            store.record().id,
-            skipped.platform,
-            skipped.reason
-        );
+    progress
+        .phase(Phase::named("record created").record(store.record().id.clone(), store.dir()))?;
+    let skipped_count = store.record().resolved.skipped_platforms.len();
+    for (index, skipped) in store.record().resolved.skipped_platforms.iter().enumerate() {
+        progress.phase(Phase::named("assembly skipped").item(
+            format!("{}: {}", skipped.platform, skipped.reason),
+            index + 1,
+            skipped_count,
+        ))?;
     }
 
     // Entry checks against the local workspace realization
@@ -66,21 +63,25 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
     let checks = store.record().resolved.image.checks.clone();
     if !checks.is_empty() {
         let pixi_environment = store.record().resolved.image.pixi_environment.clone();
-        eprintln!(
-            "image {}: checking the local workspace environment ({} checks)",
-            store.record().id,
-            checks.len()
-        );
+        progress.phase(
+            Phase::named("package-build preflight")
+                .current_item(format!("{} environment checks", checks.len())),
+        )?;
         // Even an infrastructure failure (Pixi unavailable) must finalize
         // the record rather than leave it Running.
-        let (evidence, failure) =
-            match environment::run_local_checks(&workspace.root, &pixi_environment, &checks) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    store.finish(ImageStatus::Failed)?;
-                    return Err(error);
-                }
-            };
+        let (evidence, failure) = match environment::run_local_checks(
+            &workspace.root,
+            &pixi_environment,
+            &checks,
+            progress,
+            "package-build preflight",
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                store.finish(ImageStatus::Failed)?;
+                return Err(error);
+            }
+        };
         store.record_mut().environment_checks = evidence;
         store.rewrite()?;
         if let Some(failure) = failure {
@@ -88,7 +89,7 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
             // report: the record finalizes, stdout keeps the single
             // machine-readable report, and the operator gets the repair hint.
             let message = failure.message(&pixi_environment);
-            eprintln!("image {}: {message}", store.record().id);
+            progress.phase(Phase::named("package-build preflight failed").current_item(message))?;
             let status = ImageStatus::Failed;
             let manifest = store.finish(status)?;
             return Ok(ImageBuildReport {
@@ -101,7 +102,9 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
 
     let assembly_count = store.record().resolved.assemblies.len();
     for index in 0..assembly_count {
-        let outcome = assemble(workspace, &mut store, index, tool);
+        let platform = store.record().resolved.assemblies[index].platform.clone();
+        progress.phase(Phase::named("assembly").item(&platform, index + 1, assembly_count))?;
+        let outcome = assemble(workspace, &mut store, index, tool, progress);
         store.record_mut().assemblies[index].outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => AssemblyOutcome::Failed {
@@ -113,7 +116,15 @@ pub fn run<T: BuilderTool, C: AdapterClient>(
 
     let validation_count = store.record().resolved.validations.len();
     for index in 0..validation_count {
-        let outcome = validate(workspace, &store, index, adapter);
+        let plan = &store.record().resolved.validations[index];
+        let item = format!(
+            "{}/{} ({})",
+            plan.recipe,
+            plan.server_case.as_deref().unwrap_or("base"),
+            plan.platform
+        );
+        progress.phase(Phase::named("validation").item(item, index + 1, validation_count))?;
+        let outcome = validate(workspace, &store, index, adapter, progress);
         store.record_mut().validations[index].outcome = outcome;
         store.rewrite()?;
     }
@@ -149,6 +160,7 @@ fn assemble<T: BuilderTool>(
     store: &mut ImageRecordStore,
     index: usize,
     tool: &T,
+    progress: &Progress,
 ) -> Result<AssemblyOutcome, InferlabError> {
     let record_id = store.record().id.clone();
     let resolved = store.record().resolved.clone();
@@ -207,7 +219,8 @@ fn assemble<T: BuilderTool>(
     let mut wheels = Vec::new();
     let mut source_packages = Vec::new();
     let build_result = (|| -> Result<(), InferlabError> {
-        for wheel_source in &resolved.image.wheel_sources {
+        let wheel_total = resolved.image.wheel_sources.len();
+        for (wheel_index, wheel_source) in resolved.image.wheel_sources.iter().enumerate() {
             let owner = resolved
                 .image
                 .source_paths
@@ -231,10 +244,11 @@ fn assemble<T: BuilderTool>(
             let cache_dir = wheel_cache_root.join(&cache_key);
             let (wheel, cached) = match cached_wheel(&cache_dir)? {
                 Some(wheel) => {
-                    eprintln!(
-                        "image {record_id}: reusing cached wheel {}",
-                        wheel_source.display()
-                    );
+                    progress.phase(Phase::named("package-build").item(
+                        wheel_source.display().to_string(),
+                        wheel_index + 1,
+                        wheel_total,
+                    ))?;
                     (wheel, true)
                 }
                 None => {
@@ -250,13 +264,16 @@ fn assemble<T: BuilderTool>(
                             .strip_prefix(owner)
                             .unwrap_or_else(|_| Path::new("")),
                     );
-                    eprintln!(
-                        "image {record_id}: building wheel {} (log: {})",
-                        wheel_source.display(),
-                        wheel_build_dir(&build_dir, wheel_source)
-                            .join("build.log")
-                            .display()
-                    );
+                    let log = wheel_build_dir(&build_dir, wheel_source).join("build.log");
+                    progress.phase(
+                        Phase::named("package-build")
+                            .item(
+                                wheel_source.display().to_string(),
+                                wheel_index + 1,
+                                wheel_total,
+                            )
+                            .log(&log),
+                    )?;
                     let wheel = build_wheel(
                         &workspace.root,
                         &resolved.image.pixi_environment,
@@ -406,10 +423,15 @@ fn assemble<T: BuilderTool>(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "build".to_owned());
-    eprintln!(
-        "image {record_id}: building {platform} (log: {})",
-        build_dir.join("docker-build.log").display()
-    );
+    progress.phase(
+        Phase::named("assembly")
+            .item(
+                &platform,
+                index + 1,
+                store.record().resolved.assemblies.len(),
+            )
+            .log(build_dir.join("docker-build.log")),
+    )?;
     let built = match tool.build_image(
         &prepared.context_dir,
         &build_dir,
@@ -467,7 +489,11 @@ fn assemble<T: BuilderTool>(
         source,
     })?;
 
-    eprintln!("image {record_id}: inspecting {}", built.image_id);
+    progress.phase(Phase::named("inspection").item(
+        &built.image_id,
+        index + 1,
+        store.record().resolved.assemblies.len(),
+    ))?;
     let inspected = tool.inspect_image(
         &built.image_id,
         &mut RecordingSink {
@@ -489,7 +515,11 @@ fn assemble<T: BuilderTool>(
             &built.image_id,
             &record_id,
         ));
-        eprintln!("image {record_id}: exporting {}", archive.display());
+        progress.phase(Phase::named("export").item(
+            archive.display().to_string(),
+            index + 1,
+            store.record().resolved.assemblies.len(),
+        ))?;
         let exported = tool.export_image(
             &built.image_id,
             &archive,
@@ -596,6 +626,7 @@ fn validate<C: AdapterClient>(
     store: &ImageRecordStore,
     index: usize,
     adapter: &C,
+    progress: &Progress,
 ) -> ValidationOutcome {
     let record = store.record();
     let plan = &record.resolved.validations[index];
@@ -637,18 +668,11 @@ fn validate<C: AdapterClient>(
     if let Err(reason) = super::single_host_local(resolved.server.processes()) {
         return ValidationOutcome::BuiltButUnvalidated { reason };
     }
-    eprintln!(
-        "image {}: validating {}/{} ({})",
-        record.id,
-        plan.recipe,
-        plan.server_case.as_deref().unwrap_or("base"),
-        plan.platform
-    );
     let mut resolved = resolved;
     // The realization was checked during assembly ([[RFC-0002:C-ENVIRONMENT-CHECKS]]).
     resolved.stack.realization = environment::CheckRealization::Image;
     super::launch::containerize(&mut resolved, &image_id, &workspace.local.machines, false);
-    match recipe::run(&workspace.root, resolved) {
+    match recipe::run(&workspace.root, resolved, progress) {
         Ok(record) if record.status == RecipeStatus::Failed => ValidationOutcome::Failed {
             recipe_record_id: Some(record.id),
             message: "validation recipe failed".to_owned(),

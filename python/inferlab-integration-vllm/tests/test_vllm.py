@@ -35,6 +35,8 @@ def test_plan_serve_matches_the_shared_vllm_fixture() -> None:
     expected_output = expected.root.result.root.output
     assert result.model_copy(update={"integration": expected_output.integration}) == expected_output
     assert result.integration.framework_version == "unavailable"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is None
     assert result.routing.root.owner == "inferlab_builtin"
     assert "vllm" not in sys.modules
@@ -171,6 +173,7 @@ def test_render_lowers_published_vllm_settings() -> None:
             {
                 "tokenizer_mode": "deepseek_v4",
                 "tool_call_parser": "deepseek_v4",
+                "reasoning_parser": "deepseek_v4",
                 "enable_auto_tool_choice": True,
                 "reasoning_config": {
                     "reasoning_parser": "deepseek_v4",
@@ -187,6 +190,7 @@ def test_render_lowers_published_vllm_settings() -> None:
 
     assert argv[argv.index("--tokenizer-mode") + 1] == "deepseek_v4"
     assert argv[argv.index("--tool-call-parser") + 1] == "deepseek_v4"
+    assert argv[argv.index("--reasoning-parser") + 1] == "deepseek_v4"
     assert "--enable-auto-tool-choice" in argv
     assert json.loads(argv[argv.index("--reasoning-config") + 1]) == {
         "reasoning_parser": "deepseek_v4",

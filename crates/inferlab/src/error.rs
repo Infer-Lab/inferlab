@@ -254,6 +254,31 @@ pub enum InferlabError {
     #[error("ad-hoc execution failed: {message}")]
     AdHocRun { message: String },
 
+    #[error("failed to {operation} dataset path {path}: {source}")]
+    DatasetIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to download dataset from {url}: {source}")]
+    DatasetHttp {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("dataset snapshot at {path} has SHA-256 {observed}, expected {expected}")]
+    DatasetDigest {
+        path: PathBuf,
+        expected: String,
+        observed: String,
+    },
+
+    #[error("dataset preparation failed: {message}")]
+    DatasetPreparation { message: String },
+
     #[error("failed to access server record {path}: {source}")]
     RecordIo {
         path: PathBuf,
@@ -340,7 +365,11 @@ impl InferlabError {
             Self::ServerLifecycle { .. }
             | Self::ServerBusy { .. }
             | Self::Proxy { .. }
-            | Self::Profiling { .. } => "E4002",
+            | Self::Profiling { .. }
+            | Self::DatasetIo { .. }
+            | Self::DatasetHttp { .. }
+            | Self::DatasetDigest { .. }
+            | Self::DatasetPreparation { .. } => "E4002",
             Self::RecordIo { .. } | Self::RecordDecode { .. } | Self::RecordEncode { .. } => {
                 "E5001"
             }

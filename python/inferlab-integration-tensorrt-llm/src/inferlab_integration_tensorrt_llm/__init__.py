@@ -1,7 +1,5 @@
 import hashlib
 import os
-import tomllib
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import cast
 
@@ -44,10 +42,14 @@ from inferlab_adapter_sdk import (
     ServeTopology,
     SettingValue,
     append_option,
+    effective_settings,
+    integration_identity,
     merge_serve_args,
-    plain_setting,
+    replica_id,
+    require_role,
+    validate_settings,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 # TensorRT-LLM declares its click options in underscore spellings plus short
 # aliases and does no hyphen/underscore normalization, so the claim list must
@@ -128,19 +130,7 @@ def _runtime_cache_env(root: str) -> dict[str, str]:
 
 
 def _settings(values: dict[str, SettingValue]) -> TrtllmServeSettings:
-    try:
-        return TrtllmServeSettings.model_validate(
-            {key: plain_setting(value) for key, value in values.items()}
-        )
-    except ValidationError as error:
-        raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
-
-
-def _effective_settings(settings: TrtllmServeSettings) -> dict[str, SettingValue]:
-    return {
-        key: SettingValue(root=value)
-        for key, value in settings.model_dump(exclude_none=True).items()
-    }
+    return validate_settings(TrtllmServeSettings, values)
 
 
 def _yaml_mapping(value: object, source: str) -> dict[str, object]:
@@ -237,30 +227,13 @@ def _launch_file(
     return declaration, str(Path(runtime_cache_root) / relative_path)
 
 
-def _adapter_version() -> str:
-    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-    if pyproject.is_file():
-        with pyproject.open("rb") as handle:
-            project_version: str = tomllib.load(handle)["project"]["version"]
-        return project_version
-    try:
-        return version("inferlab-integration-tensorrt-llm")
-    except PackageNotFoundError:
-        # External-image lowering mounts each package's dist-info beside
-        # its module, so importlib.metadata resolves there instead.
-        return "unavailable"
-
-
 def _identity() -> IntegrationIdentity:
-    try:
-        framework_version = version("tensorrt_llm")
-    except PackageNotFoundError:
-        framework_version = "unavailable"
-    return IntegrationIdentity(
+    return integration_identity(
         adapter_id="inferlab-tensorrt-llm",
-        adapter_version=_adapter_version(),
+        adapter_distribution="inferlab-integration-tensorrt-llm",
         framework="tensorrt-llm",
-        framework_version=framework_version,
+        framework_distribution="tensorrt_llm",
+        module_file=__file__,
     )
 
 
@@ -349,23 +322,6 @@ def _effective_parallelism(declared: Parallelism) -> Parallelism:
     )
 
 
-def _role_for_kind(input: PlanServeInput, kind: ServeRoleKind) -> ServeRoleInput:
-    matches = [role for role in input.roles if role.kind == kind]
-    if len(matches) != 1:
-        raise AdapterOperationError(
-            AdapterErrorCode.invalid_settings,
-            f"{input.topology.value} topology requires exactly one {kind.value} role",
-        )
-    return matches[0]
-
-
-def _replica_id(role: ServeRoleInput, replica_index: int) -> str:
-    base = "server" if role.kind == ServeRoleKind.serve else role.id
-    if role.replica_count == 1:
-        return base
-    return f"{base}-{replica_index:03d}"
-
-
 def _device_count(parallelism: Parallelism) -> int:
     outer = parallelism.outer or ParallelismOuter()
     return (outer.tensor_parallel_size or 1) * (outer.pipeline_parallel_size or 1)
@@ -383,7 +339,7 @@ def _plan_role(
     parallelism = _effective_parallelism(role.parallelism)
     replicas = [
         ServeReplicaRequirement(
-            id=_replica_id(role, replica_index),
+            id=replica_id(role, replica_index),
             role_id=role.id,
             replica_index=replica_index,
             device_count=_device_count(parallelism),
@@ -400,7 +356,7 @@ def _plan_role(
             kind=role.kind,
             declared_replica_count=role.replica_count,
             effective_replica_count=role.replica_count,
-            effective_settings=_effective_settings(settings),
+            effective_settings=effective_settings(settings),
             effective_parallelism=parallelism,
         ),
         replicas,
@@ -410,7 +366,8 @@ def _plan_role(
 def _endpoint_requirement() -> EndpointRequirement:
     return EndpointRequirement(
         protocol=EndpointProtocol(),
-        api_path="/v1/completions",
+        completions_path="/v1/completions",
+        chat_completions_path="/v1/chat/completions",
     )
 
 
@@ -426,7 +383,7 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
             f"the TensorRT-LLM integration does not support routing backend "
             f"{input.routing_backend!r}",
         )
-    role = _role_for_kind(input, ServeRoleKind.serve)
+    role = require_role(input, ServeRoleKind.serve)
     role_result, replicas = _plan_role(input, role)
     settings = _settings(role_result.effective_settings)
     render_inputs = []
@@ -460,8 +417,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             f"TensorRT-LLM does not support routing backend {input.routing_backend!r}",
         )
-    prefill = _role_for_kind(input, ServeRoleKind.prefill)
-    decode = _role_for_kind(input, ServeRoleKind.decode)
+    prefill = require_role(input, ServeRoleKind.prefill)
+    decode = require_role(input, ServeRoleKind.decode)
     prefill_result, prefill_replicas = _plan_role(input, prefill)
     decode_result, decode_replicas = _plan_role(input, decode)
     roles = [prefill_result, decode_result]

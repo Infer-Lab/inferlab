@@ -1,6 +1,7 @@
 use crate::InferlabError;
 use crate::adapter::ProcessAdapterClient;
 use crate::environment;
+use crate::progress::{Mode as ProgressMode, Phase, Progress};
 use crate::recipe::{self, RecipeStatus};
 use crate::record::{RecordIdentity, new_record_id};
 use crate::resolve::{ExecutionTarget, ResolveRequest, Workflow, resolve};
@@ -436,40 +437,88 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
             }
         }
         Command::Workspace(WorkspaceCommand::Lock) => {
-            let root = discover_workspace(workspace.as_deref())?;
-            write_json(&environment::lock_workspace(&root)?)
+            with_progress("workspace lock", ProgressMode::Immediate, |progress| {
+                let root = discover_workspace(workspace.as_deref())?;
+                write_json(&environment::lock_workspace_with_progress(&root, progress)?)
+            })
         }
-        Command::Stack(StackCommand::Status(args)) => run_stack_status(workspace, args),
-        Command::Toolchain(ToolchainCommand::Install) => write_json(&toolchain::install()?),
-        Command::Serve(ServeCommand::Start(args)) => run_selection(
-            workspace,
-            args.selection.local.clone(),
-            Workflow::ServeStart,
-            args.server,
-            args.selection,
-            &[],
-        ),
+        Command::Stack(StackCommand::Status(args)) => {
+            with_progress("stack status", ProgressMode::Delayed, |progress| {
+                run_stack_status(workspace, args, progress)
+            })
+        }
+        Command::Toolchain(ToolchainCommand::Install) => {
+            with_progress("toolchain install", ProgressMode::Immediate, |progress| {
+                write_json(&toolchain::install_with_progress(progress)?)
+            })
+        }
+        Command::Serve(ServeCommand::Start(args)) => {
+            let mode = if args.selection.dry_run {
+                ProgressMode::Delayed
+            } else {
+                ProgressMode::Immediate
+            };
+            with_progress("serve start", mode, |progress| {
+                run_selection(
+                    workspace,
+                    args.selection.local.clone(),
+                    Workflow::ServeStart,
+                    args.server,
+                    args.selection,
+                    &[],
+                    progress,
+                )
+            })
+        }
         Command::Serve(ServeCommand::Status(args)) => {
-            let root = discover_workspace(workspace.as_deref())?;
-            write_json(&server::status(&root, &args.id)?)
+            with_progress("serve status", ProgressMode::Delayed, |progress| {
+                progress.phase(Phase::named("server record inspection"))?;
+                let root = discover_workspace(workspace.as_deref())?;
+                write_json(&server::status_with_progress(&root, &args.id, progress)?)
+            })
         }
         Command::Serve(ServeCommand::Logs(args)) => {
-            let root = discover_workspace(workspace.as_deref())?;
-            write_json(&server::logs(&root, &args.id)?)
+            with_progress("serve logs", ProgressMode::Delayed, |progress| {
+                progress.phase(Phase::named("server log discovery"))?;
+                let root = discover_workspace(workspace.as_deref())?;
+                write_json(&server::logs_with_progress(&root, &args.id, progress)?)
+            })
         }
         Command::Serve(ServeCommand::Stop(args)) => {
-            let root = discover_workspace(workspace.as_deref())?;
-            write_json(&server::stop(&root, &args.id)?)
+            with_progress("serve stop", ProgressMode::Immediate, |progress| {
+                progress.phase(Phase::named("process termination"))?;
+                let root = discover_workspace(workspace.as_deref())?;
+                write_json(&server::stop(&root, &args.id, progress)?)
+            })
         }
-        Command::Recipe(RecipeCommand::Run(args)) => run_selection(
-            workspace,
-            args.selection.local.clone(),
-            Workflow::RecipeRun,
-            args.recipe,
-            args.selection,
-            &args.capture,
-        ),
-        Command::Bench(args) => run_bench_command(workspace, args),
+        Command::Recipe(RecipeCommand::Run(args)) => {
+            let mode = if args.selection.dry_run {
+                ProgressMode::Delayed
+            } else {
+                ProgressMode::Immediate
+            };
+            with_progress("recipe run", mode, |progress| {
+                run_selection(
+                    workspace,
+                    args.selection.local.clone(),
+                    Workflow::RecipeRun,
+                    args.recipe,
+                    args.selection,
+                    &args.capture,
+                    progress,
+                )
+            })
+        }
+        Command::Bench(args) => {
+            let mode = if args.dry_run {
+                ProgressMode::Delayed
+            } else {
+                ProgressMode::Immediate
+            };
+            with_progress("bench", mode, |progress| {
+                run_bench_command(workspace, args, progress)
+            })
+        }
         Command::Run(args) => {
             let root = discover_workspace(workspace.as_deref())?;
             let config = load_workspace_config(&root)?;
@@ -490,23 +539,43 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
             // command's own report, never an Inferlab diagnostic.
             std::process::exit(code);
         }
-        Command::Image(ImageCommand::Build(args)) => run_image_build(workspace, args),
-        Command::Scratchpad(command) => {
-            let root = discover_workspace(workspace.as_deref())?;
-            let output = match command {
-                ScratchpadCommand::Note(args) => crate::scratchpad::note(
-                    &root,
-                    &args.text,
-                    args.topic.as_deref(),
-                    &args.records,
-                    args.author.as_deref(),
-                )?,
-                ScratchpadCommand::Show(args) => {
-                    crate::scratchpad::show(&root, args.topic.as_deref(), args.all)?
-                }
+        Command::Image(ImageCommand::Build(args)) => {
+            let mode = if args.dry_run {
+                ProgressMode::Delayed
+            } else {
+                ProgressMode::Immediate
             };
-            println!("{}", output.trim_end());
-            Ok(())
+            with_progress("image build", mode, |progress| {
+                run_image_build(workspace, args, progress)
+            })
+        }
+        Command::Scratchpad(command) => {
+            let command_name = match &command {
+                ScratchpadCommand::Note(_) => "scratchpad note",
+                ScratchpadCommand::Show(_) => "scratchpad show",
+            };
+            with_progress(command_name, ProgressMode::Delayed, |progress| {
+                progress.phase(Phase::named("journal discovery"))?;
+                let root = discover_workspace(workspace.as_deref())?;
+                let output = match command {
+                    ScratchpadCommand::Note(args) => crate::scratchpad::note_with_progress(
+                        &root,
+                        &args.text,
+                        args.topic.as_deref(),
+                        &args.records,
+                        args.author.as_deref(),
+                        progress,
+                    )?,
+                    ScratchpadCommand::Show(args) => crate::scratchpad::show_with_progress(
+                        &root,
+                        args.topic.as_deref(),
+                        args.all,
+                        progress,
+                    )?,
+                };
+                println!("{}", output.trim_end());
+                Ok(())
+            })
         }
         Command::Agent(command) => {
             let report = match command {
@@ -546,7 +615,9 @@ pub fn run(cli: Cli) -> Result<(), InferlabError> {
 fn run_stack_status(
     workspace_path: Option<PathBuf>,
     args: StackStatusArgs,
+    progress: &Progress,
 ) -> Result<(), InferlabError> {
+    progress.phase(Phase::named("environment realization inspection"))?;
     let root = discover_workspace(workspace_path.as_deref())?;
     let config = load_workspace_config(&root)?;
     let selected: Vec<(String, String)> = match args.stack.as_deref() {
@@ -568,7 +639,7 @@ fn run_stack_status(
             .map(|(id, definition)| (id.clone(), definition.pixi_environment.clone()))
             .collect(),
     };
-    let reports = environment::status(&root, &selected)?;
+    let reports = environment::status_with_progress(&root, &selected, progress)?;
     let unconfirmed = reports
         .iter()
         .any(|report| report.status != environment::EnvironmentStatusKind::Confirmed);
@@ -583,7 +654,9 @@ fn run_stack_status(
 fn run_image_build(
     workspace_path: Option<PathBuf>,
     args: ImageBuildArgs,
+    progress: &Progress,
 ) -> Result<(), InferlabError> {
+    progress.phase(Phase::named("resolution"))?;
     let root = discover_workspace(workspace_path.as_deref())?;
     let workspace = load_workspace(root, args.local.as_deref())?;
     let tool = crate::image::tool::DockerBuilderTool;
@@ -601,7 +674,8 @@ fn run_image_build(
     if args.dry_run {
         return write_json(&resolved.dry_run_plan());
     }
-    let report = crate::image::runtime::run(&workspace, resolved, &tool, &ProcessAdapterClient)?;
+    let report =
+        crate::image::runtime::run(&workspace, resolved, &tool, &ProcessAdapterClient, progress)?;
     let failed = report.status != crate::image::record::ImageStatus::Succeeded;
     let record_id = report.record_id.clone();
     write_json(&report)?;
@@ -704,7 +778,9 @@ fn sglang_prefill_targets(
 fn run_bench_command(
     workspace_path: Option<PathBuf>,
     args: BenchArgs,
+    progress: &Progress,
 ) -> Result<(), InferlabError> {
+    progress.phase(Phase::named("resolution and admission"))?;
     let root = discover_workspace(workspace_path.as_deref())?;
     let config = load_workspace_config(&root)?;
     let snapshot = crate::workspace::snapshot_workspace(&root, &config)?;
@@ -734,6 +810,7 @@ fn run_bench_command(
             record_id: &plan.target.server_record_id,
         },
         workload::ResolvedWorkloadPlan::ManualBench(Box::new(plan.clone())),
+        progress,
     )?;
     let failed = record.status == WorkloadStatus::Failed;
     let record_id = record.id.clone();
@@ -752,7 +829,9 @@ fn run_selection(
     target_id: String,
     selection: SelectionArgs,
     captures: &[String],
+    progress: &Progress,
 ) -> Result<(), InferlabError> {
+    progress.phase(Phase::named("resolution"))?;
     let root = discover_workspace(workspace_path.as_deref())?;
     let workspace = load_workspace(root.clone(), local.as_deref())?;
     let server_id = match workflow {
@@ -807,6 +886,7 @@ fn run_selection(
                 }),
             explicit_entrypoint,
         };
+    progress.phase(Phase::named("local and remote preflight"))?;
     let resolved = if let Some(image) = &image {
         resolve(
             &workspace,
@@ -826,9 +906,9 @@ fn run_selection(
         write_json(&resolved.dry_run_plan())
     } else {
         match workflow {
-            Workflow::ServeStart => write_json(&server::start(&root, resolved)?),
+            Workflow::ServeStart => write_json(&server::start(&root, resolved, progress)?),
             Workflow::RecipeRun => {
-                let record = recipe::run(&root, resolved)?;
+                let record = recipe::run(&root, resolved, progress)?;
                 let failed = record.status == RecipeStatus::Failed;
                 let record_id = record.id.clone();
                 write_json(&record)?;
@@ -865,4 +945,18 @@ fn write_text(value: &str) -> Result<(), InferlabError> {
             .map_err(|source| InferlabError::WriteOutput { source })?;
     }
     Ok(())
+}
+
+fn with_progress<T>(
+    command: &str,
+    mode: ProgressMode,
+    operation: impl FnOnce(&Progress) -> Result<T, InferlabError>,
+) -> Result<T, InferlabError> {
+    let progress = Progress::stderr(command, mode)?;
+    let result = operation(&progress);
+    let progress_result = progress.finish();
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => progress_result.map(|()| value),
+    }
 }

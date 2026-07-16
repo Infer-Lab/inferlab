@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "status": "succeeded",
+  "metrics": {
+    "gsm8k:exact_match,strict-match": 0.95
+  },
+  "normalized_metrics": {
+    "gsm8k:exact_match,strict-match": {
+      "source_identity": "gsm8k",
+      "metric": "exact_match",
+      "filter": "strict-match",
+      "native_metric_key": "exact_match,strict-match",
+      "value": 0.95,
+      "higher_is_better": true
+    }
+  },
+  "gate": {
+    "metric": {
+      "source_identity": "gsm8k",
+      "metric": "exact_match",
+      "filter": "strict-match",
+      "native_metric_key": "exact_match,strict-match",
+      "value": 0.95,
+      "higher_is_better": true
+    },
+    "threshold": 0.9,
+    "comparison": "at_least",
+    "conclusion": "passed"
+  },
+  "trial_summary": {
+    "requested_trials": 3,
+    "issued_trials": 3,
+    "unissued_trials": 0,
+    "completed_trials": 3,
+    "request_failure_trials": 0,
+    "passed_trials": 2,
+    "pass_rate": 0.6666666666666666,
+    "per_trial_metric": "exact_match",
+    "per_trial_filter": "strict-match",
+    "higher_is_better": true
+  },
+  "native_command": ["python", "-m", "lm_eval", "run"],
+  "native_exit_code": 0,
+  "native_timed_out": false,
+  "raw_artifacts": [
+    {
+      "name": "lm_eval_results_0",
+      "kind": "lm-eval-results",
+      "path": "/records/eval/artifacts/lm-eval-raw/results_fixture.json"
+    }
+  ],
+  "failure_kind": null,
+  "error": null
+}

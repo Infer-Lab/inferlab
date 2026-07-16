@@ -42,6 +42,8 @@ struct Scenario {
     docker_log: Option<PathBuf>,
     /// The adapter container sleeps instead of answering (timeout coverage).
     adapter_hang: bool,
+    /// The external-image framework probe sleeps instead of answering.
+    framework_probe_hang: bool,
     /// The adapter floods stderr past the pipe capacity (drain coverage).
     adapter_verbose: bool,
     /// The adapter returns a structured rejection.
@@ -411,27 +413,30 @@ fn closed_loop_builds_validates_and_scopes_platforms() -> Result<(), Box<dyn Err
 
     let progress = String::from_utf8_lossy(&output.stderr);
     assert!(
-        progress.contains(&format!("image record {record_id}:")),
+        progress.contains("phase=\"record created\"")
+            && progress.contains(&format!("record=\"{record_id}\""))
+            && progress.contains("record_dir=\""),
         "the record identity is reported as soon as the record exists"
     );
     assert!(
-        progress.contains(&format!("image {record_id}: skipping linux/arm64")),
+        progress.contains("phase=\"assembly skipped\"")
+            && progress.contains("item=\"linux/arm64:")
+            && progress.contains("position=1/1"),
         "the skipped platform is reported to the operator: {progress}"
     );
     assert!(
-        progress.contains(&format!(
-            "image {record_id}: checking the local workspace environment"
-        )),
+        progress.contains("phase=\"package-build preflight\""),
         "entry checks report as a phase before package builds: {progress}"
     );
     assert!(
-        progress.contains(&format!(
-            "image {record_id}: building wheel vendor/vllm (log: "
-        )),
+        progress.contains("phase=\"package-build\" item=\"vendor/vllm\"")
+            && progress.contains("log=\""),
         "wheel build phases report their log paths: {progress}"
     );
-    assert!(progress.contains(&format!("image {record_id}: building linux/amd64 (log: ")));
-    assert!(progress.contains(&format!("image {record_id}: validating dsv4-qualify/")));
+    assert!(progress.contains("phase=\"assembly\" item=\"linux/amd64\" position=1/1"));
+    assert!(progress.contains("phase=\"inspection\"") && progress.contains("position=1/1"));
+    assert!(progress.contains("phase=\"export\"") && progress.contains("position=1/1"));
+    assert!(progress.contains("phase=\"validation\" item=\"dsv4-qualify/"));
 
     let manifest = &report["manifest"];
     let assemblies = manifest["assemblies"].as_array().ok_or("assemblies")?;
@@ -1802,6 +1807,49 @@ fn timed_out_adapter_container_is_removed() -> Result<(), Box<dyn Error>> {
         log.lines()
             .any(|line| line.starts_with("rm -f fixturecid0123")),
         "the timed-out adapter container itself is removed, not just the client: {log}"
+    );
+    Ok(())
+}
+
+#[test]
+fn timed_out_external_framework_probe_removes_its_container() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let local_path = workspace.root.path().join(".inferlab/local.toml");
+    let mut local = fs::read_to_string(&local_path)?;
+    local.push_str("\n[adapter]\nimage_timeout_seconds = 1\n");
+    fs::write(&local_path, local)?;
+    let docker_log = workspace.root.path().join("docker-log");
+
+    let output = workspace
+        .command_with(&Scenario {
+            docker_log: Some(docker_log.clone()),
+            framework_probe_hang: true,
+            ..Scenario::default()
+        })
+        .args([
+            "recipe",
+            "run",
+            "dsv4-qualify",
+            "--external-image",
+            "fixture-external",
+            "--dry-run",
+        ])
+        .output()?;
+
+    assert!(
+        !output.status.success(),
+        "a hung framework probe must time out"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("framework probe") && stderr.contains("within 1 seconds"),
+        "the probe preserves its own timeout terminal: {stderr}"
+    );
+    let log = fs::read_to_string(&docker_log)?;
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("rm -f fixturecid0123")),
+        "the timed-out framework-probe container is removed and verified: {log}"
     );
     Ok(())
 }

@@ -1,0 +1,21 @@
+task: inferlab_estonia
+output_type: generate_until
+custom_dataset: !function estonia.load_dataset
+test_split: test
+doc_to_text: prompt
+doc_to_target: target
+process_results: !function estonia.process_results
+num_fewshot: 0
+generation_kwargs:
+  until: []
+filter_list:
+  - name: strict-terminal-answer
+    filter:
+      - function: take_first
+metric_list:
+  - metric: estonia_pass
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1
+  source: llm-inference-bench estonia profile

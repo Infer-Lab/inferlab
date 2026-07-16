@@ -242,7 +242,8 @@ pub struct EndpointProjection {
     pub host: String,
     pub port: u16,
     pub protocol: String,
-    pub api_path: String,
+    pub completions_path: String,
+    pub chat_completions_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

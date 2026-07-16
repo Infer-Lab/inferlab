@@ -103,6 +103,37 @@ by that recipe's suite, for example `--set evals.gsm8k.limit=100` or
 `--set 'benches.random-8k1k.concurrency=[1,8]'`. These patches cannot change
 measurement identity, kind, suite membership, gate, or server selection.
 
+**Measurement controls.** An lm-eval definition selects one task as a pinned
+lm-eval name (`task = "gsm8k"`), a release-bundled task
+(`task = { bundled = "estonia" }`), or a tracked workspace YAML
+(`task = { yaml = "evals/long-context.yaml" }`). The task owns its dataset,
+splits, prompting, output type, filters, and scorer. Inferlab uses the resolved
+model-weight locator as the Hugging Face tokenizer locator. It sends
+`generate_until` tasks to chat completions; prompt-logprob tasks use
+completions after a tokenizer/logprob alignment probe.
+
+Set inference parameters in the Eval or Bench definition's `request_body`, and
+patch them for one run with nested `--set` paths:
+
+```
+inferlab recipe run qualify \
+  --set evals.reasoning.trials=5 \
+  --set evals.reasoning.request_body.temperature=1.0 \
+  --set 'evals.reasoning.request_body.reasoning_effort="high"' \
+  --set evals.reasoning.request_body.chat_template_kwargs.enable_thinking=true \
+  --dry-run
+```
+
+Inferlab retains the model, prompt/messages, streaming, one-completion, output
+bound, stop, and repeated-trial seed fields. A conflicting `request_body`
+member fails validation. For a concurrency Bench,
+`warmup_prompts_per_concurrency = n` resolves `concurrency * n` native warmup
+requests before profiling; warmup is excluded from normalized metrics. Use
+`output_tokens = 1` for a prefill-dominant Bench; TPOT is then inapplicable and
+omitted. See the
+[0.4.0 workspace authoring guide](https://github.com/Infer-Lab/inferlab/blob/v0.4.0/docs/workspace-authoring.md)
+for task-source, request-body, warmup, request-source, metric, and SLO examples.
+
 **Closed loop.** `inferlab recipe run <RECIPE> --case <CASE>` starts the
 server (multi-role prefill/decode topologies included), runs the declared
 eval/bench suite, stops everything, and aggregates child records. Failure
@@ -148,8 +179,12 @@ inferlab scratchpad show --topic flash     # recent tail; --all for everything
 
 ## Reading Results
 
-- Bench cases: `cases/<case>/result.json` (normalized metrics) and
-  `cases/<case>/artifacts/` (raw AIPerf output) inside the bench record.
+- Eval: `cases/eval/result.json` plus `cases/eval/artifacts/`; `record.json`
+  carries normalized metrics, gate evidence, repeated-trial counts and pass
+  rate, task resolution, probe artifacts, and the native lm-eval command.
+- Bench: `cases/<case>/result.json` plus `cases/<case>/artifacts/`; `record.json`
+  carries normalized metrics, profiling counts, SLO conclusions, warmup and
+  frozen-population slices, request-source acquisition, and raw AIPerf artifacts.
 - Server records carry placement, per-machine device hardware identity, role and
   rank bindings, readiness, and cleanup outcomes.
 - Compare runs on record fields (effective settings, digests, metrics), never

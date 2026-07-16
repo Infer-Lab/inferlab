@@ -5,6 +5,7 @@
 //! routes entries — an entry's topic is stated on the entry itself.
 
 use crate::InferlabError;
+use crate::progress::{Phase, Progress};
 use crate::record::{RECORD_FILE, RECORDS_DIR, now_unix_ms, utc_timestamp, validate_record_id};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -40,12 +41,13 @@ struct RecordSummary {
     status: Option<String>,
 }
 
-pub fn note(
+pub(crate) fn note_with_progress(
     root: &Path,
     text: &str,
     topic: Option<&str>,
     record_refs: &[String],
     author: Option<&str>,
+    progress: &Progress,
 ) -> Result<String, InferlabError> {
     let topic = match topic.map(str::trim) {
         Some("") => return fail("topic must not be empty".to_owned()),
@@ -65,6 +67,7 @@ pub fn note(
         .append(true)
         .open(&path)
         .map_err(|source| io_fail(&path, source))?;
+    progress.phase(Phase::named("journal-lock waiting").lock(&path))?;
     file.lock_exclusive()
         .map_err(|source| io_fail(&path, source))?;
     let entry = Entry {
@@ -89,8 +92,13 @@ pub fn note(
     Ok(message)
 }
 
-pub fn show(root: &Path, topic: Option<&str>, all: bool) -> Result<String, InferlabError> {
-    let entries: Vec<Entry> = read_entries(root)?
+pub(crate) fn show_with_progress(
+    root: &Path,
+    topic: Option<&str>,
+    all: bool,
+    progress: &Progress,
+) -> Result<String, InferlabError> {
+    let entries: Vec<Entry> = read_entries(root, progress)?
         .into_iter()
         .filter(|entry| topic.is_none() || entry.topic.as_deref() == topic)
         .collect();
@@ -125,7 +133,7 @@ pub fn show(root: &Path, topic: Option<&str>, all: bool) -> Result<String, Infer
     Ok(output)
 }
 
-fn read_entries(root: &Path) -> Result<Vec<Entry>, InferlabError> {
+fn read_entries(root: &Path, progress: &Progress) -> Result<Vec<Entry>, InferlabError> {
     let path = root.join(SCRATCHPADS_DIR).join(JOURNAL_FILE);
     if !path.is_file() {
         return Ok(Vec::new());
@@ -134,6 +142,7 @@ fn read_entries(root: &Path) -> Result<Vec<Entry>, InferlabError> {
     // concurrent appender to finish its line, so a torn entry is never
     // observed ([[RFC-0005:C-SCRATCHPAD-JOURNAL]]).
     let mut file = fs::File::open(&path).map_err(|source| io_fail(&path, source))?;
+    progress.phase(Phase::named("journal-lock waiting").lock(&path))?;
     file.lock_shared()
         .map_err(|source| io_fail(&path, source))?;
     let mut text = String::new();

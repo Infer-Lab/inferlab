@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::time_bound::{OperationBound, OperationTerminalCause, OperationTimingEvidence};
+
 const ADAPTER_TIMEOUT: Duration = Duration::from_secs(30);
 /// An image-backed adapter pays container start-up on top of framework
 /// import, so it gets a wider deadline than a host-launched one.
@@ -42,6 +44,7 @@ pub struct AdapterLowering<T> {
     pub output: T,
     pub request_sha256: String,
     pub response_sha256: String,
+    pub timing: OperationTimingEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -86,7 +89,7 @@ impl AdapterClient for ProcessAdapterClient {
         input: PlanServeInput,
     ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
         let request = AdapterRequest::PlanServe {
-            protocol_version: ProtocolVersion::V5,
+            protocol_version: ProtocolVersion::V6,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
@@ -101,7 +104,7 @@ impl AdapterClient for ProcessAdapterClient {
         input: RenderServeInput,
     ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
         let request = AdapterRequest::RenderServe {
-            protocol_version: ProtocolVersion::V5,
+            protocol_version: ProtocolVersion::V6,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, pixi_environment, request)?;
@@ -238,12 +241,17 @@ impl ImageAdapterClient {
 /// qualification-adjacent fact available for an image this workspace did not
 /// build ([[RFC-0003:C-RUNTIME-WORKFLOWS]]). An image in which the claimed
 /// framework is not observable is rejected.
+pub(crate) struct FrameworkProbe {
+    pub version: String,
+    pub timing: OperationTimingEvidence,
+}
+
 pub(crate) fn probe_external_framework(
     reference: &str,
     device: Option<u32>,
     timeout: Duration,
     framework: &str,
-) -> Result<String, InferlabError> {
+) -> Result<FrameworkProbe, InferlabError> {
     if !is_valid_integration_identifier(framework) {
         return Err(InferlabError::ImageSelection {
             message: format!("integration reported invalid framework identifier {framework:?}"),
@@ -271,19 +279,29 @@ pub(crate) fn probe_external_framework(
         format!("import importlib.metadata as m; print(m.version('{framework}'))"),
     ]);
     let probe_failed = |message: String| InferlabError::ImageSelection { message };
+    let bound = OperationBound::finite(timeout);
     let (status, stdout, stderr) =
-        match crate::container::run_bounded(&launcher, None, None, timeout) {
+        match crate::container::run_with_bound(&launcher, None, None, &bound, None) {
             Ok(crate::container::BoundedWait::Exited {
                 status,
                 stdout,
                 stderr,
             }) => (status, stdout, stderr),
-            Ok(crate::container::BoundedWait::Deadline { .. }) => {
+            Ok(crate::container::BoundedWait::Expired { kill, .. }) => {
                 remove_adapter_container(&cidfile);
+                if let Err(error) = kill {
+                    eprintln!(
+                        "warning: framework probe client cleanup failed after its deadline: {error}"
+                    );
+                }
                 return Err(probe_failed(format!(
                     "framework probe of {reference} did not finish within {} seconds",
                     timeout.as_secs()
                 )));
+            }
+            Ok(crate::container::BoundedWait::Interrupted { kill, .. }) => {
+                remove_adapter_container(&cidfile);
+                return Err(interrupted_probe_error(reference, kill));
             }
             Err(crate::container::BoundedError::Launch(source)) => {
                 return Err(probe_failed(format!(
@@ -297,7 +315,28 @@ pub(crate) fn probe_external_framework(
                 remove_adapter_container(&cidfile);
                 return Err(probe_failed(format!("framework probe failed: {source}")));
             }
+            Err(crate::container::BoundedError::WaitCleanup {
+                source, cleanup, ..
+            }) => {
+                remove_adapter_container(&cidfile);
+                if !cleanup.verified {
+                    eprintln!(
+                        "warning: framework probe client cleanup failed after a wait error: {}",
+                        cleanup
+                            .error
+                            .as_deref()
+                            .unwrap_or("unknown cleanup failure")
+                    );
+                }
+                return Err(probe_failed(format!("framework probe failed: {source}")));
+            }
         };
+    if bound.is_expired() {
+        return Err(probe_failed(format!(
+            "framework probe of {reference} did not finish within {} seconds",
+            timeout.as_secs()
+        )));
+    }
     if !status.success() {
         return Err(probe_failed(format!(
             "external image {reference} does not expose framework {framework:?}: {}",
@@ -305,12 +344,24 @@ pub(crate) fn probe_external_framework(
         )));
     }
     let version = String::from_utf8_lossy(&stdout).trim().to_owned();
+    if bound.is_expired() {
+        return Err(probe_failed(format!(
+            "framework probe of {reference} did not finish within {} seconds",
+            timeout.as_secs()
+        )));
+    }
     if version.is_empty() {
         return Err(probe_failed(format!(
             "framework probe of {reference} reported no version for {framework:?}"
         )));
     }
-    Ok(version)
+    Ok(FrameworkProbe {
+        version,
+        timing: bound.timing(
+            "before_framework_probe_container_launch",
+            OperationTerminalCause::Succeeded,
+        ),
+    })
 }
 
 /// Removal of an adapter container that may have outlived its docker client
@@ -328,13 +379,14 @@ fn remove_adapter_container(cidfile: &Path) {
     let detail = match remove_container(None, &cid) {
         Removal::Confirmed { .. } => return,
         Removal::Unconfirmed(RemovalFailure::Exit { stderr, .. }) => stderr.trim().to_owned(),
-        Removal::Unconfirmed(RemovalFailure::Deadline) => format!(
+        Removal::Unconfirmed(RemovalFailure::Deadline { .. }) => format!(
             "docker rm did not finish within {} seconds",
             crate::container::REMOVAL_TIMEOUT.as_secs()
         ),
         Removal::Unconfirmed(RemovalFailure::Launch(error) | RemovalFailure::Wait(error)) => {
             error.to_string()
         }
+        Removal::Unconfirmed(RemovalFailure::WaitCleanup { source, .. }) => source.to_string(),
         Removal::Unconfirmed(RemovalFailure::Ssh(error)) => error,
     };
     eprintln!("warning: unconfirmed removal of adapter container {cid}: {detail}");
@@ -349,7 +401,7 @@ impl AdapterClient for ImageAdapterClient {
         input: PlanServeInput,
     ) -> Result<AdapterLowering<PlanServeResult>, InferlabError> {
         let request = AdapterRequest::PlanServe {
-            protocol_version: ProtocolVersion::V5,
+            protocol_version: ProtocolVersion::V6,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, request)?;
@@ -364,7 +416,7 @@ impl AdapterClient for ImageAdapterClient {
         input: RenderServeInput,
     ) -> Result<AdapterLowering<RenderServeResult>, InferlabError> {
         let request = AdapterRequest::RenderServe {
-            protocol_version: ProtocolVersion::V5,
+            protocol_version: ProtocolVersion::V6,
             input,
         };
         let invocation = self.invoke(workspace_root, integration, request)?;
@@ -384,6 +436,7 @@ fn plan_lowering(
         output,
         request_sha256: invocation.request_sha256,
         response_sha256: invocation.response_sha256,
+        timing: invocation.timing,
     })
 }
 
@@ -399,6 +452,7 @@ fn render_lowering(
         output,
         request_sha256: invocation.request_sha256,
         response_sha256: invocation.response_sha256,
+        timing: invocation.timing,
     })
 }
 
@@ -406,6 +460,7 @@ struct AdapterInvocation {
     result: AdapterResult,
     request_sha256: String,
     response_sha256: String,
+    timing: OperationTimingEvidence,
 }
 
 fn invoke_adapter(
@@ -422,23 +477,32 @@ fn invoke_adapter(
         integration: integration.to_owned(),
         source,
     };
-    let (status, stdout, stderr) = match crate::container::run_bounded(
+    let bound = OperationBound::finite(timeout);
+    let (status, stdout, stderr) = match crate::container::run_with_bound(
         launcher,
         Some(workspace_root),
         Some(&payload),
-        timeout,
+        &bound,
+        None,
     ) {
         Ok(crate::container::BoundedWait::Exited {
             status,
             stdout,
             stderr,
         }) => (status, stdout, stderr),
-        Ok(crate::container::BoundedWait::Deadline { kill }) => {
-            kill.map_err(adapter_io)?;
+        Ok(crate::container::BoundedWait::Expired { kill, .. }) => {
+            if let Err(source) = kill {
+                eprintln!(
+                    "warning: adapter client cleanup failed after the {integration:?} invocation deadline: {source}"
+                );
+            }
             return Err(InferlabError::AdapterTimeout {
                 integration: integration.to_owned(),
                 seconds: timeout.as_secs(),
             });
+        }
+        Ok(crate::container::BoundedWait::Interrupted { kill, .. }) => {
+            return Err(interrupted_adapter_error(integration, kill));
         }
         Err(crate::container::BoundedError::Launch(source)) => {
             return Err(InferlabError::LaunchAdapter {
@@ -452,8 +516,24 @@ fn invoke_adapter(
         ) => {
             return Err(adapter_io(source));
         }
+        Err(crate::container::BoundedError::WaitCleanup {
+            source, cleanup, ..
+        }) => {
+            if !cleanup.verified {
+                eprintln!(
+                    "warning: adapter client cleanup failed after a wait error: {}",
+                    cleanup
+                        .error
+                        .as_deref()
+                        .unwrap_or("unknown cleanup failure")
+                );
+            }
+            return Err(adapter_io(source));
+        }
     };
+    ensure_adapter_active(&bound, integration, timeout)?;
     let diagnostics = String::from_utf8_lossy(&stderr).trim().to_owned();
+    ensure_adapter_active(&bound, integration, timeout)?;
     if !status.success() {
         return Err(InferlabError::AdapterExit {
             integration: integration.to_owned(),
@@ -467,25 +547,34 @@ fn invoke_adapter(
     // surface as an opaque deserialize failure; pre-parse the raw
     // `protocol_version` and fail with
     // the actionable both-versions-plus-remedy shape instead.
-    if let Some(answered) = raw_protocol_version(&stdout)
+    ensure_adapter_active(&bound, integration, timeout)?;
+    let answered = raw_protocol_version(&stdout);
+    ensure_adapter_active(&bound, integration, timeout)?;
+    if let Some(answered) = answered
         && answered != PROTOCOL_VERSION
     {
         return Err(InferlabError::AdapterProtocolVersion {
             message: protocol_version_remedy(integration, &answered),
         });
     }
-    let response: AdapterResponse =
-        serde_json::from_slice(&stdout).map_err(|source| InferlabError::AdapterProtocol {
-            integration: integration.to_owned(),
-            source,
-            diagnostics: diagnostics.clone(),
-        })?;
+    let response = serde_json::from_slice(&stdout);
+    ensure_adapter_active(&bound, integration, timeout)?;
+    let response: AdapterResponse = response.map_err(|source| InferlabError::AdapterProtocol {
+        integration: integration.to_owned(),
+        source,
+        diagnostics: diagnostics.clone(),
+    })?;
     let response_sha256 = format!("{:x}", Sha256::digest(&stdout));
+    ensure_adapter_active(&bound, integration, timeout)?;
     match response {
         AdapterResponse::Ok { result, .. } => Ok(AdapterInvocation {
             result: *result,
             request_sha256,
             response_sha256,
+            timing: bound.timing(
+                "before_adapter_process_launch",
+                OperationTerminalCause::Succeeded,
+            ),
         }),
         // An integration that recognizes the mismatch itself answers with a
         // structured unsupported-protocol-version error; surface the same
@@ -521,8 +610,46 @@ fn invoke_adapter(
     }
 }
 
+fn ensure_adapter_active(
+    bound: &OperationBound,
+    integration: &str,
+    timeout: Duration,
+) -> Result<(), InferlabError> {
+    if bound.is_expired() {
+        return Err(InferlabError::AdapterTimeout {
+            integration: integration.to_owned(),
+            seconds: timeout.as_secs(),
+        });
+    }
+    Ok(())
+}
+
+fn interrupted_adapter_error(integration: &str, kill: std::io::Result<()>) -> InferlabError {
+    if let Err(source) = kill {
+        eprintln!(
+            "warning: adapter client cleanup failed after the {integration:?} invocation was interrupted: {source}"
+        );
+    }
+    InferlabError::AdapterIo {
+        integration: integration.to_owned(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "adapter invocation was interrupted",
+        ),
+    }
+}
+
+fn interrupted_probe_error(reference: &str, kill: std::io::Result<()>) -> InferlabError {
+    if let Err(error) = kill {
+        eprintln!("warning: framework probe client cleanup failed after interruption: {error}");
+    }
+    InferlabError::ImageSelection {
+        message: format!("framework probe of {reference} was interrupted"),
+    }
+}
+
 /// The protocol version this binary speaks, as its wire string.
-const PROTOCOL_VERSION: &str = "5";
+const PROTOCOL_VERSION: &str = "6";
 
 /// The raw `protocol_version` string an adapter answered, read without
 /// committing to the full versioned response shape. Absent when the field is
@@ -696,4 +823,97 @@ fn validate_integration_id(integration: &str) -> Result<(), InferlabError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_adapter_owner_rejects_a_complete_protocol_response() {
+        let response = include_bytes!("../../../protocol/fixtures/valid/plan-serve-response.json");
+        let bound = OperationBound::finite(Duration::ZERO);
+
+        let error = (|| -> Result<(), InferlabError> {
+            ensure_adapter_active(&bound, "vllm", Duration::ZERO)?;
+            let _: AdapterResponse = serde_json::from_slice(response).map_err(|source| {
+                InferlabError::AdapterProtocol {
+                    integration: "vllm".to_owned(),
+                    source,
+                    diagnostics: String::new(),
+                }
+            })?;
+            ensure_adapter_active(&bound, "vllm", Duration::ZERO)
+        })()
+        .err();
+
+        assert!(matches!(error, Some(InferlabError::AdapterTimeout { .. })));
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_replace_adapter_interruption() -> Result<(), String> {
+        let error = interrupted_adapter_error(
+            "vllm",
+            Err(std::io::Error::other("fixture cleanup failure")),
+        );
+
+        let InferlabError::AdapterIo { source, .. } = error else {
+            return Err("adapter interruption changed error category".to_owned());
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(source.to_string(), "adapter invocation was interrupted");
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_replace_framework_probe_interruption() {
+        let error = interrupted_probe_error(
+            "example.com/model@sha256:fixture",
+            Err(std::io::Error::other("fixture cleanup failure")),
+        );
+
+        assert!(matches!(
+            error,
+            InferlabError::ImageSelection { message }
+                if message.contains("framework probe") && message.contains("interrupted")
+        ));
+    }
+
+    #[test]
+    fn successful_adapter_invocation_records_its_owner_budget_and_terminal_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request: AdapterRequest = serde_json::from_slice(include_bytes!(
+            "../../../protocol/fixtures/valid/plan-serve-request.json"
+        ))?;
+        let response = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../protocol/fixtures/valid/plan-serve-response.json");
+        let launcher = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "cat >/dev/null; cat -- \"$1\"".to_owned(),
+            "adapter-fixture".to_owned(),
+            response.display().to_string(),
+        ];
+        let root = tempfile::tempdir()?;
+
+        let invocation = invoke_adapter(
+            root.path(),
+            "vllm",
+            &launcher,
+            Duration::from_secs(3),
+            request,
+        )?;
+
+        assert_eq!(
+            invocation.timing.budget,
+            crate::time_bound::OperationBudgetEvidence::Finite {
+                configured_ms: 3_000,
+            }
+        );
+        assert_eq!(
+            invocation.timing.terminal_cause,
+            OperationTerminalCause::Succeeded
+        );
+        Ok(())
+    }
 }

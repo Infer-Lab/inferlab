@@ -1,5 +1,3 @@
-import tomllib
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from inferlab_adapter_sdk import (
@@ -41,10 +39,14 @@ from inferlab_adapter_sdk import (
     SettingValue,
     TargetEndpointScheme,
     append_option,
+    effective_settings,
+    integration_identity,
     merge_serve_args,
-    plain_setting,
+    replica_id,
+    require_role,
+    validate_settings,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 _ROUTER_WORKER_STARTUP_TIMEOUT_SECS = 2_147_483_647
 
@@ -138,43 +140,16 @@ def _runtime_cache_env(root: str) -> dict[str, str]:
 
 
 def _settings(values: dict[str, SettingValue]) -> TokenspeedServeSettings:
-    try:
-        return TokenspeedServeSettings.model_validate(
-            {key: plain_setting(value) for key, value in values.items()}
-        )
-    except ValidationError as error:
-        raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
-
-
-def _effective_settings(settings: TokenspeedServeSettings) -> dict[str, SettingValue]:
-    return {
-        key: SettingValue(root=value)
-        for key, value in settings.model_dump(exclude_none=True).items()
-    }
-
-
-def _adapter_version() -> str:
-    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-    if pyproject.is_file():
-        with pyproject.open("rb") as handle:
-            project_version: str = tomllib.load(handle)["project"]["version"]
-        return project_version
-    try:
-        return version("inferlab-integration-tokenspeed")
-    except PackageNotFoundError:
-        return "unavailable"
+    return validate_settings(TokenspeedServeSettings, values)
 
 
 def _identity() -> IntegrationIdentity:
-    try:
-        framework_version = version("tokenspeed")
-    except PackageNotFoundError:
-        framework_version = "unavailable"
-    return IntegrationIdentity(
+    return integration_identity(
         adapter_id="inferlab-tokenspeed",
-        adapter_version=_adapter_version(),
+        adapter_distribution="inferlab-integration-tokenspeed",
         framework="tokenspeed",
-        framework_version=framework_version,
+        framework_distribution="tokenspeed",
+        module_file=__file__,
     )
 
 
@@ -269,23 +244,6 @@ def _effective_parallelism(declared: Parallelism) -> Parallelism:
     )
 
 
-def _role_for_kind(input: PlanServeInput, kind: ServeRoleKind) -> ServeRoleInput:
-    matches = [role for role in input.roles if role.kind == kind]
-    if len(matches) != 1:
-        raise AdapterOperationError(
-            AdapterErrorCode.invalid_settings,
-            f"{input.topology.value} topology requires exactly one {kind.value} role",
-        )
-    return matches[0]
-
-
-def _replica_id(role: ServeRoleInput, replica_index: int) -> str:
-    base = "server" if role.kind == ServeRoleKind.serve else role.id
-    if role.replica_count == 1:
-        return base
-    return f"{base}-{replica_index:03d}"
-
-
 def _plan_role(
     input: PlanServeInput,
     role: ServeRoleInput,
@@ -297,7 +255,7 @@ def _plan_role(
     outer = parallelism.outer or ParallelismOuter()
     replicas = [
         ServeReplicaRequirement(
-            id=_replica_id(role, replica_index),
+            id=replica_id(role, replica_index),
             role_id=role.id,
             replica_index=replica_index,
             device_count=outer.tensor_parallel_size or 1,
@@ -314,7 +272,7 @@ def _plan_role(
             kind=role.kind,
             declared_replica_count=role.replica_count,
             effective_replica_count=role.replica_count,
-            effective_settings=_effective_settings(settings),
+            effective_settings=effective_settings(settings),
             effective_parallelism=parallelism,
         ),
         replicas,
@@ -324,7 +282,8 @@ def _plan_role(
 def _endpoint_requirement() -> EndpointRequirement:
     return EndpointRequirement(
         protocol=EndpointProtocol(),
-        api_path="/v1/completions",
+        completions_path="/v1/completions",
+        chat_completions_path="/v1/chat/completions",
         prefix_cache_reset=HttpActionSpec(
             method=HttpMethod(),
             path="/flush_cache",
@@ -344,7 +303,7 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
             f"TokenSpeed single topology does not support routing backend "
             f"{input.routing_backend!r}",
         )
-    role = _role_for_kind(input, ServeRoleKind.serve)
+    role = require_role(input, ServeRoleKind.serve)
     if role.replica_count != 1:
         raise AdapterOperationError(
             AdapterErrorCode.invalid_settings,
@@ -377,8 +336,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             f"TokenSpeed prefill/decode does not support routing backend {input.routing_backend!r}",
         )
-    prefill = _role_for_kind(input, ServeRoleKind.prefill)
-    decode = _role_for_kind(input, ServeRoleKind.decode)
+    prefill = require_role(input, ServeRoleKind.prefill)
+    decode = require_role(input, ServeRoleKind.decode)
     process_alive = ReadinessProbe(root=ReadinessProbeProcessAlive())
     prefill_result, prefill_replicas = _plan_role(
         input,

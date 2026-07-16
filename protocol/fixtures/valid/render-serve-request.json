@@ -1,6 +1,6 @@
 {
   "operation": "render_serve",
-  "protocol_version": "5",
+  "protocol_version": "6",
   "input": {
     "model": {"id": "dsv4", "served_name": "dsv4"},
     "topology": "prefill_decode",

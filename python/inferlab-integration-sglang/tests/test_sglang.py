@@ -69,7 +69,8 @@ def test_plan_single_topology() -> None:
     assert result.replicas[0].device_count == 2
     probe = result.replicas[0].primary_readiness.root
     assert isinstance(probe, ReadinessProbeHttp) and probe.path == "/v1/models"
-    assert result.endpoint.api_path == "/v1/completions"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is not None
     assert result.endpoint.prefix_cache_reset.path == "/flush_cache"
     assert result.routing.root.owner == "direct"
@@ -167,7 +168,8 @@ def test_plan_prefill_decode_uses_the_shared_bootstrap_shape(
     assert isinstance(transfer, ServeRoleLinkKvTransfer)
     assert transfer.mechanism == transport
     assert result.routing.root.owner == "inferlab_builtin"
-    assert result.endpoint.api_path == "/v1/completions"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is not None
     assert result.endpoint.prefix_cache_reset.path == "/flush_cache"
 

@@ -1,6 +1,7 @@
 use crate::InferlabError;
+use crate::bench_metric::BenchMetric;
 use inferlab_protocol::{KvTransferMechanism, Parallelism, ServeTopology};
-use serde::de::{self, Visitor};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -280,6 +281,102 @@ pub struct EnvironmentScriptDefinition {
     pub script: PathBuf,
 }
 
+/// One JSON-compatible value in an operator-declared inference request body.
+///
+/// A dedicated visitor keeps TOML date/time values from being coerced to
+/// strings: the workspace definition is an exact JSON body fragment, not a
+/// general TOML value tree.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum RequestBodyValue {
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Array(Vec<RequestBodyValue>),
+    Object(BTreeMap<String, RequestBodyValue>),
+}
+
+impl<'de> Deserialize<'de> for RequestBodyValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RequestBodyVisitor;
+
+        impl<'de> Visitor<'de> for RequestBodyVisitor {
+            type Value = RequestBodyValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a request body value (boolean, integer, finite float, string, array, or table)",
+                )
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(RequestBodyValue::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(RequestBodyValue::Integer(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i64::try_from(value)
+                    .map(RequestBodyValue::Integer)
+                    .map_err(|_| E::custom("request body integer exceeds the supported range"))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(RequestBodyValue::Float(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RequestBodyValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(RequestBodyValue::String(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(RequestBodyValue::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    values.insert(key, value);
+                }
+                if values.contains_key("$__toml_private_datetime") {
+                    return Err(serde::de::Error::custom(
+                        "request body does not support TOML date or time values",
+                    ));
+                }
+                Ok(RequestBodyValue::Object(values))
+            }
+        }
+
+        deserializer.deserialize_any(RequestBodyVisitor)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum EvalDefinition {
@@ -290,41 +387,101 @@ pub enum EvalDefinition {
         timeout_seconds: u64,
     },
     LmEval {
-        task: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        dataset: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        split: Option<String>,
+        task: EvalTaskSource,
+        #[serde(default)]
+        request_body: BTreeMap<String, RequestBodyValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         few_shot: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<u64>,
+        #[serde(default = "default_eval_trials")]
+        trials: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_tokens: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         concurrency: Option<u32>,
         metric: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric_filter: Option<String>,
         threshold: f64,
         timeout_seconds: u64,
     },
+}
+
+const fn default_eval_trials() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum EvalTaskSource {
+    BuiltIn(String),
+    Bundled { bundled: String },
+    WorkspaceYaml { yaml: PathBuf },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateSlo {
+    pub metric: BenchMetric,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_most: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_least: Option<f64>,
+}
+
+fn deserialize_nonempty_aggregate_slos<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AggregateSlo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let constraints = Vec::<AggregateSlo>::deserialize(deserializer)?;
+    if constraints.is_empty() {
+        return Err(serde::de::Error::custom(
+            "aggregate_slos must be non-empty when declared",
+        ));
+    }
+    Ok(constraints)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestSlo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpot_ms: Option<f64>,
+    pub minimum_good_request_ratio: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BenchDefinition {
     Serving {
-        input_tokens: u32,
-        output_tokens: u32,
+        request_source: BenchRequestSource,
         #[serde(default)]
         seed: u64,
         #[serde(default)]
-        temperature: f64,
+        request_body: BTreeMap<String, RequestBodyValue>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_nonempty_aggregate_slos",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        aggregate_slos: Vec<AggregateSlo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_slo: Option<RequestSlo>,
         #[serde(default)]
         concurrency: Vec<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompts_per_concurrency: Option<u32>,
+        #[serde(default)]
+        warmup_prompts_per_concurrency: u32,
         #[serde(default)]
         request_rates: Vec<RequestRate>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -338,17 +495,21 @@ pub enum BenchDefinition {
         timeout_seconds: u64,
     },
     AdaptiveServing {
-        input_tokens: u32,
-        output_tokens: u32,
+        request_source: BenchRequestSource,
         #[serde(default)]
         seed: u64,
         #[serde(default)]
-        temperature: f64,
+        request_body: BTreeMap<String, RequestBodyValue>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_nonempty_aggregate_slos",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        aggregate_slos: Vec<AggregateSlo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_slo: Option<RequestSlo>,
         initial_request_rates: Vec<f64>,
-        target_metric: String,
-        target_threshold: f64,
-        #[serde(default = "default_max_refinement_steps")]
-        max_refinement_steps: u32,
+        max_search_steps: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min_rate_resolution: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -363,8 +524,60 @@ pub enum BenchDefinition {
     },
 }
 
-const fn default_max_refinement_steps() -> u32 {
-    6
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BenchRequestSource {
+    Random {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    Dataset {
+        dataset: BenchDataset,
+        max_input_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u32>,
+    },
+}
+
+impl BenchRequestSource {
+    pub fn tpot_applicability(&self) -> BenchTpotApplicability {
+        match self {
+            Self::Random { output_tokens, .. } => {
+                BenchTpotApplicability::from_output_tokens(*output_tokens)
+            }
+            Self::Dataset { output_tokens, .. } => output_tokens.map_or(
+                BenchTpotApplicability::Applicable,
+                BenchTpotApplicability::from_output_tokens,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchTpotApplicability {
+    Applicable,
+    Inapplicable,
+}
+
+impl BenchTpotApplicability {
+    pub(crate) const fn from_output_tokens(output_tokens: u32) -> Self {
+        if output_tokens >= 2 {
+            Self::Applicable
+        } else {
+            Self::Inapplicable
+        }
+    }
+
+    pub const fn is_applicable(self) -> bool {
+        matches!(self, Self::Applicable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchDataset {
+    Sharegpt,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1290,6 +1503,7 @@ fn validate_workspace(root: &Path, config: &WorkspaceConfig) -> Result<(), Infer
     for (id, eval) in &config.evals {
         require_id("eval", id)?;
         validate_eval(id, eval)?;
+        validate_eval_task_source(root, id, eval)?;
     }
 
     for (id, suite) in &config.workload_suites {
@@ -1552,39 +1766,100 @@ pub(crate) fn validate_eval(id: &str, definition: &EvalDefinition) -> Result<(),
         }
         EvalDefinition::LmEval {
             task,
-            dataset,
-            split,
+            request_body,
             limit,
+            seed,
+            trials,
             max_tokens,
             concurrency,
             metric,
+            metric_filter,
             threshold,
             timeout_seconds,
             ..
         } => {
-            require_nonempty("lm-eval task", id, task)?;
-            require_optional_nonempty("lm-eval dataset", id, dataset.as_deref())?;
-            require_optional_nonempty("lm-eval split", id, split.as_deref())?;
+            match task {
+                EvalTaskSource::BuiltIn(task) => require_nonempty("lm-eval task", id, task)?,
+                EvalTaskSource::Bundled { bundled } => {
+                    require_nonempty("lm-eval bundled task", id, bundled)?
+                }
+                EvalTaskSource::WorkspaceYaml { .. } => {}
+            }
+            validate_request_body("eval", id, request_body, &["seed"])?;
             require_nonempty("lm-eval metric", id, metric)?;
+            if let Some(metric_filter) = metric_filter {
+                require_nonempty("lm-eval metric_filter", id, metric_filter)?;
+            }
             require_optional_positive("limit", id, limit.map(u64::from))?;
+            require_positive("trials", id, u64::from(*trials))?;
+            let base_seed = seed.unwrap_or(1234);
+            if base_seed.checked_add(u64::from(*trials - 1)).is_none() {
+                return invalid(format!(
+                    "eval {id:?} seed schedule exceeds the supported unsigned integer range"
+                ));
+            }
             require_optional_positive("max_tokens", id, max_tokens.map(u64::from))?;
             require_optional_positive("concurrency", id, concurrency.map(u64::from))?;
             if !threshold.is_finite() {
                 return invalid(format!("eval {id:?} threshold must be finite"));
+            }
+            if *trials > 1 && !(0.0..=1.0).contains(threshold) {
+                return invalid(format!(
+                    "eval {id:?} threshold must be between zero and one for repeated trials"
+                ));
             }
             require_positive("timeout_seconds", id, *timeout_seconds)
         }
     }
 }
 
+pub(crate) fn validate_eval_task_source(
+    root: &Path,
+    id: &str,
+    definition: &EvalDefinition,
+) -> Result<(), InferlabError> {
+    let EvalDefinition::LmEval { task, .. } = definition else {
+        return Ok(());
+    };
+    let EvalTaskSource::WorkspaceYaml { yaml } = task else {
+        return Ok(());
+    };
+    if !is_safe_relative(yaml) {
+        return invalid(format!(
+            "lm-eval {id:?} task YAML {} must be workspace-relative without parent traversal",
+            yaml.display()
+        ));
+    }
+    if !matches!(
+        yaml.extension(),
+        Some(extension) if extension == OsStr::new("yaml") || extension == OsStr::new("yml")
+    ) {
+        return invalid(format!(
+            "lm-eval {id:?} task YAML {} must use a .yaml or .yml extension supported by the pinned lm-eval runtime",
+            yaml.display()
+        ));
+    }
+    reject_symlink_components(root, id, yaml)?;
+    let path = root.join(yaml);
+    if !path.is_file() {
+        return invalid(format!(
+            "lm-eval {id:?} task YAML {} is not a regular workspace file",
+            yaml.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(), InferlabError> {
     match definition {
         BenchDefinition::Serving {
-            input_tokens,
-            output_tokens,
-            temperature,
+            request_source,
+            request_body,
+            aggregate_slos,
+            request_slo,
             concurrency,
             prompts_per_concurrency,
+            warmup_prompts_per_concurrency,
             request_rates,
             request_count,
             duration_seconds,
@@ -1594,12 +1869,12 @@ pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(
         } => {
             validate_bench_common(
                 id,
-                *input_tokens,
-                *output_tokens,
-                *temperature,
+                request_source,
+                request_body,
                 *burstiness,
                 *timeout_seconds,
             )?;
+            validate_bench_slos(id, request_source, aggregate_slos, request_slo, false)?;
             if concurrency.is_empty() && request_rates.is_empty() {
                 return invalid(format!(
                     "bench {id:?} must define a concurrency or request-rate case"
@@ -1626,6 +1901,11 @@ pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(
                 }
                 _ => {}
             }
+            if concurrency.is_empty() && *warmup_prompts_per_concurrency != 0 {
+                return invalid(format!(
+                    "bench {id:?} sets warmup_prompts_per_concurrency without concurrency cases"
+                ));
+            }
             validate_request_rates(id, request_rates)?;
             validate_rate_count_policy(
                 id,
@@ -1636,12 +1916,11 @@ pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(
             )
         }
         BenchDefinition::AdaptiveServing {
-            input_tokens,
-            output_tokens,
-            temperature,
+            request_source,
+            request_body,
+            aggregate_slos,
+            request_slo,
             initial_request_rates,
-            target_metric,
-            target_threshold,
             min_rate_resolution,
             request_count,
             duration_seconds,
@@ -1651,12 +1930,12 @@ pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(
         } => {
             validate_bench_common(
                 id,
-                *input_tokens,
-                *output_tokens,
-                *temperature,
+                request_source,
+                request_body,
                 *burstiness,
                 *timeout_seconds,
             )?;
+            validate_bench_slos(id, request_source, aggregate_slos, request_slo, true)?;
             if initial_request_rates.is_empty()
                 || initial_request_rates
                     .iter()
@@ -1665,10 +1944,6 @@ pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(
                 return invalid(format!(
                     "bench {id:?} initial_request_rates must contain positive finite values"
                 ));
-            }
-            require_nonempty("adaptive target metric", id, target_metric)?;
-            if !target_threshold.is_finite() {
-                return invalid(format!("bench {id:?} target_threshold must be finite"));
             }
             if min_rate_resolution.is_some_and(|value| !value.is_finite() || value <= 0.0) {
                 return invalid(format!(
@@ -1680,25 +1955,190 @@ pub(crate) fn validate_bench(id: &str, definition: &BenchDefinition) -> Result<(
     }
 }
 
+fn validate_bench_slos(
+    id: &str,
+    request_source: &BenchRequestSource,
+    aggregate_slos: &[AggregateSlo],
+    request_slo: &Option<RequestSlo>,
+    required: bool,
+) -> Result<(), InferlabError> {
+    if required && aggregate_slos.is_empty() && request_slo.is_none() {
+        return invalid(format!(
+            "adaptive bench {id:?} requires aggregate_slos, request_slo, or both"
+        ));
+    }
+    for constraint in aggregate_slos {
+        let metric = constraint.metric;
+        let bound = match (constraint.at_most, constraint.at_least) {
+            (Some(value), None) | (None, Some(value)) => value,
+            _ => {
+                return invalid(format!(
+                    "bench {id:?} aggregate_slos metric {:?} requires exactly one of at_most or at_least",
+                    metric.name()
+                ));
+            }
+        };
+        if !bound.is_finite() {
+            return invalid(format!(
+                "bench {id:?} aggregate_slos metric {:?} bound must be finite",
+                metric.name()
+            ));
+        }
+        if metric.depends_on_tpot() && !request_source.tpot_applicability().is_applicable() {
+            return invalid(format!(
+                "bench {id:?} cannot constrain TPOT when the request source makes TPOT inapplicable"
+            ));
+        }
+        if metric.requires_request_slo() && request_slo.is_none() {
+            return invalid(format!(
+                "bench {id:?} aggregate metric {:?} requires request_slo",
+                metric.name()
+            ));
+        }
+    }
+    let Some(request_slo) = request_slo else {
+        return Ok(());
+    };
+    let bounds = [
+        ("request_latency_ms", request_slo.request_latency_ms),
+        ("ttft_ms", request_slo.ttft_ms),
+        ("tpot_ms", request_slo.tpot_ms),
+    ];
+    if bounds.iter().all(|(_, value)| value.is_none()) {
+        return invalid(format!(
+            "bench {id:?} request_slo requires at least one request-metric bound"
+        ));
+    }
+    for (name, value) in bounds {
+        if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            return invalid(format!(
+                "bench {id:?} request_slo {name} must be finite and non-negative"
+            ));
+        }
+    }
+    if request_slo.tpot_ms.is_some() && !request_source.tpot_applicability().is_applicable() {
+        return invalid(format!(
+            "bench {id:?} cannot constrain request TPOT when the request source makes TPOT inapplicable"
+        ));
+    }
+    if !(request_slo.minimum_good_request_ratio.is_finite()
+        && request_slo.minimum_good_request_ratio > 0.0
+        && request_slo.minimum_good_request_ratio <= 1.0)
+    {
+        return invalid(format!(
+            "bench {id:?} minimum_good_request_ratio must be finite and in (0, 1]"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_bench_common(
     id: &str,
-    input_tokens: u32,
-    output_tokens: u32,
-    temperature: f64,
+    request_source: &BenchRequestSource,
+    request_body: &BTreeMap<String, RequestBodyValue>,
     burstiness: Option<f64>,
     timeout_seconds: u64,
 ) -> Result<(), InferlabError> {
-    require_positive("input_tokens", id, u64::from(input_tokens))?;
-    require_positive("output_tokens", id, u64::from(output_tokens))?;
-    if !temperature.is_finite() {
-        return invalid(format!("bench {id:?} temperature must be finite"));
+    match request_source {
+        BenchRequestSource::Random {
+            input_tokens,
+            output_tokens,
+        } => {
+            require_positive("request_source.input_tokens", id, u64::from(*input_tokens))?;
+            require_positive(
+                "request_source.output_tokens",
+                id,
+                u64::from(*output_tokens),
+            )?;
+        }
+        BenchRequestSource::Dataset {
+            max_input_tokens,
+            output_tokens,
+            ..
+        } => {
+            require_positive(
+                "request_source.max_input_tokens",
+                id,
+                u64::from(*max_input_tokens),
+            )?;
+            if let Some(output_tokens) = output_tokens {
+                require_positive(
+                    "request_source.output_tokens",
+                    id,
+                    u64::from(*output_tokens),
+                )?;
+            }
+        }
     }
+    validate_request_body(
+        "bench",
+        id,
+        request_body,
+        &["min_tokens", "min_new_tokens", "ignore_eos"],
+    )?;
     if burstiness.is_some_and(|value| !value.is_finite() || value <= 0.0) {
         return invalid(format!(
             "bench {id:?} burstiness must be positive and finite"
         ));
     }
     require_positive("timeout_seconds", id, timeout_seconds)
+}
+
+fn validate_request_body(
+    kind: &str,
+    id: &str,
+    request_body: &BTreeMap<String, RequestBodyValue>,
+    additional_reserved: &[&str],
+) -> Result<(), InferlabError> {
+    const RESERVED: [&str; 8] = [
+        "model",
+        "prompt",
+        "messages",
+        "stream",
+        "n",
+        "max_tokens",
+        "max_completion_tokens",
+        "stop",
+    ];
+    if let Some(member) = RESERVED
+        .iter()
+        .chain(additional_reserved)
+        .find(|member| request_body.contains_key(**member))
+    {
+        return invalid(format!(
+            "{kind} {id:?} request_body.{member} conflicts with a measurement-runtime-owned request member"
+        ));
+    }
+    for (member, value) in request_body {
+        validate_request_body_value(kind, id, &format!("request_body.{member}"), value)?;
+    }
+    Ok(())
+}
+
+fn validate_request_body_value(
+    kind: &str,
+    id: &str,
+    path: &str,
+    value: &RequestBodyValue,
+) -> Result<(), InferlabError> {
+    match value {
+        RequestBodyValue::Float(value) if !value.is_finite() => {
+            invalid(format!("{kind} {id:?} {path} must be a finite JSON number"))
+        }
+        RequestBodyValue::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_request_body_value(kind, id, &format!("{path}[{index}]"), value)?;
+            }
+            Ok(())
+        }
+        RequestBodyValue::Object(values) => {
+            for (member, value) in values {
+                validate_request_body_value(kind, id, &format!("{path}.{member}"), value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_request_rates(id: &str, rates: &[RequestRate]) -> Result<(), InferlabError> {
@@ -1757,14 +2197,6 @@ fn require_optional_positive(
     value: Option<u64>,
 ) -> Result<(), InferlabError> {
     value.map_or(Ok(()), |value| require_positive(field, id, value))
-}
-
-fn require_optional_nonempty(
-    label: &str,
-    id: &str,
-    value: Option<&str>,
-) -> Result<(), InferlabError> {
-    value.map_or(Ok(()), |value| require_nonempty(label, id, value))
 }
 
 fn validate_local_bindings(local: &LocalBindings) -> Result<(), InferlabError> {
@@ -3149,6 +3581,237 @@ fn symlink_guard(absolute: &Path, described: &str) -> Result<(), InferlabError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicitly_declared_aggregate_slos_must_be_nonempty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let result = toml::from_str::<BenchDefinition>(
+            r#"
+kind = "serving"
+request_source = { kind = "random", input_tokens = 128, output_tokens = 32 }
+aggregate_slos = []
+concurrency = [1]
+prompts_per_concurrency = 1
+timeout_seconds = 60
+"#,
+        );
+        let Err(error) = result else {
+            return Err(std::io::Error::other(
+                "an explicitly empty aggregate_slos declaration must be rejected",
+            )
+            .into());
+        };
+
+        assert!(error.to_string().contains("non-empty"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_request_source_is_one_valid_serving_bench_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition = toml::from_str::<BenchDefinition>(
+            r#"
+kind = "serving"
+request_source = { kind = "dataset", dataset = "sharegpt", max_input_tokens = 8192 }
+concurrency = [1]
+prompts_per_concurrency = 2
+timeout_seconds = 60
+"#,
+        )?;
+
+        validate_bench("sharegpt", &definition)?;
+        let BenchDefinition::Serving { request_source, .. } = definition else {
+            return Err(std::io::Error::other("expected a serving Bench").into());
+        };
+        assert!(matches!(
+            &request_source,
+            BenchRequestSource::Dataset {
+                dataset: BenchDataset::Sharegpt,
+                max_input_tokens: 8192,
+                output_tokens: None,
+            }
+        ));
+        assert_eq!(
+            request_source.tpot_applicability(),
+            BenchTpotApplicability::Applicable
+        );
+        assert_eq!(
+            BenchRequestSource::Dataset {
+                dataset: BenchDataset::Sharegpt,
+                max_input_tokens: 8192,
+                output_tokens: Some(1),
+            }
+            .tpot_applicability(),
+            BenchTpotApplicability::Inapplicable
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_flat_token_shape_is_not_a_second_bench_authority() {
+        let result = toml::from_str::<BenchDefinition>(
+            r#"
+kind = "serving"
+input_tokens = 128
+output_tokens = 32
+concurrency = [1]
+prompts_per_concurrency = 1
+timeout_seconds = 60
+"#,
+        );
+
+        assert!(result.is_err_and(|error| error.to_string().contains("input_tokens")));
+    }
+
+    #[test]
+    fn aggregate_slo_metric_deserializes_directly_into_the_closed_vocabulary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let constraint: AggregateSlo = toml::from_str("metric = \"p95_ttft_ms\"\nat_most = 800.0")?;
+        let unknown =
+            toml::from_str::<AggregateSlo>("metric = \"aiperf_private_latency\"\nat_most = 800.0");
+
+        assert_eq!(constraint.metric.name(), "p95_ttft_ms");
+        assert!(unknown.is_err_and(|error| error.to_string().contains("unknown Bench metric")));
+        Ok(())
+    }
+
+    #[test]
+    fn request_slo_rejects_an_invalid_good_request_ratio() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let result = validate_bench_slos(
+            "latency",
+            &BenchRequestSource::Random {
+                input_tokens: 128,
+                output_tokens: 32,
+            },
+            &[],
+            &Some(RequestSlo {
+                request_latency_ms: None,
+                ttft_ms: Some(800.0),
+                tpot_ms: None,
+                minimum_good_request_ratio: 0.0,
+            }),
+            false,
+        );
+        let Err(error) = result else {
+            return Err(
+                std::io::Error::other("zero cannot be a minimum good-request ratio").into(),
+            );
+        };
+        let error = error.to_string();
+
+        assert!(error.contains("minimum_good_request_ratio"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn bundled_eval_task_uses_the_named_release_catalog_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition: EvalDefinition = toml::from_str(
+            r#"
+kind = "lm-eval"
+task = { bundled = "estonia" }
+metric = "estonia_pass"
+metric_filter = "strict-terminal-answer"
+threshold = 0.5
+timeout_seconds = 3600
+"#,
+        )?;
+
+        let EvalDefinition::LmEval { task, .. } = definition else {
+            return Err(std::io::Error::other("fixture should be lm-eval").into());
+        };
+        assert!(matches!(
+            task,
+            EvalTaskSource::Bundled { bundled } if bundled == "estonia"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inference_request_body_preserves_nested_toml_json_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let definition: EvalDefinition = toml::from_str(
+            r#"
+kind = "lm-eval"
+task = "gsm8k"
+metric = "exact_match"
+threshold = 0.9
+timeout_seconds = 300
+
+[request_body]
+temperature = 1.0
+logprobs = true
+stop_token_ids = [1, 2]
+
+[request_body.chat_template_kwargs]
+enable_thinking = false
+"#,
+        )?;
+
+        let EvalDefinition::LmEval { request_body, .. } = definition else {
+            return Err(std::io::Error::other("fixture should be lm-eval").into());
+        };
+        assert!(matches!(
+            request_body.get("temperature"),
+            Some(RequestBodyValue::Float(value)) if *value == 1.0
+        ));
+        assert!(matches!(
+            request_body.get("logprobs"),
+            Some(RequestBodyValue::Bool(true))
+        ));
+        assert!(matches!(
+            request_body.get("stop_token_ids"),
+            Some(RequestBodyValue::Array(values)) if values.len() == 2
+        ));
+        assert!(matches!(
+            request_body.get("chat_template_kwargs"),
+            Some(RequestBodyValue::Object(values))
+                if values.get("enable_thinking") == Some(&RequestBodyValue::Bool(false))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inference_request_body_rejects_owned_members_and_toml_dates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reserved: EvalDefinition = toml::from_str(
+            r#"
+kind = "lm-eval"
+task = "gsm8k"
+metric = "exact_match"
+threshold = 0.9
+timeout_seconds = 300
+request_body = { messages = [] }
+"#,
+        )?;
+        let Err(error) = validate_eval("gsm8k", &reserved) else {
+            return Err(std::io::Error::other(
+                "messages should be owned by the measurement runtime",
+            )
+            .into());
+        };
+        let error = error.to_string();
+        assert!(error.contains("request_body.messages"), "{error}");
+
+        let Err(date) = toml::from_str::<EvalDefinition>(
+            r#"
+kind = "lm-eval"
+task = "gsm8k"
+metric = "exact_match"
+threshold = 0.9
+timeout_seconds = 300
+request_body = { vendor_date = 2026-07-15 }
+"#,
+        ) else {
+            return Err(
+                std::io::Error::other("TOML dates should have no exact JSON projection").into(),
+            );
+        };
+        let date = date.to_string();
+        assert!(date.contains("request body"), "{date}");
+        Ok(())
+    }
 
     // The script text feeds recorded evidence and remote execution; a byte
     // drift here must fail the suite, not surface later as a digest change.

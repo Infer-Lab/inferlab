@@ -1,5 +1,6 @@
 use crate::InferlabError;
 use crate::interrupt;
+use crate::progress::{Phase, Progress};
 use crate::record::{RECORD_FILE, RECORDS_DIR, RecordIdentity, now_unix_ms, record_id};
 use crate::resolve::ResolvedExecution;
 use crate::server::{self, ServerRecord, ServerStatus};
@@ -62,7 +63,11 @@ impl RecipeRecord {
     const SCHEMA_VERSION: u32 = 2;
 }
 
-pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, InferlabError> {
+pub fn run(
+    root: &Path,
+    resolved: ResolvedExecution,
+    progress: &Progress,
+) -> Result<RecipeRecord, InferlabError> {
     interrupt::prepare().map_err(|message| InferlabError::ServerLifecycle { message })?;
     let measurements =
         resolved
@@ -72,10 +77,15 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 message: "closed-loop recipe has no resolved measurements".to_owned(),
             })?;
     let mut session = RecipeRecordSession::begin(root, &resolved)?;
+    progress.phase(Phase::named("record created").record(
+        session.record().id.clone(),
+        root.join(RECORDS_DIR).join(&session.record().id),
+    ))?;
     let server_id = session.record().server.id.clone();
     let mut server_started = false;
 
-    match server::start_for_recipe(root, resolved.clone(), &server_id) {
+    progress.phase(Phase::named("server startup"))?;
+    match server::start_for_recipe(root, resolved.clone(), &server_id, progress) {
         Ok(_) => {
             server_started = true;
             session.record_mut().server.status = Some(ServerStatus::Running);
@@ -91,7 +101,9 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
     }
 
     let mut gate_succeeded = measurements.gate.is_none();
+    let eval_total = measurements.evals.len();
     for (index, plan) in measurements.evals.iter().enumerate() {
+        progress.phase(Phase::named("Eval").item(&plan.id, index + 1, eval_total))?;
         let id = format!("{}-eval-{index:03}-{}", session.record().id, plan.id);
         let outcome = if !server_started {
             workload::skip(
@@ -101,6 +113,7 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 &plan.id,
                 plan,
                 "server did not start",
+                progress,
             )
         } else if interrupt::received() {
             workload::skip(
@@ -110,9 +123,10 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 &plan.id,
                 plan,
                 "recipe interrupted",
+                progress,
             )
         } else {
-            workload::run_eval(root, &id, plan, &server_id)
+            workload::run_eval(root, &id, plan, &server_id, progress)
         };
         match outcome {
             Ok(record) => {
@@ -144,7 +158,9 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
         session.rewrite()?;
     }
 
+    let bench_total = measurements.benches.len();
     for (index, plan) in measurements.benches.iter().enumerate() {
+        progress.phase(Phase::named("Bench").item(&plan.id, index + 1, bench_total))?;
         let id = format!("{}-bench-{index:03}-{}", session.record().id, plan.id);
         let outcome = if !server_started {
             workload::skip(
@@ -154,6 +170,7 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 &plan.id,
                 plan,
                 "server did not start",
+                progress,
             )
         } else if interrupt::received() {
             workload::skip(
@@ -163,6 +180,7 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 &plan.id,
                 plan,
                 "recipe interrupted",
+                progress,
             )
         } else if !gate_succeeded {
             workload::skip(
@@ -172,6 +190,7 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                 &plan.id,
                 plan,
                 "eval gate did not succeed",
+                progress,
             )
         } else {
             workload::run_bench(
@@ -182,6 +201,7 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
                     record_id: &server_id,
                 },
                 workload::ResolvedWorkloadPlan::Bench(Box::new(plan.clone())),
+                progress,
             )
         };
         match outcome {
@@ -206,7 +226,8 @@ pub fn run(root: &Path, resolved: ResolvedExecution) -> Result<RecipeRecord, Inf
     }
 
     if server_started {
-        match server::stop(root, &server_id) {
+        progress.phase(Phase::named("server cleanup"))?;
+        match server::stop(root, &server_id, progress) {
             Ok(record) => {
                 let (verified, cleanup_error) = server_cleanup_summary(&record);
                 session.record_mut().server.status = Some(record.status);

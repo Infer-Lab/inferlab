@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 pub const ID: &str = "inferlab-trtllm-proxy";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 const MIN_REQUEST_ID: u64 = 1_u64 << 42;
 const CONTEXT_FIRST_SCHEDULE_STYLE: u64 = 0;
@@ -66,7 +66,23 @@ fn router(state: ProxyState) -> Router {
     Router::new()
         .route("/healthcheck", get(healthcheck))
         .route("/v1/completions", post(completions))
+        .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
+}
+
+#[derive(Clone, Copy)]
+enum RequestFamily {
+    Completions,
+    ChatCompletions,
+}
+
+impl RequestFamily {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Completions => "/v1/completions",
+            Self::ChatCompletions => "/v1/chat/completions",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -200,12 +216,29 @@ async fn completions(
     completion_route(state, headers, body).await
 }
 
+async fn chat_completions(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response<Body>, ProxyHttpError> {
+    request_route(state, headers, body, RequestFamily::ChatCompletions).await
+}
+
 async fn completion_route(
     state: ProxyState,
     headers: HeaderMap,
     body: Value,
 ) -> Result<Response<Body>, ProxyHttpError> {
-    let stream = validate_public_request(&body)?;
+    request_route(state, headers, body, RequestFamily::Completions).await
+}
+
+async fn request_route(
+    state: ProxyState,
+    headers: HeaderMap,
+    body: Value,
+    family: RequestFamily,
+) -> Result<Response<Body>, ProxyHttpError> {
+    let stream = validate_public_request(&body, family)?;
     if !state.ready() {
         return Err(ProxyHttpError::status(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -223,18 +256,19 @@ async fn completion_route(
         state.client(),
         prefill,
         context_body,
+        family.path(),
         &request_id_header,
         authorization.as_deref(),
     )
     .await?;
 
-    match context_outcome(context, request_id)? {
-        ContextOutcome::Complete(context) => complete_context_response(context, stream),
+    match context_outcome(context, request_id, family)? {
+        ContextOutcome::Complete(context) => complete_context_response(context, stream, family),
         ContextOutcome::Handoff(handoff) => {
-            let generation_body = generation_body(&body, handoff)?;
+            let generation_body = generation_body(&body, handoff, family)?;
             let response = core::send_json_post(
                 state.client(),
-                join_path(&decode, "/v1/completions"),
+                join_path(&decode, family.path()),
                 &generation_body,
                 Some(&request_id_header),
                 authorization.as_deref(),
@@ -251,26 +285,36 @@ async fn completion_route(
     }
 }
 
-fn validate_public_request(body: &Value) -> Result<bool, ProxyHttpError> {
+fn validate_public_request(body: &Value, family: RequestFamily) -> Result<bool, ProxyHttpError> {
     let object = body.as_object().ok_or_else(|| {
         ProxyHttpError::status(
             StatusCode::BAD_REQUEST,
-            "OpenAI completion request body must be a JSON object",
+            "OpenAI request body must be a JSON object",
         )
     })?;
-    match object.get("prompt") {
-        Some(Value::String(_)) => {}
-        Some(Value::Array(_)) => {
-            return Err(ProxyHttpError::status(
-                StatusCode::BAD_REQUEST,
-                "TensorRT-LLM built-in proxy does not support prompt arrays",
-            ));
-        }
-        _ => {
-            return Err(ProxyHttpError::status(
-                StatusCode::BAD_REQUEST,
-                "TensorRT-LLM built-in proxy requires a scalar string prompt",
-            ));
+    match family {
+        RequestFamily::Completions => match object.get("prompt") {
+            Some(Value::String(_)) => {}
+            Some(Value::Array(_)) => {
+                return Err(ProxyHttpError::status(
+                    StatusCode::BAD_REQUEST,
+                    "TensorRT-LLM built-in proxy does not support prompt arrays",
+                ));
+            }
+            _ => {
+                return Err(ProxyHttpError::status(
+                    StatusCode::BAD_REQUEST,
+                    "TensorRT-LLM built-in proxy requires a scalar string prompt",
+                ));
+            }
+        },
+        RequestFamily::ChatCompletions => {
+            if !object.get("messages").is_some_and(Value::is_array) {
+                return Err(ProxyHttpError::status(
+                    StatusCode::BAD_REQUEST,
+                    "TensorRT-LLM built-in proxy requires structured chat messages",
+                ));
+            }
         }
     }
     if object
@@ -325,12 +369,13 @@ async fn send_context_request(
     client: reqwest::Client,
     prefill: String,
     body: Value,
+    path: &'static str,
     request_id: &str,
     authorization: Option<&str>,
 ) -> Result<ContextResponse, ProxyHttpError> {
     let response = core::send_json_post(
         client,
-        join_path(&prefill, "/v1/completions"),
+        join_path(&prefill, path),
         &body,
         Some(request_id),
         authorization,
@@ -367,14 +412,20 @@ enum ContextOutcome {
 }
 
 struct Handoff {
-    prompt_token_ids: Value,
+    prompt_token_ids: PromptTokenIds,
     usage: Value,
     disaggregated_params: Map<String, Value>,
+}
+
+enum PromptTokenIds {
+    Array(Value),
+    Base64(String),
 }
 
 fn context_outcome(
     mut response: ContextResponse,
     request_id: u64,
+    family: RequestFamily,
 ) -> Result<ContextOutcome, ProxyHttpError> {
     let first = response
         .body
@@ -397,12 +448,36 @@ fn context_outcome(
         return Ok(ContextOutcome::Complete(response));
     }
 
-    let prompt_token_ids = response
-        .body
-        .get("prompt_token_ids")
-        .filter(|tokens| is_scalar_token_array(tokens))
-        .cloned()
-        .ok_or_else(|| handoff_error("prompt_token_ids must be a scalar token array"))?;
+    let prompt_token_ids = match family {
+        RequestFamily::Completions => response
+            .body
+            .get("prompt_token_ids")
+            .filter(|tokens| is_scalar_token_array(tokens))
+            .cloned()
+            .map(PromptTokenIds::Array)
+            .ok_or_else(|| handoff_error("prompt_token_ids must be a scalar token array"))?,
+        RequestFamily::ChatCompletions => {
+            if let Some(tokens) = response
+                .body
+                .get("prompt_token_ids_b64")
+                .and_then(Value::as_str)
+            {
+                PromptTokenIds::Base64(tokens.to_owned())
+            } else {
+                response
+                    .body
+                    .get("prompt_token_ids")
+                    .filter(|tokens| is_scalar_token_array(tokens))
+                    .cloned()
+                    .map(PromptTokenIds::Array)
+                    .ok_or_else(|| {
+                        handoff_error(
+                            "chat handoff requires prompt_token_ids_b64 or a scalar prompt_token_ids array",
+                        )
+                    })?
+            }
+        }
+    };
     let usage = response
         .body
         .get("usage")
@@ -462,12 +537,20 @@ fn sanitize_context_response(body: &mut Value) {
 fn complete_context_response(
     context: ContextResponse,
     stream: bool,
+    family: RequestFamily,
 ) -> Result<Response<Body>, ProxyHttpError> {
     if stream {
+        let event = context_stream_event(&context.body, family)?;
+        let mut body = b"data: ".to_vec();
+        body.extend(serde_json::to_vec(&event).map_err(|error| {
+            ProxyHttpError::internal(format!("failed to serialize context stream event: {error}"))
+        })?);
+        body.extend_from_slice(b"\n\n");
+        body.extend_from_slice(TERMINAL_SSE);
         return Response::builder()
             .status(context.status)
             .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from(TERMINAL_SSE))
+            .body(Body::from(body))
             .map_err(|error| {
                 ProxyHttpError::internal(format!(
                     "failed to build terminal context response: {error}"
@@ -486,12 +569,50 @@ fn complete_context_response(
     })
 }
 
-fn generation_body(body: &Value, handoff: Handoff) -> Result<Value, ProxyHttpError> {
+fn context_stream_event(body: &Value, family: RequestFamily) -> Result<Value, ProxyHttpError> {
+    let mut event = body.clone();
+    let object = event.as_object_mut().ok_or_else(|| {
+        ProxyHttpError::status(
+            StatusCode::BAD_GATEWAY,
+            "context response body must be a JSON object",
+        )
+    })?;
+    match family {
+        RequestFamily::Completions => {
+            object.insert(
+                "object".to_owned(),
+                Value::String("text_completion".to_owned()),
+            );
+        }
+        RequestFamily::ChatCompletions => {
+            object.insert(
+                "object".to_owned(),
+                Value::String("chat.completion.chunk".to_owned()),
+            );
+            if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
+                for choice in choices {
+                    if let Some(choice) = choice.as_object_mut()
+                        && let Some(message) = choice.remove("message")
+                    {
+                        choice.insert("delta".to_owned(), message);
+                    }
+                }
+            }
+        }
+    }
+    Ok(event)
+}
+
+fn generation_body(
+    body: &Value,
+    handoff: Handoff,
+    family: RequestFamily,
+) -> Result<Value, ProxyHttpError> {
     let mut body = body.clone();
     let object = body.as_object_mut().ok_or_else(|| {
         ProxyHttpError::status(
             StatusCode::BAD_REQUEST,
-            "OpenAI completion request body must be a JSON object",
+            "OpenAI request body must be a JSON object",
         )
     })?;
     let mut params = handoff.disaggregated_params;
@@ -504,7 +625,24 @@ fn generation_body(body: &Value, handoff: Handoff) -> Result<Value, ProxyHttpErr
         Value::from(CONTEXT_FIRST_SCHEDULE_STYLE),
     );
     params.insert("ctx_usage".to_owned(), handoff.usage);
-    object.insert("prompt".to_owned(), handoff.prompt_token_ids);
+    match (family, handoff.prompt_token_ids) {
+        (RequestFamily::Completions, PromptTokenIds::Array(tokens)) => {
+            object.insert("prompt".to_owned(), tokens);
+        }
+        (RequestFamily::ChatCompletions, PromptTokenIds::Base64(tokens)) => {
+            object.remove("prompt_token_ids");
+            object.insert("prompt_token_ids_b64".to_owned(), Value::String(tokens));
+        }
+        (RequestFamily::ChatCompletions, PromptTokenIds::Array(tokens)) => {
+            object.remove("prompt_token_ids_b64");
+            object.insert("prompt_token_ids".to_owned(), tokens);
+        }
+        (RequestFamily::Completions, PromptTokenIds::Base64(_)) => {
+            return Err(handoff_error(
+                "completion handoff cannot use prompt_token_ids_b64",
+            ));
+        }
+    }
     object.insert("disaggregated_params".to_owned(), Value::Object(params));
     Ok(body)
 }
@@ -528,7 +666,7 @@ mod tests {
     #[test]
     fn meta_exports_proxy_identity() {
         assert_eq!(ID, "inferlab-trtllm-proxy");
-        assert_eq!(VERSION, 1);
+        assert_eq!(VERSION, 2);
         assert_eq!(meta().id, ID);
         assert_eq!(meta().version, VERSION);
     }
@@ -589,7 +727,7 @@ mod tests {
             "prompt_token_ids": [10, 11, 12],
             "usage": {"prompt_tokens": 3, "completion_tokens": 1}
         }));
-        let handoff = match context_outcome(context, request_id)
+        let handoff = match context_outcome(context, request_id, RequestFamily::Completions)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?
         {
             ContextOutcome::Handoff(handoff) => handoff,
@@ -604,6 +742,7 @@ mod tests {
                 "opaque_request_field": [1, 2]
             }),
             handoff,
+            RequestFamily::Completions,
         )
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
@@ -695,7 +834,11 @@ mod tests {
             ),
         ];
         for (label, body) in cases {
-            let result = context_outcome(context_response(body), request_id);
+            let result = context_outcome(
+                context_response(body),
+                request_id,
+                RequestFamily::Completions,
+            );
             assert!(result.is_err(), "{label} was accepted");
         }
         Ok(())
@@ -780,10 +923,14 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE),
             Some(&HeaderValue::from_static("text/event-stream"))
         );
-        assert_eq!(
-            to_bytes(response.into_body(), usize::MAX).await?,
-            TERMINAL_SSE
-        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+        let stream = std::str::from_utf8(&bytes)?;
+        let event = first_sse_event(stream)?;
+        assert_eq!(event["object"], "text_completion");
+        assert_eq!(event["choices"][0]["index"], 0);
+        assert_eq!(event["choices"][0]["text"], "answer");
+        assert_eq!(event["choices"][0]["finish_reason"], "stop");
+        assert!(stream.ends_with("data: [DONE]\n\n"));
         assert!(decode_backend.requests.lock().await.is_empty());
         prefill_server.abort();
         decode_server.abort();
@@ -884,6 +1031,76 @@ mod tests {
         }
         drop(context_requests);
         drop(decode_requests);
+        prefill_server.abort();
+        decode_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_uses_chat_handoff_and_emits_route_specific_context_stream() -> Result<()> {
+        let context_backend = ContextBackend::default();
+        let decode_backend = DecodeBackend::default();
+        let (prefill, prefill_server) = spawn_context_backend(context_backend.clone()).await?;
+        let (decode, decode_server) = spawn_decode_backend(decode_backend.clone()).await?;
+        let state = proxy_state(vec![prefill], vec![decode])?;
+        state.set_ready();
+        let messages = json!([{"role": "user", "content": "hello"}]);
+
+        let response = request_route(
+            state.clone(),
+            HeaderMap::new(),
+            json!({
+                "model": "m",
+                "messages": messages,
+                "mode": "generate",
+                "temperature": 1.0,
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"enable_thinking": true}
+            }),
+            RequestFamily::ChatCompletions,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let context_requests = context_backend.requests.lock().await;
+        let decode_requests = decode_backend.requests.lock().await;
+        assert_eq!(context_requests.len(), 1);
+        assert_eq!(decode_requests.len(), 1);
+        assert_eq!(context_requests[0].path, "/v1/chat/completions");
+        assert_eq!(decode_requests[0].path, "/v1/chat/completions");
+        assert_eq!(context_requests[0].body["messages"], messages);
+        assert_eq!(decode_requests[0].body["messages"], messages);
+        assert_eq!(decode_requests[0].body["prompt_token_ids_b64"], "encoded");
+        assert!(decode_requests[0].body.get("prompt").is_none());
+        for key in ["temperature", "reasoning_effort", "chat_template_kwargs"] {
+            assert_eq!(decode_requests[0].body[key], context_requests[0].body[key]);
+        }
+        drop(context_requests);
+        drop(decode_requests);
+
+        let response = request_route(
+            state,
+            HeaderMap::new(),
+            json!({
+                "model": "m",
+                "messages": messages,
+                "mode": "complete",
+                "stream": true
+            }),
+            RequestFamily::ChatCompletions,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+        let stream = std::str::from_utf8(&bytes)?;
+        let event = first_sse_event(stream)?;
+        assert_eq!(event["object"], "chat.completion.chunk");
+        assert_eq!(event["choices"][0]["index"], 0);
+        assert_eq!(event["choices"][0]["delta"]["content"], "answer");
+        assert_eq!(event["choices"][0]["finish_reason"], "stop");
+        assert!(stream.ends_with("data: [DONE]\n\n"));
+        assert_eq!(decode_backend.requests.lock().await.len(), 1);
         prefill_server.abort();
         decode_server.abort();
         Ok(())
@@ -1013,10 +1230,20 @@ mod tests {
         })
     }
 
+    fn first_sse_event(stream: &str) -> Result<Value> {
+        let event = stream
+            .strip_prefix("data: ")
+            .and_then(|stream| stream.split_once("\n\n"))
+            .map(|(event, _)| event)
+            .context("response lacked an SSE data event")?;
+        serde_json::from_str(event).map_err(Into::into)
+    }
+
     #[derive(Clone)]
     struct ObservedRequest {
         headers: HeaderMap,
         body: Value,
+        path: &'static str,
     }
 
     #[derive(Clone, Default)]
@@ -1046,6 +1273,7 @@ mod tests {
         let app = Router::new()
             .route("/health", get(context_health))
             .route("/v1/completions", post(context_completion))
+            .route("/v1/chat/completions", post(context_chat_completion))
             .with_state(state);
         spawn_router(app).await
     }
@@ -1054,6 +1282,7 @@ mod tests {
         let app = Router::new()
             .route("/health", get(decode_health))
             .route("/v1/completions", post(decode_completion))
+            .route("/v1/chat/completions", post(decode_chat_completion))
             .with_state(state);
         spawn_router(app).await
     }
@@ -1082,9 +1311,27 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response<Body> {
+        context_request(state, headers, body, RequestFamily::Completions).await
+    }
+
+    async fn context_chat_completion(
+        State(state): State<ContextBackend>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        context_request(state, headers, body, RequestFamily::ChatCompletions).await
+    }
+
+    async fn context_request(
+        state: ContextBackend,
+        headers: HeaderMap,
+        body: Value,
+        family: RequestFamily,
+    ) -> Response<Body> {
         state.requests.lock().await.push(ObservedRequest {
             headers,
             body: body.clone(),
+            path: family.path(),
         });
         if body.get("mode").and_then(Value::as_str) == Some("context-fail") {
             return (StatusCode::INTERNAL_SERVER_ERROR, "context failed").into_response();
@@ -1095,27 +1342,33 @@ mod tests {
         } else {
             "length"
         };
-        (
-            StatusCode::CREATED,
-            Json(json!({
-                "id": "cmpl-context",
-                "choices": [{
-                    "finish_reason": finish_reason,
-                    "text": "answer",
-                    "disaggregated_params": {
-                        "request_type": "context_only",
-                        "ctx_request_id": 91,
-                        "disagg_request_id": request_id,
-                        "first_gen_tokens": [8],
-                        "opaque_future_field": {"endpoint": "nixl://ctx"}
-                    }
-                }],
-                "prompt_token_ids": [10, 11, 12],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
-                "opaque": "kept"
-            })),
-        )
-            .into_response()
+        let mut choice = match family {
+            RequestFamily::Completions => json!({"text": "answer"}),
+            RequestFamily::ChatCompletions => {
+                json!({"message": {"role": "assistant", "content": "answer"}})
+            }
+        };
+        choice["finish_reason"] = Value::String(finish_reason.to_owned());
+        choice["index"] = Value::from(0);
+        choice["disaggregated_params"] = json!({
+            "request_type": "context_only",
+            "ctx_request_id": 91,
+            "disagg_request_id": request_id,
+            "first_gen_tokens": [8],
+            "opaque_future_field": {"endpoint": "nixl://ctx"}
+        });
+        let mut response = json!({
+            "id": "cmpl-context",
+            "choices": [choice],
+            "prompt_token_ids": [10, 11, 12],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            "opaque": "kept"
+        });
+        if matches!(family, RequestFamily::ChatCompletions) {
+            response["object"] = Value::String("chat.completion".to_owned());
+            response["prompt_token_ids_b64"] = Value::String("encoded".to_owned());
+        }
+        (StatusCode::CREATED, Json(response)).into_response()
     }
 
     async fn decode_completion(
@@ -1123,9 +1376,27 @@ mod tests {
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Response<Body> {
+        decode_request(state, headers, body, RequestFamily::Completions).await
+    }
+
+    async fn decode_chat_completion(
+        State(state): State<DecodeBackend>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        decode_request(state, headers, body, RequestFamily::ChatCompletions).await
+    }
+
+    async fn decode_request(
+        state: DecodeBackend,
+        headers: HeaderMap,
+        body: Value,
+        family: RequestFamily,
+    ) -> Response<Body> {
         state.requests.lock().await.push(ObservedRequest {
             headers,
             body: body.clone(),
+            path: family.path(),
         });
         let mode = body.get("mode").and_then(Value::as_str);
         if mode == Some("decode-fail") {

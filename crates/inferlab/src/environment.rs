@@ -1,5 +1,6 @@
 use crate::InferlabError;
 use crate::interrupt;
+use crate::progress::{Phase, Progress};
 use crate::workspace::StackDefinition;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -147,9 +148,12 @@ pub fn run_local_checks(
     root: &Path,
     pixi_environment: &str,
     checks: &[PlannedEnvironmentCheck],
+    progress: &Progress,
+    phase_name: &str,
 ) -> Result<(Vec<EnvironmentCheckEvidence>, Option<LocalCheckFailure>), InferlabError> {
     let mut evidence = Vec::new();
-    for check in checks {
+    for (index, check) in checks.iter().enumerate() {
+        progress.phase(Phase::named(phase_name).item(&check.id, index + 1, checks.len()))?;
         let output = Command::new("pixi")
             .current_dir(root)
             .args(["run", "--locked", "--no-install", "--executable", "-e"])
@@ -416,13 +420,20 @@ pub enum EnvironmentStatusKind {
 /// packages or updating the manifest or lock
 /// ([[RFC-0002:C-PIXI-ENVIRONMENT-LIFECYCLE]]). `stacks` pairs a workspace
 /// stack identifier with the Pixi environment it selects.
-pub fn status(
+pub(crate) fn status_with_progress(
     root: &Path,
     stacks: &[(String, String)],
+    progress: &Progress,
 ) -> Result<Vec<EnvironmentStatusReport>, InferlabError> {
     stacks
         .iter()
-        .map(|(stack, pixi_environment)| {
+        .enumerate()
+        .map(|(index, (stack, pixi_environment))| {
+            progress.phase(Phase::named("environment realization inspection").item(
+                stack,
+                index + 1,
+                stacks.len(),
+            ))?;
             let install_command = format!("pixi install --locked --environment {pixi_environment}");
             let (status, diagnostics, install_command) =
                 match check_environment(root, pixi_environment)? {
@@ -449,28 +460,35 @@ pub fn status(
         .collect()
 }
 
-pub fn lock_workspace(root: &Path) -> Result<LockResult, InferlabError> {
+pub(crate) fn lock_workspace_with_progress(
+    root: &Path,
+    progress: &Progress,
+) -> Result<LockResult, InferlabError> {
     interrupt::prepare().map_err(|message| InferlabError::EnvironmentLifecycle { message })?;
     let mut transaction = WorkspaceFileTransaction::begin(root)?;
-    let result = produce_lock(root, &mut transaction);
+    let result = produce_lock(root, &mut transaction, progress);
     match result {
         Ok(result) => {
             transaction.commit();
             Ok(result)
         }
-        Err(error) => match transaction.restore() {
-            Ok(()) => Err(error),
-            Err(restoration) => Err(InferlabError::EnvironmentRestore {
-                operation: error.to_string(),
-                restoration: restoration.to_string(),
-            }),
-        },
+        Err(error) => {
+            progress.phase(Phase::named("restoration after failure or interruption"))?;
+            match transaction.restore() {
+                Ok(()) => Err(error),
+                Err(restoration) => Err(InferlabError::EnvironmentRestore {
+                    operation: error.to_string(),
+                    restoration: restoration.to_string(),
+                }),
+            }
+        }
     }
 }
 
 fn produce_lock(
     root: &Path,
     transaction: &mut WorkspaceFileTransaction,
+    progress: &Progress,
 ) -> Result<LockResult, InferlabError> {
     let full_text = std::str::from_utf8(&transaction.manifest_bytes).map_err(|error| {
         InferlabError::InvalidConfig {
@@ -488,11 +506,14 @@ fn produce_lock(
         let base_text = toml::to_string_pretty(&base_manifest)
             .map_err(|source| InferlabError::SerializeToml { source })?;
         transaction.write_manifest(base_text.as_bytes())?;
+        progress.phase(Phase::named("base-lock production"))?;
         run_pixi_lock(root, &transaction.manifest)?;
+        progress.phase(Phase::named("staged base installation"))?;
         run_pixi_base_install(root, &transaction.manifest)?;
         transaction.restore_manifest()?;
     }
 
+    progress.phase(Phase::named("authoritative full-lock production"))?;
     run_pixi_lock(root, &transaction.manifest)?;
     let lock_bytes = fs::read(&transaction.lock).map_err(|source| InferlabError::Read {
         path: transaction.lock.clone(),

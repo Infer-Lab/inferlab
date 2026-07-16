@@ -76,6 +76,18 @@ fn workspace_lock_stages_build_dependencies_and_leaves_the_full_lock() -> Result
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout)?;
+    let progress = String::from_utf8_lossy(&output.stderr);
+    for phase in [
+        "base-lock production",
+        "staged base installation",
+        "authoritative full-lock production",
+    ] {
+        assert!(
+            progress.contains(&format!("phase=\"{phase}\"")),
+            "missing {phase:?} in progress output: {progress}"
+        );
+    }
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("progress:"));
     assert_eq!(result["staged_install"], true);
     assert_eq!(result["manifest_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(result["lock_sha256"].as_str().map(str::len), Some(64));
@@ -107,6 +119,12 @@ fn workspace_lock_restores_manifest_and_previous_lock_when_full_lock_fails()
         .output()?;
 
     assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("phase=\"restoration after failure or interruption\""),
+        "restoration progress: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         fs::read_to_string(workspace.root.path().join("pixi.toml"))?,
         FULL_MANIFEST

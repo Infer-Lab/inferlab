@@ -1,0 +1,47 @@
+{
+  "protocol_version": "6",
+  "workspace_root": "/workspace",
+  "workspace_source_exclusions": [
+    ".inferlab/cache",
+    ".inferlab/records",
+    ".inferlab/runtime",
+    ".inferlab/scratchpads"
+  ],
+  "endpoint": {
+    "protocol": "http",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "completions_path": "/v1/completions",
+    "chat_completions_path": "/v1/chat/completions"
+  },
+  "model": {
+    "locator": "/models/dsv4",
+    "served_name": "dsv4"
+  },
+  "definition": {
+    "kind": "lm_eval",
+    "task": {
+      "kind": "workspace_yaml",
+      "path": "/workspace/evals/custom.yaml"
+    },
+    "limit": 8,
+    "few_shot": null,
+    "seed": 1,
+    "trials": 3,
+    "max_tokens": 256,
+    "concurrency": 4,
+    "request_body": {
+      "temperature": 1.0,
+      "reasoning_effort": "high",
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "metric": "exact_match",
+    "metric_filter": "strict-match",
+    "threshold": 0.9,
+    "timeout_seconds": 300
+  },
+  "case_budget_seconds": 29.5,
+  "artifact_dir": "/records/eval/artifacts"
+}

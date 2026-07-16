@@ -1,11 +1,17 @@
 use super::record::{DeviceHardwareEvidence, MachineHardwareEvidence};
 use crate::interrupt;
+pub(crate) use crate::process_group::process_start_time;
+use crate::process_group::{LocalProcessGroup, VerifiedStatus};
+pub use crate::process_group::{SignalEvidence, TerminationSignal};
 use crate::resolve::{
     CommandPlan, EndpointPlan, LaunchFilePlan, LaunchPlan, ProcessPlan, ReadinessPlan,
     RemoteWorkspacePlan, TargetRegistryExpectedTarget,
 };
 use crate::shell::{shell_quote, shell_quote_path};
-use crate::ssh::{ssh_argv, ssh_command};
+use crate::ssh::ssh_argv;
+use crate::time_bound::{
+    AttemptBound, OperationBound, OperationTerminalCause, OperationTimingEvidence, Remaining,
+};
 use crate::workspace::{
     WorkspaceSnapshot, git_status_flags, source_digest_script, source_pathspecs,
 };
@@ -14,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -22,14 +28,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use wait_timeout::ChildExt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// Ceiling for the readiness probe backoff; termination-grace polling keeps
 /// the fixed [`POLL_INTERVAL`].
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const READINESS_ATTEMPT_CAP: Duration = Duration::from_millis(250);
 const TERM_GRACE: Duration = Duration::from_secs(2);
 const KILL_GRACE: Duration = Duration::from_secs(10);
+const SERVER_CLEANUP_STATUS_DEADLINE: Duration = Duration::from_secs(2);
+const REMOTE_SERVER_CLEANUP_DEADLINE: Duration = Duration::from_secs(30);
+pub(super) const REMOTE_LOG_SYNC_DEADLINE: Duration = Duration::from_secs(30);
+const LOCAL_LAUNCH_FAILURE_REAP_GRACE: Duration = Duration::from_secs(5);
 /// Poll iterations the embedded SSH cleanup scripts spend waiting out each
 /// grace window at [`POLL_INTERVAL`] (`sleep 0.1`) per step; kept in sync with
 /// the local-path grace windows above so the remote and local waits match.
@@ -144,25 +155,14 @@ pub enum CleanupTrigger {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignalEvidence {
-    pub signal: TerminationSignal,
-    pub process_group: u32,
-    pub exit_code: Option<i32>,
-    pub stderr: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminationSignal {
-    Term,
-    Kill,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CleanupEvidence {
     pub trigger: CleanupTrigger,
+    pub elapsed_ms: u64,
+    pub status_deadline_ms: u64,
+    pub term_grace_ms: u64,
+    pub kill_grace_ms: u64,
+    pub reap_grace_ms: Option<u64>,
+    pub remote_deadline_ms: Option<u64>,
     pub verified: bool,
     pub already_exited: bool,
     pub forced: bool,
@@ -181,6 +181,10 @@ pub struct CleanupEvidence {
 #[serde(deny_unknown_fields)]
 pub struct ContainerRemovalEvidence {
     pub container: String,
+    pub elapsed_ms: u64,
+    pub operation_elapsed_ms: u64,
+    pub deadline_ms: u64,
+    pub client_cleanup: Option<crate::container::CommandCleanupEvidence>,
     pub confirmed: bool,
     pub already_absent: bool,
     pub error: Option<String>,
@@ -190,6 +194,12 @@ impl CleanupEvidence {
     pub(super) fn unavailable(trigger: CleanupTrigger, message: String) -> Self {
         Self {
             trigger,
+            elapsed_ms: 0,
+            status_deadline_ms: duration_ms(SERVER_CLEANUP_STATUS_DEADLINE),
+            term_grace_ms: duration_ms(TERM_GRACE),
+            kill_grace_ms: duration_ms(KILL_GRACE),
+            reap_grace_ms: None,
+            remote_deadline_ms: None,
             verified: false,
             already_exited: false,
             forced: false,
@@ -213,6 +223,12 @@ impl CleanupEvidence {
     ) -> Self {
         Self {
             trigger,
+            elapsed_ms: removal.elapsed_ms,
+            status_deadline_ms: duration_ms(SERVER_CLEANUP_STATUS_DEADLINE),
+            term_grace_ms: duration_ms(TERM_GRACE),
+            kill_grace_ms: duration_ms(KILL_GRACE),
+            reap_grace_ms: None,
+            remote_deadline_ms: None,
             verified,
             already_exited: false,
             forced: false,
@@ -248,6 +264,8 @@ pub enum ReadinessEvidence {
         url: String,
         attempts: u32,
         ready_unix_ms: u64,
+        timing: OperationTimingEvidence,
+        diagnostic_attempts: Vec<ReadinessAttemptEvidence>,
     },
     HttpTargetRegistry {
         readiness_url: String,
@@ -255,23 +273,39 @@ pub enum ReadinessEvidence {
         attempts: u32,
         ready_unix_ms: u64,
         matched_targets: Vec<TargetRegistryMatchEvidence>,
+        timing: OperationTimingEvidence,
+        diagnostic_attempts: Vec<ReadinessAttemptEvidence>,
     },
     ProcessAlive {
         ready_unix_ms: u64,
+        timing: OperationTimingEvidence,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessAttemptEvidence {
+    pub operation: String,
+    pub effective_bound_ms: u64,
+    pub succeeded: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReadinessFailureKind {
     Exited,
     Interrupted,
     Timeout,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadinessFailure {
     pub kind: ReadinessFailureKind,
     pub message: String,
+    pub timing: Option<OperationTimingEvidence>,
+    pub diagnostic_attempts: Vec<ReadinessAttemptEvidence>,
 }
 
 pub(super) struct ProcessSpec<'a> {
@@ -287,6 +321,24 @@ pub(super) struct ProcessSpec<'a> {
     pub container: Option<&'a str>,
 }
 
+pub(super) struct RemoteCheckRequest<'a> {
+    pub target: &'a str,
+    pub root: &'a Path,
+    pub pixi: &'a str,
+    pub pixi_environment: &'a str,
+    pub checks: &'a [crate::environment::PlannedEnvironmentCheck],
+    pub machine: &'a str,
+    pub progress: &'a crate::progress::Progress,
+}
+
+pub(super) type RemoteCheckOutcome = Result<
+    (
+        Vec<crate::environment::EnvironmentCheckEvidence>,
+        Option<crate::environment::LocalCheckFailure>,
+    ),
+    String,
+>;
+
 #[derive(Clone, Debug)]
 pub(super) struct LaunchFailure {
     pub message: String,
@@ -295,7 +347,8 @@ pub(super) struct LaunchFailure {
     /// have created, when the failure attempted one; the record's cleanup
     /// evidence carries the actual container and reason rather than a
     /// generic note ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
-    pub container_removal: Option<ContainerRemovalEvidence>,
+    pub container_removal: Option<Box<ContainerRemovalEvidence>>,
+    pub cleanup: Option<Box<CleanupEvidence>>,
 }
 
 impl LaunchFailure {
@@ -304,6 +357,7 @@ impl LaunchFailure {
             message,
             ownership_unknown: false,
             container_removal: None,
+            cleanup: None,
         }
     }
 
@@ -313,12 +367,16 @@ impl LaunchFailure {
             message,
             ownership_unknown: true,
             container_removal: None,
+            cleanup: None,
         }
     }
 }
 
-pub(super) trait ProcessRuntime {
+pub(super) trait ProcessLauncher {
     fn spawn(&self, spec: ProcessSpec<'_>) -> Result<ProcessHandle, LaunchFailure>;
+}
+
+pub(super) trait PreflightObserver {
     /// Probe the device hardware assigned on one machine through its launch
     /// path, before any serving process starts ([[RFC-0005:C-EVIDENCE]]).
     fn probe_hardware(
@@ -327,29 +385,64 @@ pub(super) trait ProcessRuntime {
         machine: &str,
         devices: &[u32],
     ) -> Result<MachineHardwareEvidence, String>;
+
+    fn run_remote_checks(&self, request: RemoteCheckRequest<'_>) -> RemoteCheckOutcome;
+}
+
+pub(super) trait ProcessObserver {
     fn status(&self, handle: &ProcessHandle) -> ProcessStatus;
+    fn status_with_bound(&self, handle: &ProcessHandle, bound: &OperationBound) -> ProcessStatus;
+    fn sync_logs(
+        &self,
+        handle: &ProcessHandle,
+        stdout: &Path,
+        stderr: &Path,
+        cleanup: bool,
+    ) -> Result<(), String>;
+}
+
+pub(super) trait ReadinessObserver {
     fn wait_ready(
         &self,
         handle: &ProcessHandle,
         endpoint: &EndpointPlan,
         readiness: &ReadinessPlan,
+        on_probe_failure: &mut dyn FnMut(&str),
     ) -> Result<ReadinessEvidence, ReadinessFailure>;
-    fn terminate(&self, handle: &ProcessHandle, trigger: CleanupTrigger) -> CleanupEvidence;
-    fn sync_logs(&self, handle: &ProcessHandle, stdout: &Path, stderr: &Path)
-    -> Result<(), String>;
+}
+
+pub(super) trait ProcessCleanup {
+    fn terminate(
+        &self,
+        handle: &ProcessHandle,
+        trigger: CleanupTrigger,
+        on_container_removal: &mut dyn FnMut(&str),
+    ) -> CleanupEvidence;
+}
+
+pub(super) trait ServerRuntime:
+    ProcessLauncher + PreflightObserver + ProcessObserver + ReadinessObserver + ProcessCleanup
+{
+}
+
+impl<T> ServerRuntime for T where
+    T: ProcessLauncher + PreflightObserver + ProcessObserver + ReadinessObserver + ProcessCleanup
+{
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct SystemProcessRuntime;
 
-impl ProcessRuntime for SystemProcessRuntime {
+impl ProcessLauncher for SystemProcessRuntime {
     fn spawn(&self, spec: ProcessSpec<'_>) -> Result<ProcessHandle, LaunchFailure> {
         match spec.launch {
             LaunchPlan::Local => spawn_local(spec).map(ProcessHandle::Local),
             LaunchPlan::Ssh { target } => spawn_ssh(target, spec).map(ProcessHandle::Ssh),
         }
     }
+}
 
+impl PreflightObserver for SystemProcessRuntime {
     fn probe_hardware(
         &self,
         launch: &LaunchPlan,
@@ -375,6 +468,20 @@ impl ProcessRuntime for SystemProcessRuntime {
         parse_hardware_output(machine, devices, &String::from_utf8_lossy(&output.stdout))
     }
 
+    fn run_remote_checks(&self, request: RemoteCheckRequest<'_>) -> RemoteCheckOutcome {
+        run_remote_checks(
+            request.target,
+            request.root,
+            request.pixi,
+            request.pixi_environment,
+            request.checks,
+            request.machine,
+            request.progress,
+        )
+    }
+}
+
+impl ProcessObserver for SystemProcessRuntime {
     fn status(&self, handle: &ProcessHandle) -> ProcessStatus {
         match handle {
             ProcessHandle::Local(handle) => verified_local_status(handle),
@@ -382,24 +489,77 @@ impl ProcessRuntime for SystemProcessRuntime {
         }
     }
 
+    fn status_with_bound(&self, handle: &ProcessHandle, bound: &OperationBound) -> ProcessStatus {
+        match handle {
+            ProcessHandle::Local(handle) => verified_local_status_with_bound(handle, bound),
+            ProcessHandle::Ssh(handle) => verified_ssh_status_with_bound(handle, bound),
+        }
+    }
+
+    fn sync_logs(
+        &self,
+        handle: &ProcessHandle,
+        stdout: &Path,
+        stderr: &Path,
+        cleanup: bool,
+    ) -> Result<(), String> {
+        match handle {
+            ProcessHandle::Local(_) => Ok(()),
+            ProcessHandle::Ssh(handle) => {
+                let bound = OperationBound::finite(REMOTE_LOG_SYNC_DEADLINE);
+                fetch_remote_file(&handle.target, &handle.stdout, stdout, &bound, cleanup)?;
+                fetch_remote_file(&handle.target, &handle.stderr, stderr, &bound, cleanup)
+            }
+        }
+    }
+}
+
+impl ReadinessObserver for SystemProcessRuntime {
     fn wait_ready(
         &self,
         handle: &ProcessHandle,
         endpoint: &EndpointPlan,
         readiness: &ReadinessPlan,
+        on_probe_failure: &mut dyn FnMut(&str),
     ) -> Result<ReadinessEvidence, ReadinessFailure> {
         match readiness {
             ReadinessPlan::ProcessAlive => {
-                ensure_alive(self.status(handle))?;
+                let bound = OperationBound::unbounded();
+                ensure_alive(self.status(handle)).map_err(|failure| {
+                    timed_readiness_failure(
+                        failure,
+                        &bound,
+                        OperationTerminalCause::Failed,
+                        Vec::new(),
+                    )
+                })?;
                 Ok(ReadinessEvidence::ProcessAlive {
-                    ready_unix_ms: unix_time_millis()?,
+                    ready_unix_ms: unix_time_millis().map_err(|failure| {
+                        timed_readiness_failure(
+                            failure,
+                            &bound,
+                            OperationTerminalCause::Failed,
+                            Vec::new(),
+                        )
+                    })?,
+                    timing: bound.timing(
+                        "before_process_alive_check",
+                        OperationTerminalCause::Succeeded,
+                    ),
                 })
             }
             ReadinessPlan::Http {
                 path,
                 timeout_seconds,
                 ..
-            } => wait_http_ready(self, handle, endpoint, path, *timeout_seconds),
+            } => wait_http_ready(
+                self,
+                handle,
+                endpoint,
+                path,
+                *timeout_seconds,
+                on_probe_failure,
+            ),
             ReadinessPlan::HttpTargetRegistry {
                 readiness_path,
                 registry_path,
@@ -412,7 +572,7 @@ impl ProcessRuntime for SystemProcessRuntime {
                 timeout_seconds,
                 ..
             } => wait_http_target_registry_ready(
-                || self.status(handle),
+                |bound| self.status_with_bound(handle, bound),
                 endpoint,
                 HttpTargetRegistryProbe {
                     readiness_path,
@@ -425,11 +585,19 @@ impl ProcessRuntime for SystemProcessRuntime {
                     expected_targets,
                 },
                 *timeout_seconds,
+                on_probe_failure,
             ),
         }
     }
+}
 
-    fn terminate(&self, handle: &ProcessHandle, trigger: CleanupTrigger) -> CleanupEvidence {
+impl ProcessCleanup for SystemProcessRuntime {
+    fn terminate(
+        &self,
+        handle: &ProcessHandle,
+        trigger: CleanupTrigger,
+        on_container_removal: &mut dyn FnMut(&str),
+    ) -> CleanupEvidence {
         let mut evidence = match handle {
             ProcessHandle::Local(handle) => terminate_local(handle, trigger),
             ProcessHandle::Ssh(handle) => terminate_ssh(handle, trigger),
@@ -444,6 +612,7 @@ impl ProcessRuntime for SystemProcessRuntime {
             ProcessHandle::Ssh(handle) => (handle.container.as_deref(), Some(&*handle.target)),
         };
         if let Some(container) = container {
+            on_container_removal(container);
             let removal = remove_server_container(target, container);
             if !removal.confirmed {
                 evidence.verified = false;
@@ -457,21 +626,6 @@ impl ProcessRuntime for SystemProcessRuntime {
             evidence.container_removal = Some(removal);
         }
         evidence
-    }
-
-    fn sync_logs(
-        &self,
-        handle: &ProcessHandle,
-        stdout: &Path,
-        stderr: &Path,
-    ) -> Result<(), String> {
-        match handle {
-            ProcessHandle::Local(_) => Ok(()),
-            ProcessHandle::Ssh(handle) => {
-                fetch_remote_file(&handle.target, &handle.stdout, stdout)?;
-                fetch_remote_file(&handle.target, &handle.stderr, stderr)
-            }
-        }
     }
 }
 
@@ -714,6 +868,7 @@ pub(super) fn run_remote_checks(
     pixi_environment: &str,
     checks: &[crate::environment::PlannedEnvironmentCheck],
     machine: &str,
+    progress: &crate::progress::Progress,
 ) -> Result<
     (
         Vec<crate::environment::EnvironmentCheckEvidence>,
@@ -723,7 +878,14 @@ pub(super) fn run_remote_checks(
 > {
     use crate::environment::{CheckOutcome, CheckRealization, EnvironmentCheckEvidence};
     let mut evidence = Vec::new();
-    for check in checks {
+    for (index, check) in checks.iter().enumerate() {
+        let _ = progress.phase(
+            crate::progress::Phase::named("local and remote preflight").item(
+                format!("{machine}:{}", check.id),
+                index + 1,
+                checks.len(),
+            ),
+        );
         let script = format!(
             "cd {root} && {pixi} run --locked --no-install --executable -e {environment} -- \
              python {script}",
@@ -852,11 +1014,13 @@ fn spawn_local(spec: ProcessSpec<'_>) -> Result<HostProcessHandle, LaunchFailure
         .spawn()
         .map_err(|error| fail(format!("failed to launch {program:?}: {error}")))?;
     HostProcessHandle::new(child.id(), spec.container.map(str::to_owned)).map_err(|error| {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &process_group])
-            .status();
-        let _ = child.wait();
+        let mut cleanup = cleanup_failed_local_launch(&mut child);
+        let error = match &cleanup.error {
+            None => error,
+            Some(cleanup) => {
+                format!("{error}; local launch cleanup was not verified: {cleanup}")
+            }
+        };
         // The client may already have asked the daemon to create the
         // container, which the group kill cannot reach. The group was
         // stopped above, so this final removal races nothing; an
@@ -865,15 +1029,86 @@ fn spawn_local(spec: ProcessSpec<'_>) -> Result<HostProcessHandle, LaunchFailure
         match spec.container {
             Some(container) => {
                 let removal = remove_server_container(None, container);
+                if !removal.confirmed {
+                    cleanup.verified = false;
+                    if cleanup.error.is_none() {
+                        cleanup.error = removal.error.clone();
+                    }
+                }
+                cleanup.container_removal = Some(removal.clone());
                 LaunchFailure {
                     message: format!("{error}; {}", removal_summary(&removal)),
-                    ownership_unknown: !removal.confirmed,
-                    container_removal: Some(removal),
+                    ownership_unknown: !cleanup.verified,
+                    container_removal: Some(Box::new(removal)),
+                    cleanup: Some(Box::new(cleanup)),
                 }
             }
-            None => fail(error),
+            None => LaunchFailure {
+                message: error,
+                ownership_unknown: !cleanup.verified,
+                container_removal: None,
+                cleanup: Some(Box::new(cleanup)),
+            },
         }
     })
+}
+
+fn cleanup_failed_local_launch(child: &mut std::process::Child) -> CleanupEvidence {
+    let started = Instant::now();
+    let initial_status_error = match child.try_wait() {
+        Ok(Some(_)) => {
+            let mut evidence =
+                completed_cleanup(CleanupTrigger::StartupRollback, true, false, Vec::new());
+            evidence.elapsed_ms = elapsed_ms(started);
+            evidence.status_deadline_ms = 0;
+            evidence.term_grace_ms = 0;
+            evidence.reap_grace_ms = Some(duration_ms(LOCAL_LAUNCH_FAILURE_REAP_GRACE));
+            return evidence;
+        }
+        Ok(None) => None,
+        // The subsequent kill and bounded reap are authoritative cleanup
+        // verification. Preserve this diagnostic only if that verification
+        // also fails; a successful reap resolves the transient status error.
+        Err(error) => Some(format!("failed to inspect failed launch child: {error}")),
+    };
+    let group = match LocalProcessGroup::capture_child(child) {
+        Ok(group) => group,
+        Err(error) => {
+            let mut evidence = CleanupEvidence::unavailable(
+                CleanupTrigger::StartupRollback,
+                format!("failed to capture failed launch process-group identity: {error}"),
+            );
+            evidence.elapsed_ms = elapsed_ms(started);
+            evidence.status_deadline_ms = 0;
+            evidence.term_grace_ms = 0;
+            evidence.reap_grace_ms = Some(duration_ms(LOCAL_LAUNCH_FAILURE_REAP_GRACE));
+            return evidence;
+        }
+    };
+    let bound = OperationBound::finite(KILL_GRACE);
+    let signal = group.send_signal(TerminationSignal::Kill, &bound);
+    let reaped = match child.wait_timeout(LOCAL_LAUNCH_FAILURE_REAP_GRACE) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(format!(
+            "child did not reap within {} seconds",
+            LOCAL_LAUNCH_FAILURE_REAP_GRACE.as_secs()
+        )),
+        Err(error) => Err(format!("failed to reap failed launch child: {error}")),
+    };
+    let mut evidence = match reaped {
+        Ok(()) => completed_cleanup(CleanupTrigger::StartupRollback, false, true, vec![signal]),
+        Err(error) => {
+            let error = initial_status_error
+                .map(|status_error| format!("{status_error}; {error}"))
+                .unwrap_or(error);
+            cleanup_error(CleanupTrigger::StartupRollback, true, vec![signal], error)
+        }
+    };
+    evidence.elapsed_ms = elapsed_ms(started);
+    evidence.status_deadline_ms = 0;
+    evidence.term_grace_ms = 0;
+    evidence.reap_grace_ms = Some(duration_ms(LOCAL_LAUNCH_FAILURE_REAP_GRACE));
+    evidence
 }
 
 fn materialize_local_launch_files(launch_files: &[LaunchFilePlan]) -> Result<(), String> {
@@ -1150,6 +1385,7 @@ fn failed_ssh_handle_delivery(
     container: Option<&str>,
     message: String,
 ) -> LaunchFailure {
+    let cleanup_started = Instant::now();
     // Order matters: stop the remote launcher first, so a docker client
     // that had not yet created the container cannot create it after an
     // early rm reported it absent, then do the final container-removal
@@ -1178,14 +1414,38 @@ fn failed_ssh_handle_delivery(
             false
         }
     };
+    let verified = removal_confirmed && process_confirmed;
+    let mut cleanup = if process_confirmed {
+        completed_cleanup(CleanupTrigger::StartupRollback, false, false, Vec::new())
+    } else {
+        cleanup_error(
+            CleanupTrigger::StartupRollback,
+            false,
+            Vec::new(),
+            process_cleanup
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(|| "remote launch cleanup was not verified".to_owned()),
+        )
+    };
+    cleanup.elapsed_ms = elapsed_ms(cleanup_started);
+    cleanup.remote_deadline_ms = Some(duration_ms(REMOTE_SERVER_CLEANUP_DEADLINE));
+    cleanup.container_removal = removal.clone();
+    cleanup.verified = verified;
+    if !verified && cleanup.error.is_none() {
+        cleanup.error = removal.as_ref().and_then(|removal| removal.error.clone());
+    }
     LaunchFailure {
         message,
-        ownership_unknown: !(removal_confirmed && process_confirmed),
-        container_removal: removal,
+        ownership_unknown: !verified,
+        container_removal: removal.map(Box::new),
+        cleanup: Some(Box::new(cleanup)),
     }
 }
 
 fn cleanup_incomplete_ssh_launch(target: &str, remote_handle: &Path) -> Result<(), String> {
+    let bound = OperationBound::finite(REMOTE_SERVER_CLEANUP_DEADLINE);
     let alive = remote_group_alive_script("$pid");
     let script = format!(
         "set +e; file={file}; if [ ! -r \"$file\" ]; then exit 4; fi; read pid expected < \"$file\" || exit 4; if [ -r /proc/$pid/stat ]; then actual=$(awk '{{print $22}}' /proc/$pid/stat) || exit 4; [ \"$actual\" = \"$expected\" ] || exit 4; elif {alive}; then exit 5; else rm -f \"$file\"; exit 0; fi; if ! {alive}; then rm -f \"$file\"; exit 0; fi; kill -TERM -- -$pid; i=0; while {alive} && [ $i -lt {term_limit} ]; do sleep 0.1; i=$((i+1)); done; if {alive}; then kill -KILL -- -$pid; i=0; while {alive} && [ $i -lt {kill_limit} ]; do sleep 0.1; i=$((i+1)); done; fi; if {alive}; then exit 6; fi; rm -f \"$file\"",
@@ -1193,7 +1453,7 @@ fn cleanup_incomplete_ssh_launch(target: &str, remote_handle: &Path) -> Result<(
         term_limit = TERM_POLL_LIMIT,
         kill_limit = KILL_POLL_LIMIT,
     );
-    let output = ssh_output(target, &script)?;
+    let output = run_cleanup_command(&ssh_argv(target, &script), &bound, "SSH launch cleanup")?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1235,37 +1495,61 @@ fn render_env_command(command: &CommandPlan) -> Result<String, String> {
 
 fn ensure_alive(status: ProcessStatus) -> Result<(), ReadinessFailure> {
     if !status.queried {
-        return Err(ReadinessFailure {
-            kind: ReadinessFailureKind::Exited,
-            message: status
+        return Err(readiness_failure(
+            ReadinessFailureKind::Exited,
+            status
                 .error
                 .unwrap_or_else(|| "failed to query server process group".to_owned()),
-        });
+        ));
     }
     if !status.alive {
-        return Err(ReadinessFailure {
-            kind: ReadinessFailureKind::Exited,
-            message: status
+        return Err(readiness_failure(
+            ReadinessFailureKind::Exited,
+            status
                 .error
                 .unwrap_or_else(|| "server process group exited before readiness".to_owned()),
-        });
+        ));
     }
     Ok(())
 }
 
-fn wait_http_ready<R: ProcessRuntime>(
+fn readiness_failure(kind: ReadinessFailureKind, message: String) -> ReadinessFailure {
+    ReadinessFailure {
+        kind,
+        message,
+        timing: None,
+        diagnostic_attempts: Vec::new(),
+    }
+}
+
+fn timed_readiness_failure(
+    mut failure: ReadinessFailure,
+    bound: &OperationBound,
+    terminal_cause: OperationTerminalCause,
+    diagnostic_attempts: Vec<ReadinessAttemptEvidence>,
+) -> ReadinessFailure {
+    failure.timing = Some(bound.timing("before_readiness_wait", terminal_cause));
+    failure.diagnostic_attempts = diagnostic_attempts;
+    failure
+}
+
+fn wait_http_ready<R: ProcessObserver>(
     runtime: &R,
     handle: &ProcessHandle,
     endpoint: &EndpointPlan,
     path: &str,
     timeout_seconds: Option<u64>,
+    on_probe_failure: &mut dyn FnMut(&str),
 ) -> Result<ReadinessEvidence, ReadinessFailure> {
     // A capture-armed server carries no readiness deadline
     // ([[RFC-0004:C-WORKLOAD-PROFILING]]); the loop still terminates on
     // readiness, process-group exit, or interruption.
-    let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    let bound = timeout_seconds
+        .map(|seconds| OperationBound::finite(Duration::from_secs(seconds)))
+        .unwrap_or_else(OperationBound::unbounded);
     let url = format!("http://{}:{}{}", endpoint.host, endpoint.port, path);
     let mut attempts = 0_u32;
+    let mut diagnostic_attempts = Vec::new();
     // The probe cadence backs off from POLL_INTERVAL to a cap: sub-second
     // detection for ordinary startups without tens of thousands of no-op
     // probes across a capture-armed unbounded wait. The sleep is clamped to
@@ -1273,40 +1557,127 @@ fn wait_http_ready<R: ProcessRuntime>(
     // interval.
     let mut probe_interval = POLL_INTERVAL;
     loop {
+        ensure_readiness_active(&bound, timeout_seconds, "no readiness probe completed").map_err(
+            |failure| {
+                timed_readiness_failure(
+                    failure,
+                    &bound,
+                    OperationTerminalCause::TimedOut,
+                    diagnostic_attempts.clone(),
+                )
+            },
+        )?;
         if interrupt::received() {
-            return Err(ReadinessFailure {
-                kind: ReadinessFailureKind::Interrupted,
-                message: "server startup was interrupted".to_owned(),
-            });
+            return Err(timed_readiness_failure(
+                readiness_failure(
+                    ReadinessFailureKind::Interrupted,
+                    "server startup was interrupted".to_owned(),
+                ),
+                &bound,
+                OperationTerminalCause::Interrupted,
+                diagnostic_attempts,
+            ));
         }
-        ensure_alive(runtime.status(handle))?;
+        let status = runtime.status_with_bound(handle, &bound);
+        ensure_readiness_active(
+            &bound,
+            timeout_seconds,
+            "the server process status attempt did not complete in time",
+        )
+        .map_err(|failure| {
+            timed_readiness_failure(
+                failure,
+                &bound,
+                OperationTerminalCause::TimedOut,
+                diagnostic_attempts.clone(),
+            )
+        })?;
+        if interrupt::received() {
+            return Err(timed_readiness_failure(
+                readiness_failure(
+                    ReadinessFailureKind::Interrupted,
+                    "server startup was interrupted".to_owned(),
+                ),
+                &bound,
+                OperationTerminalCause::Interrupted,
+                diagnostic_attempts,
+            ));
+        }
+        ensure_alive(status).map_err(|failure| {
+            timed_readiness_failure(
+                failure,
+                &bound,
+                OperationTerminalCause::Failed,
+                diagnostic_attempts.clone(),
+            )
+        })?;
         attempts = attempts.saturating_add(1);
-        let last_error = match probe_http(&endpoint.host, endpoint.port, path) {
+        let attempt = probe_http_attempt(&endpoint.host, endpoint.port, path, &bound);
+        let effective_bound_ms = attempt.effective_bound_ms;
+        let last_error = match attempt.outcome {
             Ok(()) => {
+                diagnostic_attempts = vec![ReadinessAttemptEvidence {
+                    operation: "http_readiness".to_owned(),
+                    effective_bound_ms,
+                    succeeded: true,
+                    error: None,
+                }];
+                let ready_unix_ms = unix_time_millis().map_err(|failure| {
+                    timed_readiness_failure(
+                        failure,
+                        &bound,
+                        OperationTerminalCause::Failed,
+                        diagnostic_attempts.clone(),
+                    )
+                })?;
+                ensure_readiness_active(
+                    &bound,
+                    timeout_seconds,
+                    "the readiness response completed after the deadline",
+                )
+                .map_err(|failure| {
+                    timed_readiness_failure(
+                        failure,
+                        &bound,
+                        OperationTerminalCause::TimedOut,
+                        diagnostic_attempts.clone(),
+                    )
+                })?;
                 return Ok(ReadinessEvidence::Http {
                     url,
                     attempts,
-                    ready_unix_ms: unix_time_millis()?,
+                    ready_unix_ms,
+                    timing: bound
+                        .timing("before_readiness_wait", OperationTerminalCause::Succeeded),
+                    diagnostic_attempts,
                 });
             }
-            Err(error) => error,
+            Err(error) => {
+                diagnostic_attempts = vec![ReadinessAttemptEvidence {
+                    operation: "http_readiness".to_owned(),
+                    effective_bound_ms,
+                    succeeded: false,
+                    error: Some(error.clone()),
+                }];
+                error
+            }
         };
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline
-        {
+        on_probe_failure(&last_error);
+        if bound.is_expired() {
             let timeout_seconds = timeout_seconds.unwrap_or_default();
-            return Err(ReadinessFailure {
-                kind: ReadinessFailureKind::Timeout,
-                message: format!(
-                    "server did not become ready within {timeout_seconds} seconds; last probe error: {last_error}"
+            return Err(timed_readiness_failure(
+                readiness_failure(
+                    ReadinessFailureKind::Timeout,
+                    format!(
+                        "server did not become ready within {timeout_seconds} seconds; last probe error: {last_error}"
+                    ),
                 ),
-            });
+                &bound,
+                OperationTerminalCause::TimedOut,
+                diagnostic_attempts,
+            ));
         }
-        let mut sleep = probe_interval;
-        if let Some(deadline) = deadline {
-            sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));
-        }
-        thread::sleep(sleep);
+        sleep_within_readiness(&bound, probe_interval);
         probe_interval = (probe_interval * 2).min(MAX_PROBE_INTERVAL);
     }
 }
@@ -1322,13 +1693,51 @@ struct HttpTargetRegistryProbe<'a> {
     expected_targets: &'a [TargetRegistryExpectedTarget],
 }
 
+fn sleep_within_readiness(bound: &OperationBound, cadence: Duration) {
+    match bound.remaining() {
+        Remaining::Finite(remaining) => thread::sleep(cadence.min(remaining)),
+        Remaining::Expired => {}
+        Remaining::Unbounded => thread::sleep(cadence),
+    }
+}
+
+fn ensure_readiness_active(
+    bound: &OperationBound,
+    timeout_seconds: Option<u64>,
+    last_error: &str,
+) -> Result<(), ReadinessFailure> {
+    if !bound.is_expired() {
+        return Ok(());
+    }
+    Err(readiness_failure(
+        ReadinessFailureKind::Timeout,
+        format!(
+            "server did not become ready within {} seconds; last probe error: {last_error}",
+            timeout_seconds.unwrap_or_default()
+        ),
+    ))
+}
+
+fn attempt_remaining(attempt: &AttemptBound) -> Result<Duration, String> {
+    match attempt.remaining() {
+        Remaining::Finite(remaining) => Ok(remaining),
+        Remaining::Expired => Err("readiness operation deadline expired".to_owned()),
+        Remaining::Unbounded => {
+            Err("bounded readiness attempt was unexpectedly unbounded".to_owned())
+        }
+    }
+}
+
 fn wait_http_target_registry_ready(
-    status: impl Fn() -> ProcessStatus,
+    status: impl Fn(&OperationBound) -> ProcessStatus,
     endpoint: &EndpointPlan,
     probe: HttpTargetRegistryProbe<'_>,
     timeout_seconds: Option<u64>,
+    on_probe_failure: &mut dyn FnMut(&str),
 ) -> Result<ReadinessEvidence, ReadinessFailure> {
-    let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    let bound = timeout_seconds
+        .map(|seconds| OperationBound::finite(Duration::from_secs(seconds)))
+        .unwrap_or_else(OperationBound::unbounded);
     let readiness_url = format!(
         "http://{}:{}{}",
         endpoint.host, endpoint.port, probe.readiness_path
@@ -1338,57 +1747,193 @@ fn wait_http_target_registry_ready(
         endpoint.host, endpoint.port, probe.registry_path
     );
     let mut attempts = 0_u32;
+    let mut diagnostic_attempts = Vec::new();
     let mut probe_interval = POLL_INTERVAL;
     loop {
-        if interrupt::received() {
-            return Err(ReadinessFailure {
-                kind: ReadinessFailureKind::Interrupted,
-                message: "server startup was interrupted".to_owned(),
-            });
-        }
-        ensure_alive(status())?;
-        attempts = attempts.saturating_add(1);
-        let last_error = match probe_http(&endpoint.host, endpoint.port, probe.readiness_path) {
-            Ok(()) => match probe_target_registry(&endpoint.host, endpoint.port, &probe) {
-                Ok(matched_targets) => {
-                    return Ok(ReadinessEvidence::HttpTargetRegistry {
-                        readiness_url,
-                        registry_url,
-                        attempts,
-                        ready_unix_ms: unix_time_millis()?,
-                        matched_targets,
-                    });
-                }
-                Err(error) => error,
+        ensure_readiness_active(&bound, timeout_seconds, "no readiness probe completed").map_err(
+            |failure| {
+                timed_readiness_failure(
+                    failure,
+                    &bound,
+                    OperationTerminalCause::TimedOut,
+                    diagnostic_attempts.clone(),
+                )
             },
-            Err(error) => format!("public readiness probe failed: {error}"),
-        };
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline
-        {
-            let timeout_seconds = timeout_seconds.unwrap_or_default();
-            return Err(ReadinessFailure {
-                kind: ReadinessFailureKind::Timeout,
-                message: format!(
-                    "server did not become ready within {timeout_seconds} seconds; last probe error: {last_error}"
+        )?;
+        if interrupt::received() {
+            return Err(timed_readiness_failure(
+                readiness_failure(
+                    ReadinessFailureKind::Interrupted,
+                    "server startup was interrupted".to_owned(),
                 ),
-            });
+                &bound,
+                OperationTerminalCause::Interrupted,
+                diagnostic_attempts,
+            ));
         }
-        let mut sleep = probe_interval;
-        if let Some(deadline) = deadline {
-            sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));
+        let process_status = status(&bound);
+        ensure_readiness_active(
+            &bound,
+            timeout_seconds,
+            "the server process status attempt did not complete in time",
+        )
+        .map_err(|failure| {
+            timed_readiness_failure(
+                failure,
+                &bound,
+                OperationTerminalCause::TimedOut,
+                diagnostic_attempts.clone(),
+            )
+        })?;
+        if interrupt::received() {
+            return Err(timed_readiness_failure(
+                readiness_failure(
+                    ReadinessFailureKind::Interrupted,
+                    "server startup was interrupted".to_owned(),
+                ),
+                &bound,
+                OperationTerminalCause::Interrupted,
+                diagnostic_attempts,
+            ));
         }
-        thread::sleep(sleep);
+        ensure_alive(process_status).map_err(|failure| {
+            timed_readiness_failure(
+                failure,
+                &bound,
+                OperationTerminalCause::Failed,
+                diagnostic_attempts.clone(),
+            )
+        })?;
+        attempts = attempts.saturating_add(1);
+        let public_attempt =
+            probe_http_attempt(&endpoint.host, endpoint.port, probe.readiness_path, &bound);
+        let public_effective_bound_ms = public_attempt.effective_bound_ms;
+        let last_error = match public_attempt.outcome {
+            Ok(()) => {
+                let registry_attempt =
+                    probe_target_registry_attempt(&endpoint.host, endpoint.port, &probe, &bound);
+                let registry_effective_bound_ms = registry_attempt.effective_bound_ms;
+                match registry_attempt.outcome {
+                    Ok(matched_targets) => {
+                        diagnostic_attempts = vec![
+                            ReadinessAttemptEvidence {
+                                operation: "public_http_readiness".to_owned(),
+                                effective_bound_ms: public_effective_bound_ms,
+                                succeeded: true,
+                                error: None,
+                            },
+                            ReadinessAttemptEvidence {
+                                operation: "target_registry".to_owned(),
+                                effective_bound_ms: registry_effective_bound_ms,
+                                succeeded: true,
+                                error: None,
+                            },
+                        ];
+                        let ready_unix_ms = unix_time_millis().map_err(|failure| {
+                            timed_readiness_failure(
+                                failure,
+                                &bound,
+                                OperationTerminalCause::Failed,
+                                diagnostic_attempts.clone(),
+                            )
+                        })?;
+                        ensure_readiness_active(
+                            &bound,
+                            timeout_seconds,
+                            "the target registry response completed after the deadline",
+                        )
+                        .map_err(|failure| {
+                            timed_readiness_failure(
+                                failure,
+                                &bound,
+                                OperationTerminalCause::TimedOut,
+                                diagnostic_attempts.clone(),
+                            )
+                        })?;
+                        return Ok(ReadinessEvidence::HttpTargetRegistry {
+                            readiness_url,
+                            registry_url,
+                            attempts,
+                            ready_unix_ms,
+                            matched_targets,
+                            timing: bound
+                                .timing("before_readiness_wait", OperationTerminalCause::Succeeded),
+                            diagnostic_attempts,
+                        });
+                    }
+                    Err(error) => {
+                        diagnostic_attempts = vec![
+                            ReadinessAttemptEvidence {
+                                operation: "public_http_readiness".to_owned(),
+                                effective_bound_ms: public_effective_bound_ms,
+                                succeeded: true,
+                                error: None,
+                            },
+                            ReadinessAttemptEvidence {
+                                operation: "target_registry".to_owned(),
+                                effective_bound_ms: registry_effective_bound_ms,
+                                succeeded: false,
+                                error: Some(error.clone()),
+                            },
+                        ];
+                        error
+                    }
+                }
+            }
+            Err(error) => {
+                diagnostic_attempts = vec![ReadinessAttemptEvidence {
+                    operation: "public_http_readiness".to_owned(),
+                    effective_bound_ms: public_effective_bound_ms,
+                    succeeded: false,
+                    error: Some(error.clone()),
+                }];
+                format!("public readiness probe failed: {error}")
+            }
+        };
+        on_probe_failure(&last_error);
+        if bound.is_expired() {
+            let timeout_seconds = timeout_seconds.unwrap_or_default();
+            return Err(timed_readiness_failure(
+                readiness_failure(
+                    ReadinessFailureKind::Timeout,
+                    format!(
+                        "server did not become ready within {timeout_seconds} seconds; last probe error: {last_error}"
+                    ),
+                ),
+                &bound,
+                OperationTerminalCause::TimedOut,
+                diagnostic_attempts,
+            ));
+        }
+        sleep_within_readiness(&bound, probe_interval);
         probe_interval = (probe_interval * 2).min(MAX_PROBE_INTERVAL);
     }
 }
 
-fn probe_target_registry(
+fn probe_target_registry_attempt(
     host: &str,
     port: u16,
     probe: &HttpTargetRegistryProbe<'_>,
+    bound: &OperationBound,
+) -> ProbeAttempt<Vec<TargetRegistryMatchEvidence>> {
+    let response =
+        probe_http_json_attempt(host, port, probe.registry_path, "target registry", bound);
+    let effective_bound_ms = response.effective_bound_ms;
+    let outcome = response
+        .outcome
+        .and_then(|response| match_target_registry(&response, probe, bound));
+    ProbeAttempt {
+        effective_bound_ms,
+        outcome,
+    }
+}
+
+fn match_target_registry(
+    response: &serde_json::Value,
+    probe: &HttpTargetRegistryProbe<'_>,
+    bound: &OperationBound,
 ) -> Result<Vec<TargetRegistryMatchEvidence>, String> {
-    let response = probe_http_json(host, port, probe.registry_path, "target registry")?;
+    readiness_remaining(bound)?;
     let targets = response
         .get(probe.targets_field)
         .and_then(serde_json::Value::as_array)
@@ -1400,6 +1945,7 @@ fn probe_target_registry(
         })?;
     let mut evidence = Vec::with_capacity(probe.expected_targets.len());
     for expected in probe.expected_targets {
+        readiness_remaining(bound)?;
         let matches: Vec<&serde_json::Map<String, serde_json::Value>> = targets
             .iter()
             .filter_map(serde_json::Value::as_object)
@@ -1471,119 +2017,253 @@ fn probe_target_registry(
             bootstrap_port,
         });
     }
+    readiness_remaining(bound)?;
     Ok(evidence)
 }
 
-fn probe_http(host: &str, port: u16, path: &str) -> Result<(), String> {
-    let address = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("failed to resolve readiness endpoint: {error}"))?
-        .next()
-        .ok_or_else(|| "readiness endpoint did not resolve to an address".to_owned())?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250))
-        .map_err(|error| format!("readiness connection failed: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to configure readiness read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to configure readiness write timeout: {error}"))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|error| format!("failed to write readiness request: {error}"))?;
-    let mut status_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut status_line)
-        .map_err(|error| format!("failed to read readiness response: {error}"))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| format!("invalid readiness HTTP status line {status_line:?}"))?;
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(format!("readiness returned HTTP {status}"))
+struct ProbeAttempt<T> {
+    effective_bound_ms: u64,
+    outcome: Result<T, String>,
+}
+
+#[cfg(test)]
+fn probe_http(host: &str, port: u16, path: &str, bound: &OperationBound) -> Result<(), String> {
+    probe_http_attempt(host, port, path, bound).outcome
+}
+
+fn probe_http_attempt(
+    host: &str,
+    port: u16,
+    path: &str,
+    bound: &OperationBound,
+) -> ProbeAttempt<()> {
+    let attempt = bound.attempt(Some(READINESS_ATTEMPT_CAP));
+    let effective_bound_ms = attempt.configured_ms().unwrap_or_default();
+    let outcome = (|| {
+        let address = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| format!("failed to resolve readiness endpoint: {error}"))?
+            .next()
+            .ok_or_else(|| "readiness endpoint did not resolve to an address".to_owned())?;
+        let mut stream = TcpStream::connect_timeout(&address, attempt_remaining(&attempt)?)
+            .map_err(|error| format!("readiness connection failed: {error}"))?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+        write_within_attempt(&mut stream, &attempt, request.as_bytes(), "readiness")?;
+        let response = read_within_attempt(&mut stream, &attempt, true, "readiness")?;
+        let status_line = String::from_utf8(response)
+            .map_err(|error| format!("readiness returned a non-UTF-8 status line: {error}"))?;
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| format!("invalid readiness HTTP status line {status_line:?}"))?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(format!("readiness returned HTTP {status}"))
+        }
+    })();
+    ProbeAttempt {
+        effective_bound_ms,
+        outcome,
     }
 }
 
+#[cfg(test)]
 fn probe_http_json(
     host: &str,
     port: u16,
     path: &str,
     label: &str,
+    bound: &OperationBound,
 ) -> Result<serde_json::Value, String> {
-    let address = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("failed to resolve {label} endpoint: {error}"))?
-        .next()
-        .ok_or_else(|| format!("{label} endpoint did not resolve to an address"))?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250))
-        .map_err(|error| format!("{label} connection failed: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to configure {label} read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(250)))
-        .map_err(|error| format!("failed to configure {label} write timeout: {error}"))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|error| format!("failed to write {label} request: {error}"))?;
-    let mut response = Vec::new();
-    BufReader::new(stream)
-        .read_to_end(&mut response)
-        .map_err(|error| format!("failed to read {label} response: {error}"))?;
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| format!("{label} returned an invalid HTTP response"))?;
-    let headers = std::str::from_utf8(&response[..header_end])
-        .map_err(|error| format!("{label} returned non-UTF-8 HTTP headers: {error}"))?;
-    let status_line = headers.lines().next().unwrap_or_default();
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| format!("invalid {label} HTTP status line {status_line:?}"))?;
-    if !(200..300).contains(&status) {
-        return Err(format!("{label} returned HTTP {status}"));
+    probe_http_json_attempt(host, port, path, label, bound).outcome
+}
+
+fn probe_http_json_attempt(
+    host: &str,
+    port: u16,
+    path: &str,
+    label: &str,
+    bound: &OperationBound,
+) -> ProbeAttempt<serde_json::Value> {
+    let attempt = bound.attempt(Some(READINESS_ATTEMPT_CAP));
+    let effective_bound_ms = attempt.configured_ms().unwrap_or_default();
+    let outcome = (|| {
+        let address = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| format!("failed to resolve {label} endpoint: {error}"))?
+            .next()
+            .ok_or_else(|| format!("{label} endpoint did not resolve to an address"))?;
+        let mut stream = TcpStream::connect_timeout(&address, attempt_remaining(&attempt)?)
+            .map_err(|error| format!("{label} connection failed: {error}"))?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+        write_within_attempt(&mut stream, &attempt, request.as_bytes(), label)?;
+        let response = read_within_attempt(&mut stream, &attempt, false, label)?;
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| format!("{label} returned an invalid HTTP response"))?;
+        let headers = std::str::from_utf8(&response[..header_end])
+            .map_err(|error| format!("{label} returned non-UTF-8 HTTP headers: {error}"))?;
+        let status_line = headers.lines().next().unwrap_or_default();
+        let status = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| format!("invalid {label} HTTP status line {status_line:?}"))?;
+        if !(200..300).contains(&status) {
+            return Err(format!("{label} returned HTTP {status}"));
+        }
+        let value = serde_json::from_slice(&response[header_end + 4..])
+            .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
+        readiness_remaining(bound)?;
+        Ok(value)
+    })();
+    ProbeAttempt {
+        effective_bound_ms,
+        outcome,
     }
-    serde_json::from_slice(&response[header_end + 4..])
-        .map_err(|error| format!("{label} returned invalid JSON: {error}"))
+}
+
+fn read_within_attempt(
+    stream: &mut TcpStream,
+    attempt: &AttemptBound,
+    stop_at_newline: bool,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        stream
+            .set_read_timeout(Some(attempt_remaining(attempt)?))
+            .map_err(|error| format!("failed to configure {label} read timeout: {error}"))?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err("readiness operation deadline expired".to_owned());
+            }
+            Err(error) => return Err(format!("failed to read {label} response: {error}")),
+        };
+        attempt_remaining(attempt)?;
+        if read == 0 {
+            return Ok(response);
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if stop_at_newline && response.contains(&b'\n') {
+            return Ok(response);
+        }
+    }
+}
+
+fn write_within_attempt(
+    stream: &mut TcpStream,
+    attempt: &AttemptBound,
+    mut request: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    while !request.is_empty() {
+        stream
+            .set_write_timeout(Some(attempt_remaining(attempt)?))
+            .map_err(|error| format!("failed to configure {label} write timeout: {error}"))?;
+        let written = match stream.write(request) {
+            Ok(0) => {
+                return Err(format!(
+                    "failed to write {label} request: connection closed"
+                ));
+            }
+            Ok(written) => written,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err("readiness operation deadline expired".to_owned());
+            }
+            Err(error) => return Err(format!("failed to write {label} request: {error}")),
+        };
+        attempt_remaining(attempt)?;
+        request = &request[written..];
+    }
+    Ok(())
+}
+
+fn readiness_remaining(bound: &OperationBound) -> Result<(), String> {
+    match bound.remaining() {
+        Remaining::Expired => Err("readiness operation deadline expired".to_owned()),
+        Remaining::Finite(_) | Remaining::Unbounded => Ok(()),
+    }
 }
 
 fn terminate_local(handle: &HostProcessHandle, trigger: CleanupTrigger) -> CleanupEvidence {
-    let status = verified_local_status(handle);
-    if !status.queried {
-        return CleanupEvidence::unavailable(
-            trigger,
-            status
-                .error
-                .unwrap_or_else(|| "failed to verify process-group identity".to_owned()),
-        );
+    let started = Instant::now();
+    if let Err(error) = handle.validate() {
+        let mut evidence = CleanupEvidence::unavailable(trigger, error);
+        evidence.elapsed_ms = elapsed_ms(started);
+        return evidence;
     }
-    if !status.alive {
-        return completed_cleanup(trigger, true, false, Vec::new());
-    }
-    let mut signals = vec![send_local_signal(
-        TerminationSignal::Term,
+    let group = match LocalProcessGroup::new(
+        handle.leader_pid,
         handle.process_group,
-    )];
-    match wait_until_local_stopped(handle, TERM_GRACE) {
+        handle.leader_start_time_ticks,
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            let mut evidence = CleanupEvidence::unavailable(trigger, error);
+            evidence.elapsed_ms = elapsed_ms(started);
+            return evidence;
+        }
+    };
+    let status_bound = OperationBound::finite(SERVER_CLEANUP_STATUS_DEADLINE);
+    match group.verified_status(&status_bound) {
+        Ok(VerifiedStatus::Alive) => {}
+        Ok(VerifiedStatus::Exited | VerifiedStatus::Reused) => {
+            let mut evidence = completed_cleanup(trigger, true, false, Vec::new());
+            evidence.elapsed_ms = elapsed_ms(started);
+            return evidence;
+        }
+        Ok(VerifiedStatus::LeaderMissingWithMembers) => {
+            let mut evidence = CleanupEvidence::unavailable(
+                trigger,
+                format!(
+                    "process-group {} still has members but recorded leader {} no longer exists; ownership cannot be verified",
+                    handle.process_group, handle.leader_pid
+                ),
+            );
+            evidence.elapsed_ms = elapsed_ms(started);
+            return evidence;
+        }
+        Err(error) => {
+            let mut evidence = CleanupEvidence::unavailable(trigger, error);
+            evidence.elapsed_ms = elapsed_ms(started);
+            return evidence;
+        }
+    }
+    let term_bound = OperationBound::finite(TERM_GRACE);
+    let mut signals = vec![group.send_signal(TerminationSignal::Term, &term_bound)];
+    let mut evidence = match group.wait_until_stopped(None, &term_bound, POLL_INTERVAL) {
         Ok(true) => completed_cleanup(trigger, false, false, signals),
         Ok(false) => {
-            signals.push(send_local_signal(
-                TerminationSignal::Kill,
-                handle.process_group,
-            ));
-            match wait_until_local_stopped(handle, KILL_GRACE) {
+            let kill_bound = OperationBound::finite(KILL_GRACE);
+            signals.push(group.send_signal(TerminationSignal::Kill, &kill_bound));
+            match group.wait_until_stopped(None, &kill_bound, POLL_INTERVAL) {
                 Ok(true) => completed_cleanup(trigger, false, true, signals),
                 Ok(false) => CleanupEvidence {
                     trigger,
+                    elapsed_ms: 0,
+                    status_deadline_ms: duration_ms(SERVER_CLEANUP_STATUS_DEADLINE),
+                    term_grace_ms: duration_ms(TERM_GRACE),
+                    kill_grace_ms: duration_ms(KILL_GRACE),
+                    reap_grace_ms: None,
+                    remote_deadline_ms: None,
                     verified: false,
                     already_exited: false,
                     forced: true,
@@ -1598,10 +2278,25 @@ fn terminate_local(handle: &HostProcessHandle, trigger: CleanupTrigger) -> Clean
             }
         }
         Err(error) => cleanup_error(trigger, false, signals, error),
-    }
+    };
+    evidence.elapsed_ms = elapsed_ms(started);
+    evidence
 }
 
 fn terminate_ssh(handle: &SshProcessHandle, trigger: CleanupTrigger) -> CleanupEvidence {
+    let started = Instant::now();
+    let bound = OperationBound::finite(REMOTE_SERVER_CLEANUP_DEADLINE);
+    let mut evidence = terminate_ssh_under(handle, trigger, &bound);
+    evidence.elapsed_ms = elapsed_ms(started);
+    evidence.remote_deadline_ms = Some(duration_ms(REMOTE_SERVER_CLEANUP_DEADLINE));
+    evidence
+}
+
+fn terminate_ssh_under(
+    handle: &SshProcessHandle,
+    trigger: CleanupTrigger,
+    bound: &OperationBound,
+) -> CleanupEvidence {
     let script = format!(
         "set +e; pgid={}; pid={}; expected={}; if [ -r /proc/$pid/stat ]; then actual=$(awk '{{print $22}}' /proc/$pid/stat); if [ $? -ne 0 ]; then printf 'INFERLAB_CLEANUP\\tunknown\\t-\\t0\\t-\\t1\\tstat-unreadable\\n'; exit 0; fi; if [ \"$actual\" != \"$expected\" ]; then printf 'INFERLAB_CLEANUP\\tstale\\t-\\t0\\t-\\t0\\t%s\\n' \"$actual\"; exit 0; fi; elif {}; then printf 'INFERLAB_CLEANUP\\tunknown\\t-\\t0\\t-\\t1\\tleader-missing\\n'; exit 0; else printf 'INFERLAB_CLEANUP\\talready\\t-\\t0\\t-\\t0\\t-\\n'; exit 0; fi; if ! {}; then printf 'INFERLAB_CLEANUP\\talready\\t-\\t0\\t-\\t0\\t-\\n'; exit 0; fi; kill -TERM -- -$pgid; term_code=$?; i=0; while {} && [ $i -lt {term_limit} ]; do sleep 0.1; i=$((i+1)); done; forced=0; kill_code=-; if {}; then forced=1; kill -KILL -- -$pgid; kill_code=$?; i=0; while {} && [ $i -lt {kill_limit} ]; do sleep 0.1; i=$((i+1)); done; fi; alive=0; if {}; then alive=1; fi; printf 'INFERLAB_CLEANUP\\tcleanup\\t%s\\t%s\\t%s\\t%s\\t-\\n' \"$term_code\" \"$forced\" \"$kill_code\" \"$alive\"",
         handle.process_group,
@@ -1616,7 +2311,11 @@ fn terminate_ssh(handle: &SshProcessHandle, trigger: CleanupTrigger) -> CleanupE
         term_limit = TERM_POLL_LIMIT,
         kill_limit = KILL_POLL_LIMIT,
     );
-    match ssh_output(&handle.target, &script) {
+    match run_cleanup_command(
+        &ssh_argv(&handle.target, &script),
+        bound,
+        "SSH process cleanup",
+    ) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let Some(result) = parse_cleanup_output(&stdout) else {
@@ -1707,15 +2406,28 @@ fn terminate_ssh(handle: &SshProcessHandle, trigger: CleanupTrigger) -> CleanupE
 /// onto this record's evidence shape.
 fn remove_server_container(target: Option<&str>, container: &str) -> ContainerRemovalEvidence {
     use crate::container::{Removal, RemovalFailure, remove_container};
+    let started = Instant::now();
     let evidence =
-        |confirmed: bool, already_absent: bool, error: Option<String>| ContainerRemovalEvidence {
-            container: container.to_owned(),
-            confirmed,
-            already_absent,
-            error,
+        |confirmed: bool,
+         already_absent: bool,
+         error: Option<String>,
+         operation_elapsed_ms: u64,
+         client_cleanup: Option<crate::container::CommandCleanupEvidence>| {
+            ContainerRemovalEvidence {
+                container: container.to_owned(),
+                elapsed_ms: elapsed_ms(started),
+                operation_elapsed_ms,
+                deadline_ms: duration_ms(crate::container::REMOVAL_TIMEOUT),
+                client_cleanup,
+                confirmed,
+                already_absent,
+                error,
+            }
         };
     match remove_container(target, container) {
-        Removal::Confirmed { already_absent } => evidence(true, already_absent, None),
+        Removal::Confirmed { already_absent } => {
+            evidence(true, already_absent, None, elapsed_ms(started), None)
+        }
         Removal::Unconfirmed(RemovalFailure::Exit { status, stderr }) => evidence(
             false,
             false,
@@ -1723,26 +2435,50 @@ fn remove_server_container(target: Option<&str>, container: &str) -> ContainerRe
                 "docker rm -f exited with {status}: {}",
                 stderr.trim()
             )),
+            elapsed_ms(started),
+            None,
         ),
-        Removal::Unconfirmed(RemovalFailure::Deadline) => evidence(
+        Removal::Unconfirmed(RemovalFailure::Deadline {
+            operation_elapsed_ms,
+            client_cleanup,
+        }) => evidence(
             false,
             false,
             Some(format!(
                 "docker rm -f {container} exceeded its {}s deadline",
                 crate::container::REMOVAL_TIMEOUT.as_secs()
             )),
+            operation_elapsed_ms,
+            client_cleanup,
         ),
         Removal::Unconfirmed(RemovalFailure::Launch(error)) => evidence(
             false,
             false,
             Some(format!("docker rm failed to launch: {error}")),
+            elapsed_ms(started),
+            None,
         ),
         Removal::Unconfirmed(RemovalFailure::Wait(error)) => evidence(
             false,
             false,
             Some(format!("docker rm wait failed: {error}")),
+            elapsed_ms(started),
+            None,
         ),
-        Removal::Unconfirmed(RemovalFailure::Ssh(error)) => evidence(false, false, Some(error)),
+        Removal::Unconfirmed(RemovalFailure::WaitCleanup {
+            source,
+            operation_elapsed_ms,
+            client_cleanup,
+        }) => evidence(
+            false,
+            false,
+            Some(format!("docker rm wait failed: {source}")),
+            operation_elapsed_ms,
+            Some(client_cleanup),
+        ),
+        Removal::Unconfirmed(RemovalFailure::Ssh(error)) => {
+            evidence(false, false, Some(error), elapsed_ms(started), None)
+        }
     }
 }
 
@@ -1754,6 +2490,12 @@ fn completed_cleanup(
 ) -> CleanupEvidence {
     CleanupEvidence {
         trigger,
+        elapsed_ms: 0,
+        status_deadline_ms: duration_ms(SERVER_CLEANUP_STATUS_DEADLINE),
+        term_grace_ms: duration_ms(TERM_GRACE),
+        kill_grace_ms: duration_ms(KILL_GRACE),
+        reap_grace_ms: None,
+        remote_deadline_ms: None,
         verified: true,
         already_exited,
         forced,
@@ -1771,6 +2513,12 @@ fn cleanup_error(
 ) -> CleanupEvidence {
     CleanupEvidence {
         trigger,
+        elapsed_ms: 0,
+        status_deadline_ms: duration_ms(SERVER_CLEANUP_STATUS_DEADLINE),
+        term_grace_ms: duration_ms(TERM_GRACE),
+        kill_grace_ms: duration_ms(KILL_GRACE),
+        reap_grace_ms: None,
+        remote_deadline_ms: None,
         verified: false,
         already_exited: false,
         forced,
@@ -1778,6 +2526,14 @@ fn cleanup_error(
         error: Some(error),
         container_removal: None,
     }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    duration_ms(started.elapsed())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 enum RemoteCleanupState {
@@ -1845,47 +2601,22 @@ fn remote_signal_evidence(
     }
 }
 
-fn send_local_signal(signal: TerminationSignal, process_group: u32) -> SignalEvidence {
-    let signal_argument = match signal {
-        TerminationSignal::Term => "-TERM",
-        TerminationSignal::Kill => "-KILL",
-    };
-    let target = format!("-{process_group}");
-    match Command::new("kill")
-        .args([signal_argument, "--", &target])
-        .output()
-    {
-        Ok(output) => SignalEvidence {
-            signal,
-            process_group,
-            exit_code: output.status.code(),
-            stderr: Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
-            error: None,
-        },
-        Err(error) => SignalEvidence {
-            signal,
-            process_group,
-            exit_code: None,
-            stderr: None,
-            error: Some(error.to_string()),
-        },
-    }
-}
-
-fn wait_until_local_stopped(handle: &HostProcessHandle, timeout: Duration) -> Result<bool, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !process_group_has_live_members(handle.process_group)? {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
 fn verified_local_status(handle: &HostProcessHandle) -> ProcessStatus {
+    verified_local_status_under(handle, None, false)
+}
+
+fn verified_local_status_with_bound(
+    handle: &HostProcessHandle,
+    bound: &OperationBound,
+) -> ProcessStatus {
+    verified_local_status_under(handle, Some(bound), false)
+}
+
+fn verified_local_status_under(
+    handle: &HostProcessHandle,
+    bound: Option<&OperationBound>,
+    cleanup: bool,
+) -> ProcessStatus {
     if let Err(error) = handle.validate() {
         return status_error(error);
     }
@@ -1898,31 +2629,49 @@ fn verified_local_status(handle: &HostProcessHandle) -> ProcessStatus {
                 handle.leader_pid, handle.leader_start_time_ticks, actual
             )),
         },
-        Ok(Some(_)) => match process_group_has_live_members(handle.process_group) {
-            Ok(alive) => ProcessStatus {
-                queried: true,
-                alive,
-                error: None,
-            },
-            Err(error) => status_error(error),
-        },
-        Ok(None) => match process_group_has_live_members(handle.process_group) {
-            Ok(false) => ProcessStatus {
-                queried: true,
-                alive: false,
-                error: None,
-            },
-            Ok(true) => status_error(format!(
-                "process-group {} still has members but recorded leader {} no longer exists; ownership cannot be verified",
-                handle.process_group, handle.leader_pid
-            )),
-            Err(error) => status_error(error),
-        },
+        Ok(Some(_)) => {
+            match process_group_has_live_members_under(handle.process_group, bound, cleanup) {
+                Ok(alive) => ProcessStatus {
+                    queried: true,
+                    alive,
+                    error: None,
+                },
+                Err(error) => status_error(error),
+            }
+        }
+        Ok(None) => {
+            match process_group_has_live_members_under(handle.process_group, bound, cleanup) {
+                Ok(false) => ProcessStatus {
+                    queried: true,
+                    alive: false,
+                    error: None,
+                },
+                Ok(true) => status_error(format!(
+                    "process-group {} still has members but recorded leader {} no longer exists; ownership cannot be verified",
+                    handle.process_group, handle.leader_pid
+                )),
+                Err(error) => status_error(error),
+            }
+        }
         Err(error) => status_error(error),
     }
 }
 
 fn verified_ssh_status(handle: &SshProcessHandle) -> ProcessStatus {
+    verified_ssh_status_under(handle, None)
+}
+
+fn verified_ssh_status_with_bound(
+    handle: &SshProcessHandle,
+    bound: &OperationBound,
+) -> ProcessStatus {
+    verified_ssh_status_under(handle, Some(bound))
+}
+
+fn verified_ssh_status_under(
+    handle: &SshProcessHandle,
+    bound: Option<&OperationBound>,
+) -> ProcessStatus {
     if let Err(error) = handle.validate() {
         return status_error(error);
     }
@@ -1933,7 +2682,11 @@ fn verified_ssh_status(handle: &SshProcessHandle) -> ProcessStatus {
         remote_group_alive_script(&handle.process_group.to_string()),
         remote_group_alive_script(&handle.process_group.to_string()),
     );
-    match ssh_output(&handle.target, &script) {
+    let output = match bound {
+        Some(bound) => run_status_command(&ssh_argv(&handle.target, &script), bound),
+        None => ssh_output(&handle.target, &script),
+    };
+    match output {
         Ok(output) if output.status.success() => ProcessStatus {
             queried: true,
             alive: true,
@@ -1981,14 +2734,20 @@ fn remote_group_alive_script(group: &str) -> String {
     )
 }
 
-fn fetch_remote_file(target: &str, remote: &Path, local: &Path) -> Result<(), String> {
-    let output = ssh_command()
-        .arg(target)
-        .arg("cat")
-        .arg("--")
-        .arg(shell_quote_path(remote))
-        .output()
-        .map_err(|error| format!("failed to launch SSH for {target:?}: {error}"))?;
+fn fetch_remote_file(
+    target: &str,
+    remote: &Path,
+    local: &Path,
+    bound: &OperationBound,
+    cleanup: bool,
+) -> Result<(), String> {
+    let argv = ssh_argv(target, &format!("cat -- {}", shell_quote_path(remote)));
+    let output = if cleanup {
+        run_cleanup_command(&argv, bound, "remote log synchronization")
+    } else {
+        run_status_command(&argv, bound)
+    }
+    .map_err(|error| format!("failed to read remote log {}: {error}", remote.display()))?;
     if !output.status.success() {
         return Err(format!(
             "failed to read remote log {}: {}",
@@ -2098,30 +2857,20 @@ pub(crate) fn ssh_output(target: &str, script: &str) -> Result<Output, String> {
         .map_err(|error| format!("failed to launch SSH for {target:?}: {error}"))
 }
 
-pub(crate) fn process_start_time(pid: u32) -> Result<Option<u64>, String> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = match fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("failed to read {path}: {error}")),
-    };
-    let command_end = stat
-        .rfind(')')
-        .ok_or_else(|| format!("invalid process stat for pid {pid}"))?;
-    let start_time = stat[command_end + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| format!("process stat for pid {pid} has no start time"))?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid process start time for pid {pid}: {error}"))?;
-    Ok(Some(start_time))
-}
-
-fn process_group_has_live_members(process_group: u32) -> Result<bool, String> {
-    let output = Command::new("ps")
-        .args(["-eo", "pid=,pgid=,stat="])
-        .output()
-        .map_err(|error| format!("failed to query process groups: {error}"))?;
+fn process_group_has_live_members_under(
+    process_group: u32,
+    bound: Option<&OperationBound>,
+    cleanup: bool,
+) -> Result<bool, String> {
+    let argv = ["ps", "-eo", "pid=,pgid=,stat="];
+    let output = match bound {
+        Some(bound) if cleanup => run_cleanup_command(&argv, bound, "process cleanup status"),
+        Some(bound) => run_status_command(&argv, bound),
+        None => Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+            .map_err(|error| format!("failed to query process groups: {error}")),
+    }?;
     if !output.status.success() {
         return Err(format!(
             "process-group query exited with {}: {}",
@@ -2142,13 +2891,93 @@ fn process_group_has_live_members(process_group: u32) -> Result<bool, String> {
         .any(|(group, state)| group == process_group && !state.starts_with('Z')))
 }
 
+fn run_status_command<S: AsRef<std::ffi::OsStr>>(
+    argv: &[S],
+    bound: &OperationBound,
+) -> Result<Output, String> {
+    match crate::container::run_with_bound(argv, None, None, bound, None) {
+        Ok(crate::container::BoundedWait::Exited {
+            status,
+            stdout,
+            stderr,
+        }) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(crate::container::BoundedWait::Expired { kill, .. }) => {
+            kill.map_err(|error| format!("process status cleanup failed: {error}"))?;
+            Err("process status attempt deadline expired".to_owned())
+        }
+        Ok(crate::container::BoundedWait::Interrupted { kill, .. }) => {
+            kill.map_err(|error| format!("process status cleanup failed: {error}"))?;
+            Err("process status attempt was interrupted".to_owned())
+        }
+        Err(crate::container::BoundedError::Launch(error)) => {
+            Err(format!("failed to launch process status command: {error}"))
+        }
+        Err(
+            crate::container::BoundedError::Stdin(error)
+            | crate::container::BoundedError::Wait(error),
+        ) => Err(format!("process status command failed: {error}")),
+        Err(crate::container::BoundedError::WaitCleanup { source, .. }) => {
+            Err(format!("process status command wait failed: {source}"))
+        }
+    }
+}
+
+fn run_cleanup_command<S: AsRef<std::ffi::OsStr>>(
+    argv: &[S],
+    bound: &OperationBound,
+    operation: &str,
+) -> Result<Output, String> {
+    match crate::container::run_cleanup_with_bound(argv, None, None, bound, None) {
+        Ok(crate::container::BoundedWait::Exited {
+            status,
+            stdout,
+            stderr,
+        }) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(crate::container::BoundedWait::Expired { kill, .. }) => {
+            kill.map_err(|error| format!("{operation} child cleanup failed: {error}"))?;
+            Err(format!("{operation} deadline expired"))
+        }
+        Ok(crate::container::BoundedWait::Interrupted { kill, .. }) => {
+            kill.map_err(|error| format!("{operation} child cleanup failed: {error}"))?;
+            Err(format!("{operation} was interrupted"))
+        }
+        Err(crate::container::BoundedError::Launch(error)) => {
+            Err(format!("failed to launch {operation}: {error}"))
+        }
+        Err(
+            crate::container::BoundedError::Stdin(error)
+            | crate::container::BoundedError::Wait(error),
+        ) => Err(format!("{operation} failed: {error}")),
+        Err(crate::container::BoundedError::WaitCleanup {
+            source, cleanup, ..
+        }) => Err(format!(
+            "{operation} wait failed: {source}; child cleanup: {}",
+            cleanup.error.as_deref().unwrap_or(if cleanup.verified {
+                "verified"
+            } else {
+                "unverified"
+            })
+        )),
+    }
+}
+
 fn unix_time_millis() -> Result<u64, ReadinessFailure> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
-        .map_err(|error| ReadinessFailure {
-            kind: ReadinessFailureKind::Exited,
-            message: format!("system clock is before Unix epoch: {error}"),
+        .map_err(|error| {
+            readiness_failure(
+                ReadinessFailureKind::Exited,
+                format!("system clock is before Unix epoch: {error}"),
+            )
         })
 }
 
@@ -2157,8 +2986,159 @@ mod tests {
     use super::*;
     use crate::resolve::LaunchFilePlan;
     use inferlab_protocol::EndpointProtocol;
+    use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn expired_readiness_owner_prevents_a_fresh_network_attempt() {
+        let bound = OperationBound::finite(Duration::ZERO);
+        let error = probe_http("127.0.0.1", 9, "/ready", &bound)
+            .err()
+            .unwrap_or_default();
+
+        assert_eq!(error, "readiness operation deadline expired");
+    }
+
+    #[test]
+    fn readiness_attempt_deadline_bounds_a_trickled_status_line() -> Result<(), String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!("HTTP/1.1 200 {}\r\n", " ".repeat(96));
+            for byte in response.bytes() {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        });
+
+        let started = Instant::now();
+        let error = probe_http("127.0.0.1", port, "/ready", &OperationBound::unbounded())
+            .err()
+            .unwrap_or_default();
+        let elapsed = started.elapsed();
+        server
+            .join()
+            .map_err(|_| "trickle fixture panicked".to_owned())??;
+
+        assert!(error.contains("deadline expired"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a 250ms attempt lasted {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_attempt_deadline_bounds_a_trickled_body() -> Result<(), String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .map_err(|error| error.to_string())?;
+            let body = format!("{}{{}}", " ".repeat(96));
+            for byte in body.bytes() {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        });
+
+        let started = Instant::now();
+        let error = probe_http_json(
+            "127.0.0.1",
+            port,
+            "/workers",
+            "target registry",
+            &OperationBound::unbounded(),
+        )
+        .err()
+        .unwrap_or_default();
+        let elapsed = started.elapsed();
+        server
+            .join()
+            .map_err(|_| "registry trickle fixture panicked".to_owned())??;
+
+        assert!(error.contains("deadline expired"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a 250ms registry attempt lasted {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_readiness_owner_rejects_a_registry_match() {
+        let expected = vec![TargetRegistryExpectedTarget {
+            url: "http://decode:30001".to_owned(),
+            role: "decode".to_owned(),
+            bootstrap_port: None,
+        }];
+        let response = serde_json::json!({
+            "workers": [{
+                "url": "http://decode:30001",
+                "worker_type": "decode",
+                "is_healthy": true
+            }]
+        });
+
+        let error = match_target_registry(
+            &response,
+            &target_registry_probe(&expected),
+            &OperationBound::finite(Duration::ZERO),
+        )
+        .err()
+        .unwrap_or_default();
+
+        assert_eq!(error, "readiness operation deadline expired");
+    }
+
+    #[test]
+    fn process_status_command_cannot_outlive_the_readiness_owner() {
+        let started = Instant::now();
+        let error = run_status_command(
+            &["sh", "-c", "sleep 5"],
+            &OperationBound::finite(Duration::from_millis(50)),
+        )
+        .err()
+        .unwrap_or_default();
+
+        assert_eq!(error, "process status attempt deadline expired");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded process status did not stop promptly"
+        );
+    }
+
+    #[test]
+    fn unbounded_process_status_command_does_not_acquire_a_timeout() -> Result<(), String> {
+        let output = run_status_command(
+            &["sh", "-c", "sleep 0.1; printf alive"],
+            &OperationBound::unbounded(),
+        )?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"alive");
+        Ok(())
+    }
 
     fn launch_file(root: &Path, text: &str, name: &str) -> LaunchFilePlan {
         let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
@@ -2225,7 +3205,8 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port,
                 protocol: EndpointProtocol::Http,
-                api_path: "/v1/completions".to_owned(),
+                completions_path: "/v1/completions".to_owned(),
+                chat_completions_path: "/v1/chat/completions".to_owned(),
                 prefix_cache_reset: None,
             },
             server,
@@ -2423,10 +3404,11 @@ mod tests {
         ];
 
         let evidence = wait_http_target_registry_ready(
-            alive_status,
+            |_| alive_status(),
             &endpoint,
             target_registry_probe(&expected),
-            Some(1),
+            None,
+            &mut |_| {},
         )
         .map_err(|failure| failure.message)?;
         server
@@ -2444,7 +3426,9 @@ mod tests {
             registry_url,
             attempts,
             matched_targets,
-            ..
+            timing,
+            diagnostic_attempts,
+            ready_unix_ms: _,
         } = evidence
         else {
             return Err("target registry readiness returned the wrong evidence kind".to_owned());
@@ -2458,6 +3442,19 @@ mod tests {
             format!("http://127.0.0.1:{}/workers", endpoint.port)
         );
         assert_eq!(attempts, 1);
+        assert_eq!(
+            timing.budget,
+            crate::time_bound::OperationBudgetEvidence::Unbounded
+        );
+        assert_eq!(
+            timing.terminal_cause,
+            crate::time_bound::OperationTerminalCause::Succeeded
+        );
+        assert_eq!(diagnostic_attempts.len(), 2);
+        assert!(diagnostic_attempts.iter().all(|attempt| {
+            attempt.succeeded
+                && (1..=duration_ms(READINESS_ATTEMPT_CAP)).contains(&attempt.effective_bound_ms)
+        }));
         assert_eq!(
             matched_targets,
             vec![
@@ -2504,11 +3501,13 @@ mod tests {
             },
         ];
 
+        let mut probe_failures = Vec::new();
         let failure = match wait_http_target_registry_ready(
-            alive_status,
+            |_| alive_status(),
             &endpoint,
             target_registry_probe(&expected),
-            Some(0),
+            Some(1),
+            &mut |failure| probe_failures.push(failure.to_owned()),
         ) {
             Err(failure) => failure,
             Ok(evidence) => {
@@ -2522,13 +3521,20 @@ mod tests {
             .map_err(|_| "target registry fixture panicked".to_owned())??;
 
         assert_eq!(failure.kind, ReadinessFailureKind::Timeout);
-        assert!(
-            failure
-                .message
-                .contains("target registry has no \"decode\" target at \"http://decode:30001\""),
-            "{}",
-            failure.message
+        let timing = failure
+            .timing
+            .as_ref()
+            .ok_or_else(|| "readiness timeout has no timing evidence".to_owned())?;
+        assert_eq!(
+            timing.budget,
+            crate::time_bound::OperationBudgetEvidence::Finite {
+                configured_ms: 1_000,
+            }
         );
+        assert_eq!(timing.terminal_cause, OperationTerminalCause::TimedOut);
+        assert!(probe_failures.iter().any(|failure| {
+            failure.contains("target registry has no \"decode\" target at \"http://decode:30001\"")
+        }));
         Ok(())
     }
 
@@ -2605,6 +3611,10 @@ mod tests {
 
         assert!(cleanup.verified, "{cleanup:?}");
         assert!(cleanup.forced);
+        assert!(cleanup.elapsed_ms >= cleanup.term_grace_ms);
+        assert_eq!(cleanup.status_deadline_ms, 2_000);
+        assert_eq!(cleanup.term_grace_ms, 2_000);
+        assert_eq!(cleanup.kill_grace_ms, 10_000);
         Ok(())
     }
 

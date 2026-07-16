@@ -1,6 +1,4 @@
 import json
-import tomllib
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from inferlab_adapter_sdk import (
@@ -45,10 +43,14 @@ from inferlab_adapter_sdk import (
     ServeTopology,
     SettingValue,
     append_option,
+    effective_settings,
+    integration_identity,
     merge_serve_args,
-    plain_setting,
+    replica_id,
+    require_role,
+    validate_settings,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
@@ -76,6 +78,7 @@ _INFERLAB_OPTION_ARITY: dict[str, int | None] = {
     "--port": 1,
     "--profiler-config": 1,
     "--reasoning-config": 1,
+    "--reasoning-parser": 1,
     "--served-model-name": None,
     "--tensor-parallel-size": 1,
     "--tokenizer-mode": 1,
@@ -109,6 +112,7 @@ class VllmServeSettings(BaseModel):
     compilation_config: dict[str, JsonValue] | None = None
     tokenizer_mode: str | None = None
     tool_call_parser: str | None = None
+    reasoning_parser: str | None = None
     enable_auto_tool_choice: bool | None = None
     reasoning_config: dict[str, JsonValue] | None = None
     enable_flashinfer_autotune: bool | None = None
@@ -127,45 +131,16 @@ def _runtime_cache_env(root: str) -> dict[str, str]:
 
 
 def _settings(values: dict[str, SettingValue]) -> VllmServeSettings:
-    try:
-        return VllmServeSettings.model_validate(
-            {key: plain_setting(value) for key, value in values.items()}
-        )
-    except ValidationError as error:
-        raise AdapterOperationError(AdapterErrorCode.invalid_settings, str(error)) from error
-
-
-def _effective_settings(settings: VllmServeSettings) -> dict[str, SettingValue]:
-    return {
-        key: SettingValue(root=value)
-        for key, value in settings.model_dump(exclude_none=True).items()
-    }
-
-
-def _adapter_version() -> str:
-    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-    if pyproject.is_file():
-        with pyproject.open("rb") as handle:
-            project_version: str = tomllib.load(handle)["project"]["version"]
-        return project_version
-    try:
-        return version("inferlab-integration-vllm")
-    except PackageNotFoundError:
-        # External-image lowering mounts each package's dist-info beside
-        # its module, so importlib.metadata resolves there instead.
-        return "unavailable"
+    return validate_settings(VllmServeSettings, values)
 
 
 def _identity() -> IntegrationIdentity:
-    try:
-        framework_version = version("vllm")
-    except PackageNotFoundError:
-        framework_version = "unavailable"
-    return IntegrationIdentity(
+    return integration_identity(
         adapter_id="inferlab-vllm",
-        adapter_version=_adapter_version(),
+        adapter_distribution="inferlab-integration-vllm",
         framework="vllm",
-        framework_version=framework_version,
+        framework_distribution="vllm",
+        module_file=__file__,
     )
 
 
@@ -246,23 +221,6 @@ def _effective_parallelism(declared: Parallelism) -> Parallelism:
     )
 
 
-def _role_for_kind(input: PlanServeInput, kind: ServeRoleKind) -> ServeRoleInput:
-    matches = [role for role in input.roles if role.kind == kind]
-    if len(matches) != 1:
-        raise AdapterOperationError(
-            AdapterErrorCode.invalid_settings,
-            f"{input.topology.value} topology requires exactly one {kind.value} role",
-        )
-    return matches[0]
-
-
-def _replica_id(role: ServeRoleInput, replica_index: int) -> str:
-    base = "server" if role.kind == ServeRoleKind.serve else role.id
-    if role.replica_count == 1:
-        return base
-    return f"{base}-{replica_index:03d}"
-
-
 def _device_count(parallelism: Parallelism) -> int:
     outer = parallelism.outer or ParallelismOuter()
     attention = parallelism.attention or ParallelismAttention()
@@ -288,7 +246,7 @@ def _plan_role(
     device_count = _device_count(parallelism)
     replicas = []
     for replica_index in range(role.replica_count):
-        replica_id = _replica_id(role, replica_index)
+        planned_replica_id = replica_id(role, replica_index)
         capture_target = (
             CaptureTargetRequirement(
                 control=CaptureControlRequirement(
@@ -301,7 +259,7 @@ def _plan_role(
         )
         replicas.append(
             ServeReplicaRequirement(
-                id=replica_id,
+                id=planned_replica_id,
                 role_id=role.id,
                 replica_index=replica_index,
                 device_count=device_count,
@@ -318,7 +276,7 @@ def _plan_role(
             kind=role.kind,
             declared_replica_count=role.replica_count,
             effective_replica_count=role.replica_count,
-            effective_settings=_effective_settings(settings),
+            effective_settings=effective_settings(settings),
             effective_parallelism=parallelism,
         ),
         replicas,
@@ -336,7 +294,7 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             f"vLLM single topology does not support routing backend {input.routing_backend!r}",
         )
-    role = _role_for_kind(input, ServeRoleKind.serve)
+    role = require_role(input, ServeRoleKind.serve)
     role_result, replicas = _plan_role(input, role, [])
     return PlanServeResult(
         integration=_identity(),
@@ -346,7 +304,8 @@ def _plan_single(input: PlanServeInput) -> PlanServeResult:
         routing=RoutingResult(root=RoutingResultDirect(role=role.id, replica=0)),
         endpoint=EndpointRequirement(
             protocol=EndpointProtocol(),
-            api_path="/v1/completions",
+            completions_path="/v1/completions",
+            chat_completions_path="/v1/chat/completions",
             prefix_cache_reset=HttpActionSpec(
                 method=HttpMethod(),
                 path="/reset_prefix_cache",
@@ -368,8 +327,8 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
             AdapterErrorCode.invalid_settings,
             f"vLLM does not support routing backend {input.routing_backend!r}",
         )
-    prefill = _role_for_kind(input, ServeRoleKind.prefill)
-    decode = _role_for_kind(input, ServeRoleKind.decode)
+    prefill = require_role(input, ServeRoleKind.prefill)
+    decode = require_role(input, ServeRoleKind.decode)
     prefill_ports = ["bootstrap" if transport == KvTransferMechanism.mooncake else "side_channel"]
     decode_ports = [] if transport == KvTransferMechanism.mooncake else ["side_channel"]
     prefill_result, prefill_replicas = _plan_role(input, prefill, prefill_ports)
@@ -460,7 +419,11 @@ def _plan_prefill_decode(input: PlanServeInput) -> PlanServeResult:
         replicas=replicas,
         links=links,
         routing=routing,
-        endpoint=EndpointRequirement(protocol=EndpointProtocol(), api_path="/v1/completions"),
+        endpoint=EndpointRequirement(
+            protocol=EndpointProtocol(),
+            completions_path="/v1/completions",
+            chat_completions_path="/v1/chat/completions",
+        ),
     )
 
 
@@ -526,6 +489,7 @@ def _render_process(
     append_option(inferlab_args, "--block-size", settings.block_size)
     append_option(inferlab_args, "--tokenizer-mode", settings.tokenizer_mode)
     append_option(inferlab_args, "--tool-call-parser", settings.tool_call_parser)
+    append_option(inferlab_args, "--reasoning-parser", settings.reasoning_parser)
     if settings.enable_auto_tool_choice:
         inferlab_args.append("--enable-auto-tool-choice")
     if settings.reasoning_config is not None:

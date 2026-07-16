@@ -1,6 +1,6 @@
 {
   "status": "ok",
-  "protocol_version": "5",
+  "protocol_version": "6",
   "result": {
     "operation": "plan_serve",
     "output": {

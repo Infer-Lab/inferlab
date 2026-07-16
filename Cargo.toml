@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -25,7 +25,8 @@ flate2 = "1"
 fs2 = "0.4"
 futures-util = "0.3"
 insta = "1"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+rustix = { version = "1", features = ["process", "system"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

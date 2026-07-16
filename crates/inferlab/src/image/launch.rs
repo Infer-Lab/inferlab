@@ -42,6 +42,8 @@ pub struct ExternalImagePlan {
     pub integration: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework_version: Option<String>,
+    #[serde(skip)]
+    pub framework_probe_timing: Option<crate::time_bound::OperationTimingEvidence>,
 }
 
 /// Validate an image selection against the recipe's workspace facts and the
@@ -173,6 +175,7 @@ pub fn select_external(
         digest,
         integration: declaration.integration.clone(),
         framework_version: None,
+        framework_probe_timing: None,
     })
 }
 
@@ -229,7 +232,7 @@ pub(crate) fn apply_external(
 ) -> Result<(), InferlabError> {
     gate_capture(execution.server.processes())?;
     let framework = execution.server.integration.framework.clone();
-    let version = crate::adapter::probe_external_framework(
+    let probe = crate::adapter::probe_external_framework(
         &external.reference,
         adapter.image_device,
         adapter
@@ -241,7 +244,8 @@ pub(crate) fn apply_external(
     )?;
     containerize(execution, &external.reference, machines, true);
     execution.server.external_image = Some(ExternalImagePlan {
-        framework_version: Some(version),
+        framework_version: Some(probe.version),
+        framework_probe_timing: Some(probe.timing),
         ..external.clone()
     });
     Ok(())

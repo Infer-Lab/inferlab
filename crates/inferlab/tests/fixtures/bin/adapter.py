@@ -24,7 +24,7 @@ if fault.get("adapter_reject"):
         json.dumps(
             {
                 "status": "error",
-                "protocol_version": "5",
+                "protocol_version": "6",
                 "error": {"code": "invalid_settings", "message": "fixture rejection"},
             }
         )
@@ -95,7 +95,11 @@ if operation == "plan_serve":
         ],
         "links": [],
         "routing": {"owner": "direct", "role": role["id"], "replica": 0},
-        "endpoint": {"protocol": "http", "api_path": "/v1/completions"},
+        "endpoint": {
+            "protocol": "http",
+            "completions_path": "/v1/completions",
+            "chat_completions_path": "/v1/chat/completions",
+        },
         "render_inputs": (
             [{"source_path": "operator-config.yaml"}]
             if settings.get("fixture_mode") == "launch-file"
@@ -160,7 +164,7 @@ print(
     json.dumps(
         {
             "status": "ok",
-            "protocol_version": "5",
+            "protocol_version": "6",
             "result": {"operation": operation, "output": output},
         }
     )

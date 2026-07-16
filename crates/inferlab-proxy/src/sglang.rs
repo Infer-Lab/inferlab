@@ -26,7 +26,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub const ID: &str = "inferlab-sglang-proxy";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 pub fn meta() -> ProxyMeta {
     ProxyMeta {
@@ -75,6 +75,7 @@ fn router(state: ProxyState) -> Router {
     Router::new()
         .route("/healthcheck", get(healthcheck))
         .route("/v1/completions", post(completions))
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/flush_cache", post(flush_cache))
         .with_state(state)
 }
@@ -212,10 +213,27 @@ async fn completions(
     completion_route(state, headers, body).await
 }
 
+async fn chat_completions(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response<Body>, ProxyHttpError> {
+    request_route(state, headers, body, "/v1/chat/completions").await
+}
+
 async fn completion_route(
     state: ProxyState,
     headers: HeaderMap,
     body: Value,
+) -> Result<Response<Body>, ProxyHttpError> {
+    request_route(state, headers, body, "/v1/completions").await
+}
+
+async fn request_route(
+    state: ProxyState,
+    headers: HeaderMap,
+    body: Value,
+    path: &'static str,
 ) -> Result<Response<Body>, ProxyHttpError> {
     if !state.ready() {
         return Err(ProxyHttpError::status(
@@ -227,11 +245,11 @@ async fn completion_route(
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let prefill = state.next_prefill();
     let decode = state.next_decode();
-    let request_body = bootstrap_body(&body, &prefill, state.next_room())?;
+    let request_body = bootstrap_body(&body, &prefill, state.next_room(), path)?;
     let authorization = outbound_authorization(&headers);
     let client = state.client();
 
-    let prefill_url = join_path(&prefill.url, "/v1/completions");
+    let prefill_url = join_path(&prefill.url, path);
     let prefill_body = request_body.clone();
     let prefill_authorization = authorization.clone();
     let prefill_client = client.clone();
@@ -250,7 +268,7 @@ async fn completion_route(
     });
     let decode_result = core::send_json_post(
         client,
-        join_path(&decode, "/v1/completions"),
+        join_path(&decode, path),
         &request_body,
         None,
         authorization.as_deref(),
@@ -616,6 +634,7 @@ fn bootstrap_body(
     body: &Value,
     prefill: &PrefillTarget,
     room: u64,
+    path: &'static str,
 ) -> Result<Value, ProxyHttpError> {
     let mut body = body.clone();
     let object = body.as_object_mut().ok_or_else(|| {
@@ -624,7 +643,7 @@ fn bootstrap_body(
             "OpenAI completion request body must be a JSON object",
         )
     })?;
-    if object.get("prompt").is_some_and(Value::is_array) {
+    if path == "/v1/completions" && object.get("prompt").is_some_and(Value::is_array) {
         return Err(ProxyHttpError::status(
             StatusCode::BAD_REQUEST,
             "SGLang built-in proxy does not support prompt arrays",
@@ -746,6 +765,7 @@ mod tests {
     #[derive(Clone)]
     struct BackendState {
         completion_requests: Arc<Mutex<Vec<Value>>>,
+        chat_requests: Arc<Mutex<Vec<Value>>>,
         completion_status: Arc<AtomicU16>,
         completion_content_type: &'static str,
         completion_chunks: Vec<Bytes>,
@@ -762,6 +782,7 @@ mod tests {
         fn new(body: &'static [u8]) -> Self {
             Self {
                 completion_requests: Arc::new(Mutex::new(Vec::new())),
+                chat_requests: Arc::new(Mutex::new(Vec::new())),
                 completion_status: Arc::new(AtomicU16::new(StatusCode::OK.as_u16())),
                 completion_content_type: "application/json",
                 completion_chunks: vec![Bytes::from_static(body)],
@@ -815,6 +836,14 @@ mod tests {
         response
     }
 
+    async fn mock_chat_completion(
+        State(state): State<BackendState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        state.chat_requests.lock().await.push(body);
+        (StatusCode::OK, Json(json!({"route": "chat"}))).into_response()
+    }
+
     async fn mock_flush(State(state): State<BackendState>) -> Response<Body> {
         state.flush_requests.fetch_add(1, Ordering::SeqCst);
         let status = StatusCode::from_u16(state.flush_status.load(Ordering::SeqCst))
@@ -830,6 +859,7 @@ mod tests {
             )
             .route("/v1/models", get(|| async { StatusCode::OK }))
             .route("/v1/completions", post(mock_completion))
+            .route("/v1/chat/completions", post(mock_chat_completion))
             .route("/flush_cache", post(mock_flush))
             .with_state(state);
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -857,7 +887,7 @@ mod tests {
     #[test]
     fn meta_exports_proxy_identity() {
         assert_eq!(meta().id, "inferlab-sglang-proxy");
-        assert_eq!(meta().version, 1);
+        assert_eq!(meta().version, 2);
     }
 
     #[tokio::test]
@@ -921,6 +951,47 @@ mod tests {
                 .and_then(Value::as_u64)
                 .is_some()
         );
+        prefill_server.abort();
+        decode_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_dispatch_preserves_messages_and_unowned_fields_on_both_roles() -> Result<()> {
+        let prefill_backend = BackendState::new(b"prefill");
+        let decode_backend = BackendState::new(b"decode");
+        let (prefill_url, prefill_server) = spawn_backend(prefill_backend.clone()).await?;
+        let (decode_url, decode_server) = spawn_backend(decode_backend.clone()).await?;
+        let state = proxy_state(prefill_url, decode_url)?;
+        state.set_ready();
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 1.0,
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"enable_thinking": true}
+        });
+
+        let response = request_route(
+            state,
+            HeaderMap::new(),
+            request.clone(),
+            "/v1/chat/completions",
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let prefill_requests = prefill_backend.chat_requests.lock().await;
+        let decode_requests = decode_backend.chat_requests.lock().await;
+        assert_eq!(prefill_requests.len(), 1);
+        assert_eq!(*prefill_requests, *decode_requests);
+        for (key, value) in request.as_object().context("request was not an object")? {
+            assert_eq!(prefill_requests[0].get(key), Some(value), "changed {key}");
+        }
+        assert!(prefill_requests[0]["bootstrap_room"].is_u64());
+        assert!(prefill_backend.completion_requests.lock().await.is_empty());
+        assert!(decode_backend.completion_requests.lock().await.is_empty());
         prefill_server.abort();
         decode_server.abort();
         Ok(())

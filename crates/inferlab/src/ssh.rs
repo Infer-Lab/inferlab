@@ -2,7 +2,6 @@
 //! module that reaches a remote machine.
 
 use crate::shell::shell_quote;
-use std::process::Command;
 
 const SSH_OPTIONS: &[&str] = &[
     "-o",
@@ -16,8 +15,8 @@ const SSH_OPTIONS: &[&str] = &[
     "--",
 ];
 
-/// The full argv `ssh_command` would run, for a caller that needs bounded
-/// execution (the container-removal deadline) to run exactly that command.
+/// The full SSH argv for bounded execution through an owning operation or
+/// cleanup deadline.
 pub(crate) fn ssh_argv(target: &str, script: &str) -> Vec<String> {
     let mut argv: Vec<String> = ["ssh"]
         .into_iter()
@@ -31,10 +30,4 @@ pub(crate) fn ssh_argv(target: &str, script: &str) -> Vec<String> {
         shell_quote(script),
     ]);
     argv
-}
-
-pub(crate) fn ssh_command() -> Command {
-    let mut command = Command::new("ssh");
-    command.args(SSH_OPTIONS);
-    command
 }

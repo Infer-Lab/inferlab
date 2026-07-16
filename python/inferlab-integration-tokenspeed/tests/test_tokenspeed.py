@@ -88,7 +88,8 @@ def test_plan_dsv4_dp_ep_shape_and_endpoint_contract() -> None:
     readiness = replica.primary_readiness.root
     assert isinstance(readiness, ReadinessProbeHttp)
     assert readiness.path == "/readiness"
-    assert result.endpoint.api_path == "/v1/completions"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is not None
     assert result.endpoint.prefix_cache_reset.path == "/flush_cache"
     role = result.roles[0]
@@ -233,7 +234,8 @@ def test_plan_prefill_decode_keeps_smg_routing_and_mooncake_transfer_separate() 
     assert result.routing.root.owner == "integration_native"
     assert result.routing.root.role == "router"
     assert result.routing.root.replica == 0
-    assert result.endpoint.api_path == "/v1/completions"
+    assert result.endpoint.completions_path == "/v1/completions"
+    assert result.endpoint.chat_completions_path == "/v1/chat/completions"
     assert result.endpoint.prefix_cache_reset is not None
     assert result.endpoint.prefix_cache_reset.path == "/flush_cache"
 

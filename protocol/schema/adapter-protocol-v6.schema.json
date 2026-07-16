@@ -1,5 +1,5 @@
 {
-  "$id": "https://inferlab.dev/schema/adapter-protocol/v5",
+  "$id": "https://inferlab.dev/schema/adapter-protocol/v6",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AdapterProtocol",
   "description": "The schema root aggregating every wire type. It exists to generate one\ncommitted JSON schema (and the Python SDK models); its optional client\nfields are never all populated in a single message.",
@@ -19,6 +19,26 @@
       "anyOf": [
         {
           "$ref": "#/$defs/BenchClientResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bench_dataset_preparation_request": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BenchDatasetPreparationRequest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bench_dataset_preparation_result": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BenchDatasetPreparationResult"
         },
         {
           "type": "null"
@@ -290,6 +310,12 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "warmup_request_count": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
         }
       },
       "additionalProperties": false,
@@ -308,6 +334,11 @@
         "case": {
           "$ref": "#/$defs/BenchCaseInput"
         },
+        "case_budget_seconds": {
+          "description": "Remaining control-plane case budget when the client is released.",
+          "type": "number",
+          "format": "double"
+        },
         "definition": {
           "$ref": "#/$defs/BenchDefinitionInput"
         },
@@ -316,6 +347,17 @@
         },
         "model": {
           "$ref": "#/$defs/MeasurementModelInput"
+        },
+        "population": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BenchPopulationInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "protocol_version": {
           "$ref": "#/$defs/ProtocolVersion"
@@ -328,6 +370,7 @@
         "model",
         "definition",
         "case",
+        "case_budget_seconds",
         "artifact_dir"
       ]
     },
@@ -380,6 +423,17 @@
             "$ref": "#/$defs/RawArtifact"
           }
         },
+        "request_slo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BenchRequestSloResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "schema_version": {
           "description": "Result envelope version; clients write `1`. The measurement runtime\nrejects a bench result whose version is not `1`.",
           "type": "integer",
@@ -402,19 +456,232 @@
         "raw_artifacts"
       ]
     },
-    "BenchDefinitionInput": {
-      "description": "The workload shape a Bench client drives, shared across its load cases.",
+    "BenchDatasetCacheState": {
+      "description": "Read-only cache state observed while resolving the Bench plan.",
+      "type": "string",
+      "enum": [
+        "missing",
+        "present"
+      ]
+    },
+    "BenchDatasetCatalogInput": {
+      "description": "Immutable release-catalog facts resolved by the Rust control plane.",
       "type": "object",
       "properties": {
-        "input_tokens": {
+        "cache_path": {
+          "type": "string"
+        },
+        "cache_state": {
+          "$ref": "#/$defs/BenchDatasetCacheState"
+        },
+        "license": {
+          "type": "string"
+        },
+        "materialization_identity": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "source_format": {
+          "type": "string"
+        },
+        "upstream_identity": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "upstream_identity",
+        "url",
+        "sha256",
+        "source_format",
+        "license",
+        "cache_path",
+        "cache_state",
+        "materialization_identity"
+      ]
+    },
+    "BenchDatasetInput": {
+      "description": "Release-qualified public Bench datasets.",
+      "type": "string",
+      "enum": [
+        "sharegpt"
+      ]
+    },
+    "BenchDatasetPreparationRequest": {
+      "description": "The bounded tokenizer-backed operation that materializes one dataset\npopulation before any Bench case starts.",
+      "type": "object",
+      "properties": {
+        "artifact_dir": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/MeasurementModelInput"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "request_body": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          },
+          "default": {}
+        },
+        "request_source": {
+          "$ref": "#/$defs/BenchRequestSourceInput"
+        },
+        "required_entries": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
+        "seed": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "model",
+        "request_source",
+        "source_path",
+        "required_entries",
+        "seed",
+        "artifact_dir"
+      ]
+    },
+    "BenchDatasetPreparationResult": {
+      "description": "Terminal result of dataset population materialization.",
+      "type": "object",
+      "properties": {
+        "admitted_entries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "candidate_entries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ineligible_entries": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "ineligible_reasons": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "default": {}
+        },
+        "input_tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BenchTokenCountSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "materialization_identity": {
+          "type": "string"
+        },
         "output_tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BenchTokenCountSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "population": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BenchPopulationInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested_entries": {
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ClientStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "materialization_identity",
+        "requested_entries",
+        "candidate_entries",
+        "admitted_entries",
+        "ineligible_entries"
+      ]
+    },
+    "BenchDefinitionInput": {
+      "description": "The workload shape a Bench client drives, shared across its load cases.",
+      "type": "object",
+      "properties": {
+        "request_body": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SettingValue"
+          },
+          "default": {}
+        },
+        "request_slo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BenchRequestSloInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "request_source": {
+          "$ref": "#/$defs/BenchRequestSourceInput"
         },
         "reset_prefix_cache": {
           "type": "boolean",
@@ -425,10 +692,6 @@
           "format": "uint64",
           "minimum": 0
         },
-        "temperature": {
-          "type": "number",
-          "format": "double"
-        },
         "timeout_seconds": {
           "type": "integer",
           "format": "uint64",
@@ -437,10 +700,8 @@
       },
       "additionalProperties": false,
       "required": [
-        "input_tokens",
-        "output_tokens",
+        "request_source",
         "seed",
-        "temperature",
         "timeout_seconds"
       ]
     },
@@ -509,6 +770,218 @@
         }
       ]
     },
+    "BenchPopulationInput": {
+      "description": "One frozen dataset population consumed sequentially by every Bench case.",
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "tpot_applicable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "entries",
+        "tpot_applicable"
+      ]
+    },
+    "BenchRequestSloInput": {
+      "description": "Per-request latency bounds lowered to the release-owned Bench runner.",
+      "type": "object",
+      "properties": {
+        "minimum_good_request_ratio": {
+          "type": "number",
+          "format": "double"
+        },
+        "request_latency_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "tpot_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "ttft_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "minimum_good_request_ratio"
+      ]
+    },
+    "BenchRequestSloResult": {
+      "description": "File-bound request-SLO evidence derived from AIPerf profiling records.",
+      "type": "object",
+      "properties": {
+        "good_request_ratio": {
+          "type": "number",
+          "format": "double"
+        },
+        "good_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "goodput": {
+          "type": "number",
+          "format": "double"
+        },
+        "native_aggregate_good_request_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "native_aggregate_good_request_count_consistent": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "profiling_duration_seconds": {
+          "type": "number",
+          "format": "double"
+        },
+        "profiling_duration_source": {
+          "type": "string"
+        },
+        "request_count_reconciled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "good_requests",
+        "good_request_ratio",
+        "goodput",
+        "profiling_duration_seconds",
+        "profiling_duration_source",
+        "request_count_reconciled"
+      ]
+    },
+    "BenchRequestSourceInput": {
+      "description": "One closed request origin lowered by Inferlab for the Bench runtime.",
+      "oneOf": [
+        {
+          "description": "AIPerf generates exact token-shape prompts from the release-pinned\nsynthetic generator.",
+          "type": "object",
+          "properties": {
+            "input_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "random"
+            },
+            "output_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "input_tokens",
+            "output_tokens"
+          ]
+        },
+        {
+          "description": "Inferlab materializes a release-catalog conversation snapshot before\nAIPerf starts.",
+          "type": "object",
+          "properties": {
+            "catalog": {
+              "$ref": "#/$defs/BenchDatasetCatalogInput"
+            },
+            "dataset": {
+              "$ref": "#/$defs/BenchDatasetInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "dataset"
+            },
+            "max_input_tokens": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "output_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "dataset",
+            "max_input_tokens",
+            "catalog"
+          ]
+        }
+      ]
+    },
+    "BenchTokenCountSummary": {
+      "description": "Summary of the realized token counts. Exact per-entry values remain in the\npopulation evidence artifact.",
+      "type": "object",
+      "properties": {
+        "maximum": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mean": {
+          "type": "number",
+          "format": "double"
+        },
+        "minimum": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "minimum",
+        "maximum",
+        "mean"
+      ]
+    },
     "BuiltinRouterKind": {
       "description": "An Inferlab-owned routing implementation with stable target semantics.",
       "type": "string",
@@ -553,7 +1026,10 @@
       "description": "The public workload endpoint an Eval or Bench client connects to.",
       "type": "object",
       "properties": {
-        "api_path": {
+        "chat_completions_path": {
+          "type": "string"
+        },
+        "completions_path": {
           "type": "string"
         },
         "host": {
@@ -574,7 +1050,8 @@
         "protocol",
         "host",
         "port",
-        "api_path"
+        "completions_path",
+        "chat_completions_path"
       ]
     },
     "ClientStatus": {
@@ -623,10 +1100,13 @@
       ]
     },
     "EndpointRequirement": {
-      "description": "The workload endpoint's protocol and API path, plus an optional\nprefix-cache-reset action a Bench case can invoke between runs.",
+      "description": "The workload endpoint's protocol and named OpenAI paths, plus an optional\nprefix-cache-reset action a Bench case can invoke between runs.",
       "type": "object",
       "properties": {
-        "api_path": {
+        "chat_completions_path": {
+          "type": "string"
+        },
+        "completions_path": {
           "type": "string"
         },
         "prefix_cache_reset": {
@@ -646,7 +1126,8 @@
       "additionalProperties": false,
       "required": [
         "protocol",
-        "api_path"
+        "completions_path",
+        "chat_completions_path"
       ]
     },
     "EvalClientRequest": {
@@ -655,6 +1136,11 @@
       "properties": {
         "artifact_dir": {
           "type": "string"
+        },
+        "case_budget_seconds": {
+          "description": "Remaining control-plane case budget when the client is released.",
+          "type": "number",
+          "format": "double"
         },
         "definition": {
           "$ref": "#/$defs/EvalDefinitionInput"
@@ -667,14 +1153,26 @@
         },
         "protocol_version": {
           "$ref": "#/$defs/ProtocolVersion"
+        },
+        "workspace_root": {
+          "type": "string"
+        },
+        "workspace_source_exclusions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false,
       "required": [
         "protocol_version",
+        "workspace_root",
+        "workspace_source_exclusions",
         "endpoint",
         "model",
         "definition",
+        "case_budget_seconds",
         "artifact_dir"
       ]
     },
@@ -688,6 +1186,27 @@
             "null"
           ]
         },
+        "failure_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalFailureKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "gate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalMetricGate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "metrics": {
           "type": "object",
           "additionalProperties": {
@@ -700,6 +1219,25 @@
           "items": {
             "type": "string"
           }
+        },
+        "native_exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        },
+        "native_timed_out": {
+          "type": "boolean",
+          "default": false
+        },
+        "normalized_metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/EvalNormalizedMetric"
+          },
+          "default": {}
         },
         "raw_artifacts": {
           "type": "array",
@@ -715,6 +1253,17 @@
         },
         "status": {
           "$ref": "#/$defs/ClientStatus"
+        },
+        "trial_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EvalTrialSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
@@ -771,12 +1320,6 @@
               "format": "uint32",
               "minimum": 0
             },
-            "dataset": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "few_shot": {
               "type": [
                 "integer",
@@ -808,6 +1351,20 @@
             "metric": {
               "type": "string"
             },
+            "metric_filter": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "request_body": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/SettingValue"
+              },
+              "default": {}
+            },
             "seed": {
               "type": [
                 "integer",
@@ -816,14 +1373,8 @@
               "format": "uint64",
               "minimum": 0
             },
-            "split": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
             "task": {
-              "type": "string"
+              "$ref": "#/$defs/EvalTaskSourceInput"
             },
             "threshold": {
               "type": "number",
@@ -833,17 +1384,268 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "trials": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
             }
           },
           "additionalProperties": false,
           "required": [
             "kind",
             "task",
+            "trials",
             "metric",
             "threshold",
             "timeout_seconds"
           ]
         }
+      ]
+    },
+    "EvalFailureKind": {
+      "description": "A typed Eval failure category preserved across the client boundary.",
+      "type": "string",
+      "enum": [
+        "task_resolution",
+        "probe_tokenizer",
+        "probe_transport",
+        "probe_http",
+        "probe_malformed_response",
+        "probe_generated_only_logprobs",
+        "probe_tokenizer_alignment",
+        "metric_normalization"
+      ]
+    },
+    "EvalMetricComparison": {
+      "description": "The threshold comparison selected from lm-eval's scoring direction.",
+      "type": "string",
+      "enum": [
+        "at_least",
+        "at_most"
+      ]
+    },
+    "EvalMetricGate": {
+      "description": "The effective threshold comparison for the configured primary metric.",
+      "type": "object",
+      "properties": {
+        "comparison": {
+          "$ref": "#/$defs/EvalMetricComparison"
+        },
+        "conclusion": {
+          "$ref": "#/$defs/EvalMetricGateConclusion"
+        },
+        "metric": {
+          "$ref": "#/$defs/EvalNormalizedMetric"
+        },
+        "threshold": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "threshold",
+        "comparison",
+        "conclusion"
+      ]
+    },
+    "EvalMetricGateConclusion": {
+      "description": "The terminal conclusion of an lm-eval metric threshold gate.",
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed"
+      ]
+    },
+    "EvalNormalizedMetric": {
+      "description": "One finite lm-eval metric with its exact native provenance.",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "higher_is_better": {
+          "type": "boolean"
+        },
+        "metric": {
+          "type": "string"
+        },
+        "native_metric_key": {
+          "type": "string"
+        },
+        "source_identity": {
+          "type": "string"
+        },
+        "value": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_identity",
+        "metric",
+        "native_metric_key",
+        "value",
+        "higher_is_better"
+      ]
+    },
+    "EvalTaskSourceInput": {
+      "description": "The resolved lm-eval task source consumed by the release-owned Eval runner.",
+      "oneOf": [
+        {
+          "description": "One individual task shipped by the pinned lm-eval runtime.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "built_in"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name"
+          ]
+        },
+        {
+          "description": "One task closure shipped and identity-bound by the Inferlab release.",
+          "type": "object",
+          "properties": {
+            "dataset_asset_sha256": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "bundled"
+            },
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "prompt_asset_sha256": {
+              "type": "string"
+            },
+            "scorer_sha256": {
+              "type": "string"
+            },
+            "task_closure_sha256": {
+              "type": "string"
+            },
+            "task_definition_sha256": {
+              "type": "string"
+            },
+            "task_identity": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "name",
+            "task_identity",
+            "path",
+            "task_closure_sha256",
+            "task_definition_sha256",
+            "prompt_asset_sha256",
+            "dataset_asset_sha256",
+            "scorer_sha256"
+          ]
+        },
+        {
+          "description": "One validated workspace-local lm-eval YAML file.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "workspace_yaml"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path"
+          ]
+        }
+      ]
+    },
+    "EvalTrialSummary": {
+      "description": "Reconstructible aggregate counts for fixed outer Eval trials.",
+      "type": "object",
+      "properties": {
+        "completed_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "higher_is_better": {
+          "type": "boolean"
+        },
+        "issued_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pass_rate": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "passed_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "per_trial_filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "per_trial_metric": {
+          "type": "string"
+        },
+        "request_failure_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "requested_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unissued_trials": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requested_trials",
+        "issued_trials",
+        "unissued_trials",
+        "completed_trials",
+        "request_failure_trials",
+        "passed_trials",
+        "per_trial_metric",
+        "higher_is_better"
       ]
     },
     "HttpActionSpec": {
@@ -1201,12 +2003,12 @@
       ]
     },
     "ProtocolVersion": {
-      "description": "The shared protocol version used by framework integrations and release-owned\nmeasurement clients. The only accepted value is `5` (serialized as the\nstring `\"5\"`); a mismatch is rejected before lowering.",
+      "description": "The shared protocol version used by framework integrations and release-owned\nmeasurement clients. The only accepted value is `6` (serialized as the\nstring `\"6\"`); a mismatch is rejected before lowering.",
       "oneOf": [
         {
-          "description": "Protocol version 5.",
+          "description": "Protocol version 6.",
           "type": "string",
-          "const": "5"
+          "const": "6"
         }
       ]
     },

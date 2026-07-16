@@ -1,11 +1,26 @@
 #!/bin/sh
+if [ "$1" = info ] && [ "$2" = --json ]; then
+  case "$(uname -m)" in
+    x86_64) detected_platform=linux-64 ;;
+    aarch64) detected_platform=linux-aarch64 ;;
+    *) detected_platform=unsupported ;;
+  esac
+  if [ "${PIXI_FIXTURE_GLIBC:-1}" = 1 ]; then
+    virtual_packages='["__unix=0=0","__linux=6.11.0=0","__glibc=2.35=0"]'
+  else
+    virtual_packages='["__unix=0=0","__linux=6.11.0=0"]'
+  fi
+  printf '{"platform":"%s","virtual_packages":%s}\n' \
+    "${PIXI_FIXTURE_PLATFORM:-$detected_platform}" "$virtual_packages"
+  exit 0
+fi
 if [ "$1" = install ] && [ "$2" = --manifest-path ] && [ "$4" = --all ] && [ "$5" = --locked ]; then
   prefix="$(dirname "$3")"
   mkdir -p "$prefix/.pixi/envs/eval/bin" "$prefix/.pixi/envs/bench/bin"
   cat > "$prefix/.pixi/envs/eval/bin/python" <<'PYTHON'
 #!/bin/sh
 if [ "$2" = --handshake ]; then
-  printf '{"runner_version":"0.1.0","lm_eval_version":"0.4.12"}\n'
+  printf '{"runner_version":"0.3.0","lm_eval_version":"0.4.12"}\n'
   exit 0
 fi
 shift
@@ -14,7 +29,7 @@ PYTHON
   cat > "$prefix/.pixi/envs/bench/bin/python" <<'PYTHON'
 #!/bin/sh
 if [ "$2" = --handshake ]; then
-  printf '{"runner_version":"0.1.0","aiperf_version":"0.10.0"}\n'
+  printf '{"runner_version":"0.3.0","aiperf_version":"0.11.0"}\n'
   exit 0
 fi
 shift

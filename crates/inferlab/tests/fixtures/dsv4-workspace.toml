@@ -48,13 +48,13 @@ kind = "lm-eval"
 task = "gsm8k"
 limit = 64
 metric = "exact_match"
+metric_filter = "strict-match"
 threshold = 0.90
 timeout_seconds = 900
 
 [benches.c8k1k]
 kind = "serving"
-input_tokens = 8192
-output_tokens = 1024
+request_source = { kind = "random", input_tokens = 8192, output_tokens = 1024 }
 concurrency = [1, 4]
 prompts_per_concurrency = 4
 request_rates = [1.0, "inf"]
@@ -65,12 +65,14 @@ timeout_seconds = 900
 
 [benches.adaptive-c8k1k]
 kind = "adaptive-serving"
-input_tokens = 8192
-output_tokens = 1024
+request_source = { kind = "random", input_tokens = 8192, output_tokens = 1024 }
 initial_request_rates = [1.0, 4.0]
-target_metric = "p99_ttft_ms"
-target_threshold = 1000.0
-max_refinement_steps = 3
+aggregate_slos = [
+    { metric = "request_throughput", at_least = 1.0 },
+    { metric = "p99_ttft_ms", at_most = 1000.0 },
+]
+request_slo = { ttft_ms = 900.0, minimum_good_request_ratio = 0.99 }
+max_search_steps = 3
 min_rate_resolution = 0.25
 request_count = 32
 burstiness = 1.0

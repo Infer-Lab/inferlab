@@ -210,7 +210,8 @@ if operation == "plan_serve":
         "routing": {"owner": "direct", "role": role["id"], "replica": 0},
         "endpoint": {
             "protocol": "http",
-            "api_path": "/v1/completions",
+            "completions_path": "/v1/completions",
+            "chat_completions_path": "/v1/chat/completions",
             "prefix_cache_reset": {"method": "post", "path": "/reset_prefix_cache"},
         },
         "render_inputs": (
@@ -292,7 +293,7 @@ else:
     raise ValueError(f"unexpected operation {operation}")
 print(json.dumps({
     "status": "ok",
-    "protocol_version": "5",
+    "protocol_version": "6",
     "result": {
         "operation": operation,
         "output": output,
@@ -310,11 +311,20 @@ print(json.dumps({
         fs::write(
             path,
             "#!/bin/sh\n\
+             if [ \"$1\" = info ] && [ \"$2\" = --json ]; then\n\
+               case \"$(uname -m)\" in\n\
+                 x86_64) platform=linux-64 ;;\n\
+                 aarch64) platform=linux-aarch64 ;;\n\
+                 *) platform=unsupported ;;\n\
+               esac\n\
+               printf '{\"platform\":\"%s\",\"virtual_packages\":[\"__glibc=2.35=0\"]}\\n' \"$platform\"\n\
+               exit 0\n\
+             fi\n\
              if [ \"$1\" = install ] && [ \"$2\" = --manifest-path ] && [ \"$4\" = --all ] && [ \"$5\" = --locked ]; then\n\
                prefix=\"$(dirname \"$3\")\"\n\
                mkdir -p \"$prefix/.pixi/envs/eval/bin\" \"$prefix/.pixi/envs/bench/bin\"\n\
-               printf '%s\\n' '#!/bin/sh' 'printf '\"'\"'{\"runner_version\":\"0.1.0\",\"lm_eval_version\":\"0.4.12\"}\\n'\"'\"'' > \"$prefix/.pixi/envs/eval/bin/python\"\n\
-               printf '%s\\n' '#!/bin/sh' 'printf '\"'\"'{\"runner_version\":\"0.1.0\",\"aiperf_version\":\"0.10.0\"}\\n'\"'\"'' > \"$prefix/.pixi/envs/bench/bin/python\"\n\
+               printf '%s\\n' '#!/bin/sh' 'printf '\"'\"'{\"runner_version\":\"0.3.0\",\"lm_eval_version\":\"0.4.12\"}\\n'\"'\"'' > \"$prefix/.pixi/envs/eval/bin/python\"\n\
+               printf '%s\\n' '#!/bin/sh' 'printf '\"'\"'{\"runner_version\":\"0.3.0\",\"aiperf_version\":\"0.11.0\"}\\n'\"'\"'' > \"$prefix/.pixi/envs/bench/bin/python\"\n\
                chmod +x \"$prefix/.pixi/envs/eval/bin/python\" \"$prefix/.pixi/envs/bench/bin/python\"\n\
                exit 0\n\
              fi\n\
@@ -464,13 +474,13 @@ kind = \"lm-eval\"
 task = \"gsm8k\"
 limit = 64
 metric = \"exact_match\"
+metric_filter = \"strict-match\"
 threshold = 0.90
 timeout_seconds = 900
 
 [benches.c8k1k]
 kind = \"serving\"
-input_tokens = 8192
-output_tokens = 1024
+request_source = { kind = \"random\", input_tokens = 8192, output_tokens = 1024 }
 concurrency = [1, 4]
 prompts_per_concurrency = 4
 request_rates = [1.0, \"inf\"]
@@ -481,12 +491,14 @@ timeout_seconds = 900
 
 [benches.adaptive-c8k1k]
 kind = \"adaptive-serving\"
-input_tokens = 8192
-output_tokens = 1024
+request_source = { kind = \"random\", input_tokens = 8192, output_tokens = 1024 }
 initial_request_rates = [1.0, 4.0]
-target_metric = \"p99_ttft_ms\"
-target_threshold = 1000.0
-max_refinement_steps = 3
+aggregate_slos = [
+    { metric = \"request_throughput\", at_least = 1.0 },
+    { metric = \"p99_ttft_ms\", at_most = 1000.0 },
+]
+request_slo = { ttft_ms = 900.0, minimum_good_request_ratio = 0.99 }
+max_search_steps = 3
 min_rate_resolution = 0.25
 request_count = 32
 burstiness = 1.0
@@ -580,7 +592,11 @@ if operation == "plan_serve":
             "ports": [],
             "readiness": {"kind": "http", "path": "/healthcheck"},
         },
-        "endpoint": {"protocol": "http", "api_path": "/v1/completions"},
+        "endpoint": {
+            "protocol": "http",
+            "completions_path": "/v1/completions",
+            "chat_completions_path": "/v1/chat/completions",
+        },
     }
 elif operation == "render_serve":
     output = {
@@ -606,7 +622,7 @@ elif operation == "render_serve":
 else:
     raise ValueError(operation)
 
-print(json.dumps({"status": "ok", "protocol_version": "5", "result": {"operation": operation, "output": output}}))
+print(json.dumps({"status": "ok", "protocol_version": "6", "result": {"operation": operation, "output": output}}))
 "#;
 
 fn prefill_decode_workspace(integration: &str, transport: &str) -> String {
@@ -782,6 +798,14 @@ fn serve_and_recipe_dry_run_share_the_default_case() -> Result<(), Box<dyn Error
         4
     );
     assert_eq!(
+        recipe["measurements"]["benches"][0]["definition"]["warmup_prompts_per_concurrency"],
+        0
+    );
+    assert_eq!(
+        recipe["measurements"]["benches"][0]["execution"]["cases"][0]["warmup_request_count"],
+        0
+    );
+    assert_eq!(
         recipe["measurements"]["benches"][0]["execution"]["cases"][1]["request_count"],
         16
     );
@@ -802,8 +826,16 @@ fn serve_and_recipe_dry_run_share_the_default_case() -> Result<(), Box<dyn Error
         serde_json::json!([1.0, 4.0])
     );
     assert_eq!(
-        recipe["measurements"]["benches"][1]["execution"]["target_metric"],
-        "p99_ttft_ms"
+        recipe["measurements"]["benches"][1]["execution"]["policy"],
+        "highest-feasible-rate-v1"
+    );
+    assert_eq!(
+        recipe["measurements"]["benches"][1]["execution"]["max_search_steps"],
+        3
+    );
+    assert_eq!(
+        recipe["measurements"]["benches"][1]["definition"]["request_slo"]["minimum_good_request_ratio"],
+        0.99
     );
     assert!(
         recipe["measurements"]["benches"][0]["client"]["command"]["argv"][1]
@@ -1255,6 +1287,22 @@ fn static_npmd_on_one_machine_allocates_disjoint_replicas_and_a_public_proxy()
     );
     assert_eq!(plan["server"]["endpoint"]["port"], 8000);
     assert_eq!(plan["measurements"]["evals"][0]["endpoint"]["port"], 8000);
+    assert_eq!(
+        plan["server"]["endpoint"]["completions_path"],
+        "/v1/completions"
+    );
+    assert_eq!(
+        plan["server"]["endpoint"]["chat_completions_path"],
+        "/v1/chat/completions"
+    );
+    assert_eq!(
+        plan["measurements"]["evals"][0]["endpoint"]["completions_path"],
+        plan["server"]["endpoint"]["completions_path"]
+    );
+    assert_eq!(
+        plan["measurements"]["evals"][0]["endpoint"]["chat_completions_path"],
+        plan["server"]["endpoint"]["chat_completions_path"]
+    );
     assert_eq!(plan["server"]["links"][1]["kind"], "kv_transfer");
     assert!(!workspace.root.path().join(".inferlab/records").exists());
     Ok(())
@@ -1596,7 +1644,7 @@ fn trtllm_builtin_proxy_dry_run_uses_rank_zero_worker_urls_without_auxiliary_por
         serde_json::json!({
             "owner": "inferlab",
             "id": "inferlab-trtllm-proxy",
-            "version": 1
+            "version": 2
         })
     );
     assert_eq!(plan["server"]["endpoint"]["port"], 8000);
@@ -1966,21 +2014,41 @@ fn recipe_measurement_overrides_preserve_declared_effective_and_ordered_values()
         "--set",
         "evals.gsm8k.concurrency=8",
         "--set",
+        "evals.gsm8k.trials=5",
+        "--set",
+        "evals.gsm8k.request_body.chat_template_kwargs.enable_thinking=true",
+        "--set",
         "benches.c8k1k.concurrency=[1, 8]",
+        "--set",
+        "benches.c8k1k.warmup_prompts_per_concurrency=2",
+        "--set",
+        "benches.c8k1k.request_body.temperature=1.0",
         "--dry-run",
     ])?;
 
     assert_eq!(plan["server"]["explicit_overrides"], serde_json::json!([]));
     let gsm8k = &plan["measurements"]["evals"][1];
     assert_eq!(gsm8k["declared_definition"]["limit"], 64);
+    assert!(gsm8k["declared_definition"].get("seed").is_none());
+    assert_eq!(gsm8k["declared_definition"]["trials"], 1);
     assert!(gsm8k["declared_definition"].get("concurrency").is_none());
     assert_eq!(gsm8k["definition"]["limit"], 100);
     assert_eq!(gsm8k["definition"]["concurrency"], 8);
+    assert_eq!(gsm8k["definition"]["trials"], 5);
+    assert_eq!(
+        gsm8k["definition"]["request_body"],
+        serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}})
+    );
     assert_eq!(
         gsm8k["overrides"],
         serde_json::json!([
             {"invocation_index": 0, "value": "evals.gsm8k.limit=100"},
             {"invocation_index": 1, "value": "evals.gsm8k.concurrency=8"},
+            {"invocation_index": 2, "value": "evals.gsm8k.trials=5"},
+            {
+                "invocation_index": 3,
+                "value": "evals.gsm8k.request_body.chat_template_kwargs.enable_thinking=true"
+            },
         ])
     );
     let bench = &plan["measurements"]["benches"][0];
@@ -1992,12 +2060,212 @@ fn recipe_measurement_overrides_preserve_declared_effective_and_ordered_values()
         bench["definition"]["concurrency"],
         serde_json::json!([1, 8])
     );
+    assert_eq!(bench["definition"]["warmup_prompts_per_concurrency"], 2);
+    assert_eq!(bench["execution"]["cases"][0]["warmup_request_count"], 2);
+    assert_eq!(bench["execution"]["cases"][1]["warmup_request_count"], 16);
+    assert_eq!(bench["execution"]["cases"][2]["warmup_request_count"], 0);
+    assert_eq!(
+        bench["client"]["effective_definition"]["request_body"],
+        serde_json::json!({"temperature": 1.0})
+    );
+    assert_eq!(bench["client"]["tpot_applicability"], "applicable");
     assert_eq!(
         bench["overrides"],
         serde_json::json!([{
-            "invocation_index": 2,
+            "invocation_index": 4,
             "value": "benches.c8k1k.concurrency=[1, 8]"
+        }, {
+            "invocation_index": 5,
+            "value": "benches.c8k1k.warmup_prompts_per_concurrency=2"
+        }, {
+            "invocation_index": 6,
+            "value": "benches.c8k1k.request_body.temperature=1.0"
         }])
+    );
+    Ok(())
+}
+
+#[test]
+fn concurrency_warmup_count_overflow_fails_definition_resolution() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace.run(&[
+        "recipe",
+        "run",
+        "dsv4-qualify",
+        "--set",
+        "benches.c8k1k.concurrency=[2147483648]",
+        "--set",
+        "benches.c8k1k.prompts_per_concurrency=1",
+        "--set",
+        "benches.c8k1k.warmup_prompts_per_concurrency=2",
+        "--dry-run",
+    ])?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("warmup request count exceeds u32"));
+    Ok(())
+}
+
+#[test]
+fn nested_measurement_override_rejects_traversing_a_scalar() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace.run(&[
+        "recipe",
+        "run",
+        "dsv4-qualify",
+        "--set",
+        "evals.gsm8k.request_body.vendor=\"fixed\"",
+        "--set",
+        "evals.gsm8k.request_body.vendor.mode=\"fast\"",
+        "--dry-run",
+    ])?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("request_body.vendor"), "{stderr}");
+    assert!(stderr.contains("traverses non-table value"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn bench_override_cannot_switch_the_declared_request_source_kind() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let output = workspace.run(&[
+        "recipe",
+        "run",
+        "dsv4-qualify",
+        "--set",
+        "benches.c8k1k.request_source.kind=\"dataset\"",
+        "--dry-run",
+    ])?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("request_source.kind cannot be overridden"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_eval_rejects_zero_trials_and_a_request_body_seed() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let zero = workspace.run(&[
+        "recipe",
+        "run",
+        "dsv4-qualify",
+        "--set",
+        "evals.gsm8k.trials=0",
+        "--dry-run",
+    ])?;
+    assert!(!zero.status.success());
+    let stderr = String::from_utf8(zero.stderr)?;
+    assert!(stderr.contains("trials must be positive"), "{stderr}");
+
+    let path = workspace.root.path().join(".inferlab/workspace.toml");
+    let config = format!(
+        "{}\n[evals.gsm8k.request_body]\nseed = 9\n",
+        fs::read_to_string(&path)?
+    );
+    fs::write(path, config)?;
+    let seed = workspace.run(&["recipe", "run", "dsv4-qualify", "--dry-run"])?;
+    assert!(!seed.status.success());
+    let stderr = String::from_utf8(seed.stderr)?;
+    assert!(
+        stderr.contains(
+            "request_body.seed conflicts with a measurement-runtime-owned request member"
+        ),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn workspace_lm_eval_yaml_resolves_as_the_effective_task_source() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let task_dir = workspace.root.path().join("evals");
+    fs::create_dir_all(&task_dir)?;
+    fs::write(
+        task_dir.join("custom.yaml"),
+        "task: custom_eval\n\
+         dataset_path: json\n\
+         dataset_kwargs:\n\
+           data_files: evals/data.jsonl\n\
+         test_split: test\n\
+         output_type: generate_until\n\
+         doc_to_text: '{{prompt}}'\n\
+         doc_to_target: '{{answer}}'\n\
+         metric_list:\n\
+           - metric: exact_match\n\
+             higher_is_better: true\n",
+    )?;
+    let path = workspace.root.path().join(".inferlab/workspace.toml");
+    let config = fs::read_to_string(&path)?.replace(
+        "task = \"gsm8k\"",
+        "task = { yaml = \"evals/custom.yaml\" }",
+    );
+    fs::write(path, config)?;
+
+    let plan = workspace.run_json(&["recipe", "run", "dsv4-qualify", "--dry-run"])?;
+    let eval = &plan["measurements"]["evals"][1];
+    assert_eq!(
+        eval["declared_definition"]["task"],
+        serde_json::json!({"yaml": "evals/custom.yaml"})
+    );
+    assert_eq!(
+        eval["definition"]["task"]["yaml"],
+        workspace
+            .root
+            .path()
+            .join("evals/custom.yaml")
+            .display()
+            .to_string()
+    );
+    Ok(())
+}
+
+#[test]
+fn workspace_lm_eval_yml_extension_uses_the_pinned_yaml_loader() -> Result<(), Box<dyn Error>> {
+    let workspace = TestWorkspace::new()?;
+    let task_dir = workspace.root.path().join("evals");
+    fs::create_dir_all(&task_dir)?;
+    fs::write(
+        task_dir.join("custom.yml"),
+        "task: custom_eval\noutput_type: generate_until\n",
+    )?;
+    let path = workspace.root.path().join(".inferlab/workspace.toml");
+    let config = fs::read_to_string(&path)?
+        .replace("task = \"gsm8k\"", "task = { yaml = \"evals/custom.yml\" }");
+    fs::write(path, config)?;
+
+    let plan = workspace.run_json(&["recipe", "run", "dsv4-qualify", "--dry-run"])?;
+    assert_eq!(
+        plan["measurements"]["evals"][1]["declared_definition"]["task"],
+        serde_json::json!({"yaml": "evals/custom.yml"})
+    );
+    Ok(())
+}
+
+#[test]
+fn standalone_lm_eval_dataset_override_is_rejected_with_field_context() -> Result<(), Box<dyn Error>>
+{
+    let workspace = TestWorkspace::new()?;
+    let path = workspace.root.path().join(".inferlab/workspace.toml");
+    let config = fs::read_to_string(&path)?.replace(
+        "task = \"gsm8k\"",
+        "task = \"gsm8k\"\ndataset = \"ignored-before-this-fix\"",
+    );
+    fs::write(path, config)?;
+
+    let output = workspace.run(&["recipe", "run", "dsv4-qualify", "--dry-run"])?;
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("dataset"),
+        "validation names the unsupported second dataset authority"
     );
     Ok(())
 }
@@ -3208,10 +3476,10 @@ import sys
 json.load(sys.stdin)
 print(json.dumps({
     "status": "error",
-    "protocol_version": "5",
+    "protocol_version": "6",
     "error": {
         "code": "unsupported_protocol_version",
-        "message": "received protocol version 5; this integration supports protocol version 4",
+        "message": "received protocol version 6; this integration supports protocol version 4",
     },
 }))
 "#;
@@ -3233,7 +3501,7 @@ fn protocol_version_mismatch_names_both_versions_and_the_remedy() -> Result<(), 
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("protocol version 2") && stderr.contains("protocol version 5"),
+        stderr.contains("protocol version 2") && stderr.contains("protocol version 6"),
         "the mismatch names both versions: {stderr}"
     );
     assert!(
@@ -3255,7 +3523,7 @@ fn protocol_version_mismatch_names_both_versions_and_the_remedy() -> Result<(), 
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("protocol version 5") && stderr.contains("protocol version 4"),
+        stderr.contains("protocol version 6") && stderr.contains("protocol version 4"),
         "the structured rejection names both versions: {stderr}"
     );
     assert!(

@@ -11,13 +11,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The shared protocol version used by framework integrations and release-owned
-/// measurement clients. The only accepted value is `5` (serialized as the
-/// string `"5"`); a mismatch is rejected before lowering.
+/// measurement clients. The only accepted value is `6` (serialized as the
+/// string `"6"`); a mismatch is rejected before lowering.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum ProtocolVersion {
-    /// Protocol version 5.
-    #[serde(rename = "5")]
-    V5,
+    /// Protocol version 6.
+    #[serde(rename = "6")]
+    V6,
 }
 
 /// The one JSON request an integration reads from stdin, tagged by the
@@ -303,7 +303,8 @@ pub struct ClientEndpointInput {
     pub protocol: EndpointProtocol,
     pub host: String,
     pub port: u16,
-    pub api_path: String,
+    pub completions_path: String,
+    pub chat_completions_path: String,
 }
 
 /// The measurement an Eval client runs against the workload endpoint.
@@ -319,31 +320,175 @@ pub enum EvalDefinitionInput {
     },
     /// An lm-eval task run with a pass threshold on the chosen metric.
     LmEval {
-        task: String,
-        dataset: Option<String>,
-        split: Option<String>,
+        task: Box<EvalTaskSourceInput>,
+        #[serde(default)]
+        request_body: BTreeMap<String, SettingValue>,
         limit: Option<u32>,
         few_shot: Option<u32>,
         seed: Option<u64>,
+        trials: u32,
         max_tokens: Option<u32>,
         concurrency: Option<u32>,
         metric: String,
+        #[serde(default)]
+        metric_filter: Option<String>,
         threshold: f64,
         timeout_seconds: u64,
     },
+}
+
+/// The resolved lm-eval task source consumed by the release-owned Eval runner.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvalTaskSourceInput {
+    /// One individual task shipped by the pinned lm-eval runtime.
+    BuiltIn { name: String },
+    /// One task closure shipped and identity-bound by the Inferlab release.
+    Bundled {
+        name: String,
+        task_identity: String,
+        path: PathBuf,
+        task_closure_sha256: String,
+        task_definition_sha256: String,
+        prompt_asset_sha256: String,
+        dataset_asset_sha256: String,
+        scorer_sha256: String,
+    },
+    /// One validated workspace-local lm-eval YAML file.
+    WorkspaceYaml { path: PathBuf },
 }
 
 /// The workload shape a Bench client drives, shared across its load cases.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchDefinitionInput {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub request_source: BenchRequestSourceInput,
     pub seed: u64,
-    pub temperature: f64,
+    #[serde(default)]
+    pub request_body: BTreeMap<String, SettingValue>,
+    #[serde(default)]
+    pub request_slo: Option<BenchRequestSloInput>,
     pub timeout_seconds: u64,
     #[serde(default)]
     pub reset_prefix_cache: bool,
+}
+
+/// One closed request origin lowered by Inferlab for the Bench runtime.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BenchRequestSourceInput {
+    /// AIPerf generates exact token-shape prompts from the release-pinned
+    /// synthetic generator.
+    Random {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    /// Inferlab materializes a release-catalog conversation snapshot before
+    /// AIPerf starts.
+    Dataset {
+        dataset: BenchDatasetInput,
+        max_input_tokens: u32,
+        output_tokens: Option<u32>,
+        catalog: BenchDatasetCatalogInput,
+    },
+}
+
+/// Release-qualified public Bench datasets.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchDatasetInput {
+    Sharegpt,
+}
+
+/// Immutable release-catalog facts resolved by the Rust control plane.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchDatasetCatalogInput {
+    pub upstream_identity: String,
+    pub url: String,
+    pub sha256: String,
+    pub source_format: String,
+    pub license: String,
+    pub cache_path: PathBuf,
+    pub cache_state: BenchDatasetCacheState,
+    pub materialization_identity: String,
+}
+
+/// Read-only cache state observed while resolving the Bench plan.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchDatasetCacheState {
+    Missing,
+    Present,
+}
+
+/// One frozen dataset population consumed sequentially by every Bench case.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchPopulationInput {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub entries: u32,
+    pub tpot_applicable: bool,
+}
+
+/// The bounded tokenizer-backed operation that materializes one dataset
+/// population before any Bench case starts.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchDatasetPreparationRequest {
+    pub protocol_version: ProtocolVersion,
+    pub model: MeasurementModelInput,
+    pub request_source: BenchRequestSourceInput,
+    pub source_path: PathBuf,
+    pub required_entries: u32,
+    pub seed: u64,
+    #[serde(default)]
+    pub request_body: BTreeMap<String, SettingValue>,
+    pub artifact_dir: PathBuf,
+}
+
+/// Summary of the realized token counts. Exact per-entry values remain in the
+/// population evidence artifact.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchTokenCountSummary {
+    pub minimum: u32,
+    pub maximum: u32,
+    pub mean: f64,
+}
+
+/// Terminal result of dataset population materialization.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchDatasetPreparationResult {
+    pub schema_version: u32,
+    pub status: ClientStatus,
+    pub materialization_identity: String,
+    pub requested_entries: u32,
+    pub candidate_entries: u64,
+    pub admitted_entries: u64,
+    pub ineligible_entries: u64,
+    #[serde(default)]
+    pub ineligible_reasons: BTreeMap<String, u64>,
+    pub population: Option<BenchPopulationInput>,
+    pub input_tokens: Option<BenchTokenCountSummary>,
+    pub output_tokens: Option<BenchTokenCountSummary>,
+    pub evidence_path: Option<PathBuf>,
+    pub error: Option<String>,
+}
+
+/// Per-request latency bounds lowered to the release-owned Bench runner.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchRequestSloInput {
+    #[serde(default)]
+    pub request_latency_ms: Option<f64>,
+    #[serde(default)]
+    pub ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub tpot_ms: Option<f64>,
+    pub minimum_good_request_ratio: f64,
 }
 
 /// A framework-specific server setting value carried as structured JSON data
@@ -676,13 +821,14 @@ pub enum TargetEndpointScheme {
     Grpc,
 }
 
-/// The workload endpoint's protocol and API path, plus an optional
+/// The workload endpoint's protocol and named OpenAI paths, plus an optional
 /// prefix-cache-reset action a Bench case can invoke between runs.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointRequirement {
     pub protocol: EndpointProtocol,
-    pub api_path: String,
+    pub completions_path: String,
+    pub chat_completions_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cache_reset: Option<HttpActionSpec>,
 }
@@ -725,9 +871,13 @@ pub enum AdapterErrorCode {
 #[serde(deny_unknown_fields)]
 pub struct EvalClientRequest {
     pub protocol_version: ProtocolVersion,
+    pub workspace_root: PathBuf,
+    pub workspace_source_exclusions: Vec<PathBuf>,
     pub endpoint: ClientEndpointInput,
     pub model: MeasurementModelInput,
     pub definition: EvalDefinitionInput,
+    /// Remaining control-plane case budget when the client is released.
+    pub case_budget_seconds: f64,
     pub artifact_dir: PathBuf,
 }
 
@@ -741,7 +891,11 @@ pub struct BenchClientRequest {
     pub endpoint: ClientEndpointInput,
     pub model: MeasurementModelInput,
     pub definition: BenchDefinitionInput,
+    #[serde(default)]
+    pub population: Option<BenchPopulationInput>,
     pub case: BenchCaseInput,
+    /// Remaining control-plane case budget when the client is released.
+    pub case_budget_seconds: f64,
     pub artifact_dir: PathBuf,
 }
 
@@ -751,6 +905,8 @@ pub struct BenchClientRequest {
 pub struct BenchCaseInput {
     pub load_shape: BenchLoadInput,
     pub request_count: u32,
+    #[serde(default)]
+    pub warmup_request_count: u32,
 }
 
 /// How a Bench case paces its requests.
@@ -778,6 +934,74 @@ pub enum ClientStatus {
     Failed,
 }
 
+/// A typed Eval failure category preserved across the client boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalFailureKind {
+    TaskResolution,
+    ProbeTokenizer,
+    ProbeTransport,
+    ProbeHttp,
+    ProbeMalformedResponse,
+    ProbeGeneratedOnlyLogprobs,
+    ProbeTokenizerAlignment,
+    MetricNormalization,
+}
+
+/// The threshold comparison selected from lm-eval's scoring direction.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalMetricComparison {
+    AtLeast,
+    AtMost,
+}
+
+/// The terminal conclusion of an lm-eval metric threshold gate.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalMetricGateConclusion {
+    Passed,
+    Failed,
+}
+
+/// One finite lm-eval metric with its exact native provenance.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalNormalizedMetric {
+    pub source_identity: String,
+    pub metric: String,
+    pub filter: Option<String>,
+    pub native_metric_key: String,
+    pub value: f64,
+    pub higher_is_better: bool,
+}
+
+/// The effective threshold comparison for the configured primary metric.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalMetricGate {
+    pub metric: EvalNormalizedMetric,
+    pub threshold: f64,
+    pub comparison: EvalMetricComparison,
+    pub conclusion: EvalMetricGateConclusion,
+}
+
+/// Reconstructible aggregate counts for fixed outer Eval trials.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalTrialSummary {
+    pub requested_trials: u32,
+    pub issued_trials: u32,
+    pub unissued_trials: u32,
+    pub completed_trials: u32,
+    pub request_failure_trials: u32,
+    pub passed_trials: u32,
+    pub pass_rate: Option<f64>,
+    pub per_trial_metric: String,
+    pub per_trial_filter: Option<String>,
+    pub higher_is_better: bool,
+}
+
 /// The result an Eval client writes for the measurement runtime to consume.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -787,8 +1011,19 @@ pub struct EvalClientResult {
     pub schema_version: u32,
     pub status: ClientStatus,
     pub metrics: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub normalized_metrics: BTreeMap<String, EvalNormalizedMetric>,
+    #[serde(default)]
+    pub gate: Option<EvalMetricGate>,
+    #[serde(default)]
+    pub trial_summary: Option<EvalTrialSummary>,
     pub native_command: Vec<String>,
+    #[serde(default)]
+    pub native_exit_code: Option<i32>,
+    #[serde(default)]
+    pub native_timed_out: bool,
     pub raw_artifacts: Vec<RawArtifact>,
+    pub failure_kind: Option<EvalFailureKind>,
     pub error: Option<String>,
 }
 
@@ -804,10 +1039,28 @@ pub struct BenchClientResult {
     pub failed_requests: u64,
     pub normalization_schema: String,
     pub metrics: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub request_slo: Option<BenchRequestSloResult>,
     pub native_command: Vec<String>,
     pub native_exit_code: Option<i32>,
     pub raw_artifacts: Vec<RawArtifact>,
     pub error: Option<String>,
+}
+
+/// File-bound request-SLO evidence derived from AIPerf profiling records.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchRequestSloResult {
+    pub good_requests: u64,
+    pub good_request_ratio: f64,
+    pub goodput: f64,
+    pub profiling_duration_seconds: f64,
+    pub profiling_duration_source: String,
+    pub request_count_reconciled: bool,
+    #[serde(default)]
+    pub native_aggregate_good_request_count: Option<u64>,
+    #[serde(default)]
+    pub native_aggregate_good_request_count_consistent: Option<bool>,
 }
 
 /// A raw output file a client produced, retained as workload evidence.
@@ -835,4 +1088,8 @@ pub struct AdapterProtocol {
     pub bench_client_request: Option<BenchClientRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_client_result: Option<BenchClientResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_dataset_preparation_request: Option<BenchDatasetPreparationRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_dataset_preparation_result: Option<BenchDatasetPreparationResult>,
 }

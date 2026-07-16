@@ -1,0 +1,48 @@
+{
+  "protocol_version": "6",
+  "workspace_root": "/workspace",
+  "workspace_source_exclusions": [],
+  "endpoint": {
+    "protocol": "http",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "completions_path": "/v1/completions",
+    "chat_completions_path": "/v1/chat/completions"
+  },
+  "model": {
+    "locator": "/models/dsv4",
+    "served_name": "dsv4"
+  },
+  "definition": {
+    "kind": "lm_eval",
+    "task": {
+      "kind": "bundled",
+      "name": "estonia",
+      "task_identity": "inferlab_estonia",
+      "path": "/toolchain/bundled_tasks/estonia/estonia.yaml",
+      "task_closure_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "task_definition_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "prompt_asset_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "dataset_asset_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "scorer_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "request_body": {
+      "temperature": 1.0,
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "limit": 1,
+    "few_shot": 0,
+    "seed": 1234,
+    "trials": 3,
+    "max_tokens": 8192,
+    "concurrency": 1,
+    "metric": "estonia_pass",
+    "metric_filter": "strict-terminal-answer",
+    "threshold": 0.5,
+    "timeout_seconds": 3600
+  },
+  "case_budget_seconds": 3599.0,
+  "artifact_dir": "/records/eval/artifacts"
+}

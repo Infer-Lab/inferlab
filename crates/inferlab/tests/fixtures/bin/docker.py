@@ -115,6 +115,9 @@ elif args[0] == "run":
             handle.write("fixturecid0123")
     if inner[0] in ("python", "python3") and inner[1] == "-c" and "importlib.metadata" in inner[2]:
         # The external-image framework version probe.
+        if fault.get("framework_probe_hang"):
+            time.sleep(60)
+            sys.exit(3)
         print("0.7.fixture")
         sys.exit(0)
     if (

@@ -1,26 +1,35 @@
 mod adaptive;
+mod domain;
 mod record;
 mod runtime;
+mod wire;
 
 use crate::InferlabError;
 use crate::resolve::{ResolvedExecution, current_environment};
 use crate::server::ServerRecord;
+use crate::toml_override::ExactTomlOverride;
 use crate::toolchain::{
-    self, BenchToolchainIdentity, EvalToolchainIdentity, InstalledBenchToolchain,
+    self, BenchToolchainIdentity, BundledEvalTask, EvalToolchainIdentity, InstalledBenchToolchain,
     InstalledEvalToolchain,
 };
 use crate::workspace::{
-    BenchDefinition, EvalDefinition, RequestRate, WorkloadSuiteDefinition, WorkspaceConfig,
-    WorkspaceSnapshot, validate_bench, validate_eval,
-};
-use inferlab_protocol::{
-    BenchDefinitionInput, ClientEndpointInput, EvalDefinitionInput, HttpActionSpec,
-    MeasurementModelInput,
+    AggregateSlo, BenchDataset, BenchDefinition, BenchRequestSource, BenchTpotApplicability,
+    EvalDefinition, RequestRate, WorkloadSuiteDefinition, WorkspaceConfig, WorkspaceSnapshot,
+    validate_bench, validate_eval,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use domain::{
+    AggregateSloBound, BenchDatasetCatalog, BenchPopulation, DatasetCacheState,
+    ResolvedAggregateSlo, ResolvedBenchDefinition, ResolvedBenchRequestSource,
+    ResolvedBenchSloPolicy,
+};
+pub(crate) use domain::{
+    MeasurementModel, WorkloadEndpoint, WorkloadEndpointProtocol, WorkloadHttpAction,
+    WorkloadHttpMethod,
+};
 pub(crate) use record::WorkloadKind;
 pub use record::WorkloadStatus;
 pub(crate) use runtime::skip;
@@ -41,8 +50,9 @@ pub struct EvalPlan {
     pub declared_definition: EvalDefinition,
     pub definition: EvalDefinition,
     pub overrides: Vec<MeasurementOverridePlan>,
-    pub endpoint: ClientEndpointInput,
-    pub model: MeasurementModelInput,
+    pub endpoint: WorkloadEndpoint,
+    pub model: MeasurementModel,
+    pub workspace_source_exclusions: Vec<PathBuf>,
     pub execution: EvalExecutionPlan,
 }
 
@@ -142,6 +152,8 @@ pub enum EvalExecutionPlan {
     NativeOpenAiSmoke,
     LmEval {
         toolchain: Box<EvalToolchainIdentity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bundled_task: Option<Box<BundledEvalTask>>,
         command: ClientCommandPlan,
     },
 }
@@ -149,12 +161,17 @@ pub enum EvalExecutionPlan {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchClientPlan {
     pub toolchain: BenchToolchainIdentity,
-    pub endpoint: ClientEndpointInput,
-    pub model: MeasurementModelInput,
-    pub effective_definition: BenchDefinitionInput,
+    pub endpoint: WorkloadEndpoint,
+    pub model: MeasurementModel,
+    pub effective_definition: ResolvedBenchDefinition,
+    pub tpot_applicability: BenchTpotApplicability,
+    pub slo: ResolvedBenchSloPolicy,
+    pub required_population_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population: Option<BenchPopulation>,
     pub command: ClientCommandPlan,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_cache_reset: Option<inferlab_protocol::HttpActionSpec>,
+    pub prefix_cache_reset: Option<WorkloadHttpAction>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -173,9 +190,7 @@ pub enum BenchExecutionPlan {
     Adaptive {
         policy: String,
         initial_request_rates: Vec<f64>,
-        target_metric: String,
-        target_threshold: f64,
-        max_refinement_steps: u32,
+        max_search_steps: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         min_rate_resolution: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,6 +205,7 @@ pub struct BenchCasePlan {
     pub id: String,
     pub load_shape: LoadShape,
     pub request_count: u32,
+    pub warmup_request_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -206,9 +222,11 @@ pub enum LoadShape {
 }
 
 pub struct MeasurementResolveContext<'a> {
-    pub endpoint: ClientEndpointInput,
-    pub model: MeasurementModelInput,
-    pub prefix_cache_reset: Option<HttpActionSpec>,
+    pub workspace_root: &'a Path,
+    pub workspace_source_exclusions: &'a [PathBuf],
+    pub endpoint: WorkloadEndpoint,
+    pub model: MeasurementModel,
+    pub prefix_cache_reset: Option<WorkloadHttpAction>,
     pub capture_ids: &'a [String],
     pub command_env: &'a BTreeMap<String, String>,
     pub command_cwd: &'a Path,
@@ -278,22 +296,35 @@ pub fn resolve_manual_bench(
     } else {
         Vec::new()
     };
-    let context = MeasurementResolveContext {
-        endpoint: ClientEndpointInput {
-            protocol: recorded.server.endpoint.protocol,
-            host: recorded.server.endpoint.host.clone(),
-            port: recorded.server.endpoint.port,
-            api_path: recorded.server.endpoint.api_path.clone(),
-        },
-        model: MeasurementModelInput {
-            locator: model_locator,
-            served_name: recorded.server.model.served_name.clone(),
-        },
-        prefix_cache_reset: recorded.server.endpoint.prefix_cache_reset.clone(),
-        capture_ids: &capture_ids,
-        command_env: &command_env,
-        command_cwd: &root.join(".inferlab"),
-    };
+    let context =
+        MeasurementResolveContext {
+            workspace_root: root,
+            workspace_source_exclusions: &snapshot.source_exclusions,
+            endpoint: WorkloadEndpoint {
+                protocol: match recorded.server.endpoint.protocol {
+                    inferlab_protocol::EndpointProtocol::Http => WorkloadEndpointProtocol::Http,
+                },
+                host: recorded.server.endpoint.host.clone(),
+                port: recorded.server.endpoint.port,
+                completions_path: recorded.server.endpoint.completions_path.clone(),
+                chat_completions_path: recorded.server.endpoint.chat_completions_path.clone(),
+            },
+            model: MeasurementModel {
+                locator: model_locator,
+                served_name: recorded.server.model.served_name.clone(),
+            },
+            prefix_cache_reset: recorded.server.endpoint.prefix_cache_reset.as_ref().map(
+                |action| WorkloadHttpAction {
+                    method: match action.method {
+                        inferlab_protocol::HttpMethod::Post => WorkloadHttpMethod::Post,
+                    },
+                    path: action.path.clone(),
+                },
+            ),
+            capture_ids: &capture_ids,
+            command_env: &command_env,
+            command_cwd: &root.join(".inferlab"),
+        };
     Ok(ManualBenchPlan {
         invoking_inferlab_version: env!("CARGO_PKG_VERSION").to_owned(),
         target: ManualBenchTarget {
@@ -414,8 +445,15 @@ fn build_bench_plan(
     context: &MeasurementResolveContext<'_>,
     toolchain: &InstalledBenchToolchain,
 ) -> Result<BenchPlan, InferlabError> {
-    let effective_definition = bench_input(&definition);
-    let prefix_cache_reset = if effective_definition.reset_prefix_cache {
+    let tpot_applicability = match &definition {
+        BenchDefinition::Serving { request_source, .. }
+        | BenchDefinition::AdaptiveServing { request_source, .. } => {
+            request_source.tpot_applicability()
+        }
+    };
+    let resolved_definition = resolve_bench_definition(&definition)?;
+    let slo = resolve_bench_slo_policy(&definition)?;
+    let prefix_cache_reset = if resolved_definition.reset_prefix_cache {
         Some(
             context
                 .prefix_cache_reset
@@ -436,18 +474,24 @@ fn build_bench_plan(
         toolchain.python_path.to_string_lossy().into_owned(),
     );
     env.insert("PYTHONNOUSERSITE".to_owned(), "1".to_owned());
+    let execution = resolve_bench_execution(id, &definition)?;
+    let required_population_count = required_population_count(id, &execution)?;
     Ok(BenchPlan {
         id: id.to_owned(),
         capture: context.capture_ids.iter().any(|capture| capture == id),
         declared_definition,
-        execution: resolve_bench_execution(id, &definition)?,
+        execution,
         definition,
         overrides,
         client: BenchClientPlan {
             toolchain: toolchain.identity.clone(),
             endpoint: context.endpoint.clone(),
             model: context.model.clone(),
-            effective_definition,
+            effective_definition: resolved_definition,
+            tpot_applicability,
+            slo,
+            required_population_count,
+            population: None,
             command: ClientCommandPlan {
                 argv: vec![
                     toolchain.python.to_string_lossy().into_owned(),
@@ -471,6 +515,12 @@ fn apply_bench_overrides(
             message: format!("failed to prepare bench {id:?} for overrides: {error}"),
         })?;
     for item in overrides {
+        if item.path == "request_source.kind" {
+            return Err(InferlabError::InvalidOverride {
+                value: item.raw.clone(),
+                message: "Bench request_source.kind cannot be overridden".to_owned(),
+            });
+        }
         apply_definition_override(&mut value, item)?;
     }
     let definition = value
@@ -491,82 +541,19 @@ fn apply_definition_override(
     definition: &mut toml::Value,
     item: &IndexedMeasurementOverride,
 ) -> Result<(), InferlabError> {
-    let path: toml::Table = toml::from_str(&format!("{} = 0", item.path)).map_err(|error| {
-        InferlabError::InvalidOverride {
-            value: item.raw.clone(),
-            message: format!("invalid TOML key path: {error}"),
-        }
-    })?;
-    if path.contains_key("kind") {
+    let patch = ExactTomlOverride::parse(&item.path, &item.raw_value, &item.raw)?;
+    if patch.root_key() == "kind" {
         return Err(InferlabError::InvalidOverride {
             value: item.raw.clone(),
             message: "measurement kind cannot be overridden".to_owned(),
         });
     }
-    let document: toml::Table =
-        toml::from_str(&format!("value = {}", item.raw_value)).map_err(|error| {
-            InferlabError::InvalidOverride {
-                value: item.raw.clone(),
-                message: format!("invalid TOML value: {error}"),
-            }
-        })?;
-    let replacement =
-        document
-            .get("value")
-            .cloned()
-            .ok_or_else(|| InferlabError::InvalidOverride {
-                value: item.raw.clone(),
-                message: "missing override value".to_owned(),
-            })?;
-    let mut patch = toml::Value::Table(path);
-    replace_override_leaf(&mut patch, replacement).map_err(|message| {
-        InferlabError::InvalidOverride {
+    patch
+        .apply_to(definition)
+        .map_err(|message| InferlabError::InvalidOverride {
             value: item.raw.clone(),
             message,
-        }
-    })?;
-    merge_definition_patch(definition, patch).map_err(|message| InferlabError::InvalidOverride {
-        value: item.raw.clone(),
-        message,
-    })
-}
-
-fn replace_override_leaf(
-    current: &mut toml::Value,
-    replacement: toml::Value,
-) -> Result<(), String> {
-    if let toml::Value::Table(table) = current {
-        if table.len() != 1 {
-            return Err("measurement path must contain exactly one TOML key path".to_owned());
-        }
-        let (_, child) = table
-            .iter_mut()
-            .next()
-            .ok_or_else(|| "measurement path must not be empty".to_owned())?;
-        replace_override_leaf(child, replacement)
-    } else {
-        *current = replacement;
-        Ok(())
-    }
-}
-
-fn merge_definition_patch(current: &mut toml::Value, patch: toml::Value) -> Result<(), String> {
-    match (current, patch) {
-        (toml::Value::Table(current), toml::Value::Table(patch)) => {
-            for (key, value) in patch {
-                if let Some(existing) = current.get_mut(&key)
-                    && existing.is_table()
-                    && value.is_table()
-                {
-                    merge_definition_patch(existing, value)?;
-                } else {
-                    current.insert(key, value);
-                }
-            }
-            Ok(())
-        }
-        _ => Err("measurement path parent is not a table".to_owned()),
-    }
+        })
 }
 
 fn apply_eval_overrides(
@@ -725,14 +712,29 @@ fn resolve_eval(
             .ok_or_else(|| InferlabError::InvalidConfig {
                 message: format!("unknown selected eval definition {id:?}"),
             })?;
-    let (definition, override_plan) =
+    let (mut definition, override_plan) =
         apply_eval_overrides(id, declared_definition.clone(), overrides)?;
+    crate::workspace::validate_eval_task_source(context.workspace_root, id, &definition)?;
+    if let EvalDefinition::LmEval {
+        task: crate::workspace::EvalTaskSource::WorkspaceYaml { yaml },
+        ..
+    } = &mut definition
+    {
+        *yaml = context.workspace_root.join(&*yaml);
+    }
     let execution = match &definition {
         EvalDefinition::OpenAiSmoke { .. } => EvalExecutionPlan::NativeOpenAiSmoke,
         EvalDefinition::LmEval { .. } => {
             let toolchain = toolchain.ok_or_else(|| InferlabError::InvalidConfig {
                 message: "lm-eval toolchain was not resolved".to_owned(),
             })?;
+            let bundled_task = match &definition {
+                EvalDefinition::LmEval {
+                    task: crate::workspace::EvalTaskSource::Bundled { bundled },
+                    ..
+                } => Some(Box::new(toolchain.bundled_task(bundled)?)),
+                _ => None,
+            };
             let mut env = context.command_env.clone();
             env.insert(
                 "PYTHONPATH".to_owned(),
@@ -741,6 +743,7 @@ fn resolve_eval(
             env.insert("PYTHONNOUSERSITE".to_owned(), "1".to_owned());
             EvalExecutionPlan::LmEval {
                 toolchain: Box::new(toolchain.identity.clone()),
+                bundled_task,
                 command: ClientCommandPlan {
                     argv: vec![
                         toolchain.python.to_string_lossy().into_owned(),
@@ -760,6 +763,7 @@ fn resolve_eval(
         overrides: override_plan,
         endpoint: context.endpoint.clone(),
         model: context.model.clone(),
+        workspace_source_exclusions: context.workspace_source_exclusions.to_vec(),
         execution,
     })
 }
@@ -768,73 +772,140 @@ fn definitions_are_lm_eval(definitions: &BTreeMap<String, EvalDefinition>, id: &
     matches!(definitions.get(id), Some(EvalDefinition::LmEval { .. }))
 }
 
-fn eval_input(definition: &EvalDefinition) -> EvalDefinitionInput {
-    match definition {
-        EvalDefinition::OpenAiSmoke {
-            prompt,
-            max_tokens,
-            timeout_seconds,
-        } => EvalDefinitionInput::OpenAiSmoke {
-            prompt: prompt.clone(),
-            max_tokens: *max_tokens,
-            timeout_seconds: *timeout_seconds,
-        },
-        EvalDefinition::LmEval {
-            task,
-            dataset,
-            split,
-            limit,
-            few_shot,
-            seed,
-            max_tokens,
-            concurrency,
-            metric,
-            threshold,
-            timeout_seconds,
-        } => EvalDefinitionInput::LmEval {
-            task: task.clone(),
-            dataset: dataset.clone(),
-            split: split.clone(),
-            limit: *limit,
-            few_shot: *few_shot,
-            seed: *seed,
-            max_tokens: *max_tokens,
-            concurrency: *concurrency,
-            metric: metric.clone(),
-            threshold: *threshold,
-            timeout_seconds: *timeout_seconds,
-        },
-    }
-}
-
-fn bench_input(definition: &BenchDefinition) -> BenchDefinitionInput {
+fn resolve_bench_definition(
+    definition: &BenchDefinition,
+) -> Result<ResolvedBenchDefinition, InferlabError> {
     match definition {
         BenchDefinition::Serving {
-            input_tokens,
-            output_tokens,
+            request_source,
             seed,
-            temperature,
+            request_body,
+            request_slo,
             reset_prefix_cache,
             timeout_seconds,
             ..
         }
         | BenchDefinition::AdaptiveServing {
-            input_tokens,
-            output_tokens,
+            request_source,
             seed,
-            temperature,
+            request_body,
+            request_slo,
             reset_prefix_cache,
             timeout_seconds,
             ..
-        } => BenchDefinitionInput {
-            input_tokens: *input_tokens,
-            output_tokens: *output_tokens,
+        } => Ok(ResolvedBenchDefinition {
+            request_source: resolve_bench_request_source(request_source)?,
             seed: *seed,
-            temperature: *temperature,
+            request_body: request_body.clone(),
+            request_slo: request_slo.clone(),
             timeout_seconds: *timeout_seconds,
             reset_prefix_cache: *reset_prefix_cache,
-        },
+        }),
     }
+}
+
+fn resolve_bench_request_source(
+    source: &BenchRequestSource,
+) -> Result<ResolvedBenchRequestSource, InferlabError> {
+    match source {
+        BenchRequestSource::Random {
+            input_tokens,
+            output_tokens,
+        } => Ok(ResolvedBenchRequestSource::Random {
+            input_tokens: *input_tokens,
+            output_tokens: *output_tokens,
+        }),
+        BenchRequestSource::Dataset {
+            dataset,
+            max_input_tokens,
+            output_tokens,
+        } => {
+            let (upstream_identity, url, sha256, materialization_identity) = match dataset {
+                BenchDataset::Sharegpt => (
+                    "huggingface:anon8231489123/ShareGPT_Vicuna_unfiltered@bcd32a724d8460ebe14e1d05b0195e30e9a46cb1:ShareGPT_V3_unfiltered_cleaned_split.json",
+                    "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/bcd32a724d8460ebe14e1d05b0195e30e9a46cb1/ShareGPT_V3_unfiltered_cleaned_split.json",
+                    "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
+                    "sharegpt-single-request-v1",
+                ),
+            };
+            let cache_path = dataset_cache_home()?
+                .join("inferlab/datasets/sha256")
+                .join(sha256);
+            let cache_state = if cache_path.is_file() {
+                DatasetCacheState::Present
+            } else {
+                DatasetCacheState::Missing
+            };
+            Ok(ResolvedBenchRequestSource::Dataset {
+                dataset: *dataset,
+                max_input_tokens: *max_input_tokens,
+                output_tokens: *output_tokens,
+                catalog: BenchDatasetCatalog {
+                    upstream_identity: upstream_identity.to_owned(),
+                    url: url.to_owned(),
+                    sha256: sha256.to_owned(),
+                    source_format: "sharegpt-json-array-v1".to_owned(),
+                    license: "Apache-2.0".to_owned(),
+                    cache_path,
+                    cache_state,
+                    materialization_identity: materialization_identity.to_owned(),
+                },
+            })
+        }
+    }
+}
+
+fn resolve_bench_slo_policy(
+    definition: &BenchDefinition,
+) -> Result<ResolvedBenchSloPolicy, InferlabError> {
+    let (aggregate, request) = match definition {
+        BenchDefinition::Serving {
+            aggregate_slos,
+            request_slo,
+            ..
+        }
+        | BenchDefinition::AdaptiveServing {
+            aggregate_slos,
+            request_slo,
+            ..
+        } => (aggregate_slos, request_slo),
+    };
+    Ok(ResolvedBenchSloPolicy {
+        aggregate: aggregate
+            .iter()
+            .map(resolve_aggregate_slo)
+            .collect::<Result<Vec<_>, _>>()?,
+        request: request.clone(),
+    })
+}
+
+fn resolve_aggregate_slo(slo: &AggregateSlo) -> Result<ResolvedAggregateSlo, InferlabError> {
+    let metric = slo.metric;
+    let bound = match (slo.at_most, slo.at_least) {
+        (Some(value), None) => AggregateSloBound::AtMost(value),
+        (None, Some(value)) => AggregateSloBound::AtLeast(value),
+        _ => {
+            return Err(InferlabError::InvalidConfig {
+                message: format!(
+                    "resolved Bench metric {:?} has no unique SLO bound",
+                    metric.name()
+                ),
+            });
+        }
+    };
+    Ok(ResolvedAggregateSlo { metric, bound })
+}
+
+fn dataset_cache_home() -> Result<PathBuf, InferlabError> {
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cache"))
+        .ok_or_else(|| InferlabError::InvalidConfig {
+            message: "neither XDG_CACHE_HOME nor HOME is set for the dataset cache".to_owned(),
+        })
 }
 
 fn resolve_bench_execution(
@@ -845,6 +916,7 @@ fn resolve_bench_execution(
         BenchDefinition::Serving {
             concurrency,
             prompts_per_concurrency,
+            warmup_prompts_per_concurrency,
             request_rates,
             request_count,
             duration_seconds,
@@ -862,10 +934,16 @@ fn resolve_bench_execution(
                         message: format!("bench {id:?} concurrency request count exceeds u32"),
                     }
                 })?;
+                let warmup_request_count = concurrency
+                    .checked_mul(*warmup_prompts_per_concurrency)
+                    .ok_or_else(|| InferlabError::InvalidConfig {
+                        message: format!("bench {id:?} warmup request count exceeds u32"),
+                    })?;
                 cases.push(BenchCasePlan {
                     id: format!("concurrency-{index:03}"),
                     load_shape: LoadShape::ConcurrencyLimited { concurrency },
                     request_count,
+                    warmup_request_count,
                 });
             }
             for (index, rate) in request_rates.iter().cloned().enumerate() {
@@ -877,15 +955,14 @@ fn resolve_bench_execution(
                         burstiness: *burstiness,
                     },
                     request_count: count,
+                    warmup_request_count: 0,
                 });
             }
             Ok(BenchExecutionPlan::Matrix { cases })
         }
         BenchDefinition::AdaptiveServing {
             initial_request_rates,
-            target_metric,
-            target_threshold,
-            max_refinement_steps,
+            max_search_steps,
             min_rate_resolution,
             request_count,
             duration_seconds,
@@ -895,15 +972,61 @@ fn resolve_bench_execution(
             initial_request_rates.sort_by(f64::total_cmp);
             initial_request_rates.dedup();
             Ok(BenchExecutionPlan::Adaptive {
-                policy: "highest-passing-bisection-v1".to_owned(),
+                policy: "highest-feasible-rate-v1".to_owned(),
                 initial_request_rates,
-                target_metric: target_metric.clone(),
-                target_threshold: *target_threshold,
-                max_refinement_steps: *max_refinement_steps,
+                max_search_steps: *max_search_steps,
                 min_rate_resolution: *min_rate_resolution,
                 request_count: *request_count,
                 duration_seconds: *duration_seconds,
             })
+        }
+    }
+}
+
+fn required_population_count(
+    id: &str,
+    execution: &BenchExecutionPlan,
+) -> Result<u32, InferlabError> {
+    match execution {
+        BenchExecutionPlan::Matrix { cases } => cases.iter().try_fold(0_u32, |largest, case| {
+            let entries = case
+                .warmup_request_count
+                .checked_add(case.request_count)
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!("bench {id:?} request population exceeds u32"),
+                })?;
+            Ok(largest.max(entries))
+        }),
+        BenchExecutionPlan::Adaptive {
+            initial_request_rates,
+            max_search_steps,
+            request_count,
+            duration_seconds,
+            ..
+        } => {
+            if let Some(request_count) = request_count {
+                return Ok(*request_count);
+            }
+            let initial = initial_request_rates
+                .iter()
+                .copied()
+                .max_by(f64::total_cmp)
+                .ok_or_else(|| InferlabError::InvalidConfig {
+                    message: format!("adaptive bench {id:?} has no initial request rate"),
+                })?;
+            let factor = 2_f64.powf(f64::from(*max_search_steps));
+            let largest_rate = initial * factor;
+            if !largest_rate.is_finite() {
+                return Err(InferlabError::InvalidConfig {
+                    message: format!("adaptive bench {id:?} request population exceeds u32"),
+                });
+            }
+            resolved_request_count(
+                id,
+                &RequestRate::Finite(largest_rate),
+                None,
+                *duration_seconds,
+            )
         }
     }
 }

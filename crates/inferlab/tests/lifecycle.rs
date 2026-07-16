@@ -220,9 +220,33 @@ impl TestWorkspace {
 #[test]
 fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
     let workspace = TestWorkspace::new()?;
-    let started = workspace.run_json(&["serve", "start", "dsv4-qualify"])?;
+    let start_output = workspace.run(&["serve", "start", "dsv4-qualify"])?;
+    assert!(
+        start_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&start_output.stdout)?;
     let id = started["id"].as_str().ok_or("missing record id")?;
     assert_datetime_record_id(id, "serve-dsv4-qualify-tp2")?;
+    let start_progress = String::from_utf8_lossy(&start_output.stderr);
+    for phase in [
+        "resolution",
+        "local and remote preflight",
+        "record created",
+        "process launch",
+        "readiness",
+    ] {
+        assert!(
+            start_progress.contains(&format!("phase=\"{phase}\"")),
+            "missing {phase:?}: {start_progress}"
+        );
+    }
+    assert!(start_progress.contains(&format!("record=\"{id}\"")));
+    assert!(start_progress.contains("record_dir=\""));
+    assert!(start_progress.contains("item=\"server\" position=1/1"));
+    assert!(start_progress.contains("log=\""));
+    assert!(!String::from_utf8_lossy(&start_output.stdout).contains("progress:"));
 
     assert_eq!(started["status"], "running");
     assert!(started["resolved"]["recipe"].is_null());
@@ -329,7 +353,18 @@ fn start_status_logs_and_stop_share_one_record() -> Result<(), Box<dyn Error>> {
         "captured stdout preserves the fixture server's startup banner"
     );
 
-    let stopped = workspace.run_json(&["serve", "stop", id])?;
+    let stop_output = workspace.run(&["serve", "stop", id])?;
+    assert!(
+        stop_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
+    let stopped: Value = serde_json::from_slice(&stop_output.stdout)?;
+    let stop_progress = String::from_utf8_lossy(&stop_output.stderr);
+    assert!(stop_progress.contains("phase=\"process termination\""));
+    assert!(stop_progress.contains("phase=\"log synchronization\""));
+    assert!(stop_progress.contains("item=\"server\" position=1/1"));
+    assert!(stop_progress.contains("log=\""));
     assert_eq!(stopped["status"], "stopped");
     let evidence = process_evidence(&stopped, "server")?;
     assert_eq!(evidence["cleanup"][0]["verified"], true);
@@ -1044,7 +1079,11 @@ if operation == "plan_serve":
         }],
         "links": [],
         "routing": {"owner": "direct", "role": role["id"], "replica": 0},
-        "endpoint": {"protocol": "http", "api_path": "/v1/completions"},
+        "endpoint": {
+            "protocol": "http",
+            "completions_path": "/v1/completions",
+            "chat_completions_path": "/v1/chat/completions",
+        },
     }
 elif operation == "render_serve":
     allocations = input["allocations"]
@@ -1102,7 +1141,7 @@ else:
     raise ValueError(operation)
 print(json.dumps({
     "status": "ok",
-    "protocol_version": "5",
+    "protocol_version": "6",
     "result": {"operation": operation, "output": output}
 }))
 "#;

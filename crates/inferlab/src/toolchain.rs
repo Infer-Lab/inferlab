@@ -1,21 +1,26 @@
 use crate::InferlabError;
+use crate::progress::{Phase, Progress};
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::time_bound::OperationBound;
+
 const INFERLAB_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Schema version written into `complete.json` and required when reading it
 /// back; the write and read gates share this one const.
-const COMPLETION_SCHEMA_VERSION: u32 = 2;
-const EVAL_RUNNER_VERSION: &str = "0.1.0";
-const BENCH_RUNNER_VERSION: &str = "0.1.0";
+const COMPLETION_SCHEMA_VERSION: u32 = 3;
+const EVAL_RUNNER_VERSION: &str = "0.3.0";
+const BENCH_RUNNER_VERSION: &str = "0.3.0";
 const MANIFEST: &str = include_str!("../resources/eval-toolchain/pixi.toml");
 const LOCK: &str = include_str!("../resources/eval-toolchain/pixi.lock");
 const EVAL_RUNNER: &str = include_str!("../resources/toolchain-python/eval_client.py");
+const LM_EVAL_ENTRY: &str = include_str!("../resources/toolchain-python/lm_eval_entry.py");
 const BENCH_RUNNER: &str = include_str!("../resources/toolchain-python/bench_client.py");
 // The complete adapter-sdk package as the runners import it: the runners
 // use package-level names, so every module of the package ships and every
@@ -31,6 +36,10 @@ const PROTOCOL_RUNTIME: &str =
     include_str!("../resources/toolchain-python/inferlab_adapter_sdk/runtime.py");
 const GENERATED_PROTOCOL: &str =
     include_str!("../resources/toolchain-python/inferlab_adapter_sdk/_generated.py");
+const ESTONIA_TASK: &str = include_str!("../resources/bundled-eval-tasks/estonia/estonia.yaml");
+const ESTONIA_PROMPT: &str = include_str!("../resources/bundled-eval-tasks/estonia/prompt.txt");
+const ESTONIA_DATASET: &str = include_str!("../resources/bundled-eval-tasks/estonia/dataset.json");
+const ESTONIA_SCORER: &str = include_str!("../resources/bundled-eval-tasks/estonia/estonia.py");
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +51,20 @@ pub struct EvalToolchainIdentity {
     pub runner_version: String,
     pub runner_sha256: String,
     pub lm_eval_version: String,
+    pub bundled_task_closure_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundledEvalTask {
+    pub name: String,
+    pub task_identity: String,
+    pub path: PathBuf,
+    pub task_closure_sha256: String,
+    pub task_definition_sha256: String,
+    pub prompt_asset_sha256: String,
+    pub dataset_asset_sha256: String,
+    pub scorer_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -61,6 +84,7 @@ pub struct InstalledEvalToolchain {
     pub python: PathBuf,
     pub runner: PathBuf,
     pub python_path: PathBuf,
+    pub bundled_tasks_path: PathBuf,
 }
 
 pub struct InstalledBenchToolchain {
@@ -107,7 +131,14 @@ struct BenchHandshake {
     aiperf_version: String,
 }
 
-pub fn install() -> Result<InstallReport, InferlabError> {
+#[derive(Debug, Deserialize)]
+struct PixiHostInfo {
+    platform: String,
+    virtual_packages: Vec<String>,
+}
+
+pub(crate) fn install_with_progress(progress: &Progress) -> Result<InstallReport, InferlabError> {
+    progress.phase(Phase::named("installation-state inspection"))?;
     let platform = host_platform()?;
     let path = install_path(platform)?;
     let parent = path
@@ -118,6 +149,7 @@ pub fn install() -> Result<InstallReport, InferlabError> {
     create_dir_all(parent)?;
     let lock_path = parent.join(format!(".{platform}.install.lock"));
     let lock = open_lock(&lock_path)?;
+    progress.phase(Phase::named("writer-lock waiting").lock(&lock_path))?;
     lock.lock_exclusive()
         .map_err(|source| InferlabError::ToolchainIo {
             operation: "lock",
@@ -135,11 +167,15 @@ pub fn install() -> Result<InstallReport, InferlabError> {
     }
 
     if path.exists() {
+        progress.phase(Phase::named("incomplete-installation replacement"))?;
         fs::remove_dir_all(&path).map_err(|source| removal_error(&path, source))?;
     }
     write_release_files(&path)?;
+    progress.phase(Phase::named("Pixi installation"))?;
     install_locked(&path)?;
+    progress.phase(Phase::named("Eval verification"))?;
     let eval = eval_identity(platform, verify_eval_runtime(&path)?);
+    progress.phase(Phase::named("Bench verification"))?;
     let bench = bench_identity(platform, verify_bench_runtime(&path)?);
     write_completion(
         &path,
@@ -167,7 +203,28 @@ pub fn require_eval() -> Result<InstalledEvalToolchain, InferlabError> {
         python: eval_python_path(&path),
         runner: eval_runner_path(&path),
         python_path: path.join("runner"),
+        bundled_tasks_path: path.join("runner/inferlab_eval_runner/bundled_tasks"),
     })
+}
+
+impl InstalledEvalToolchain {
+    pub fn bundled_task(&self, name: &str) -> Result<BundledEvalTask, InferlabError> {
+        if name != "estonia" {
+            return Err(InferlabError::InvalidConfig {
+                message: format!("unknown bundled Eval task {name:?}"),
+            });
+        }
+        Ok(BundledEvalTask {
+            name: name.to_owned(),
+            task_identity: "inferlab_estonia".to_owned(),
+            path: self.bundled_tasks_path.join("estonia/estonia.yaml"),
+            task_closure_sha256: bundled_task_closure_digest(),
+            task_definition_sha256: digest(ESTONIA_TASK.as_bytes()),
+            prompt_asset_sha256: digest(ESTONIA_PROMPT.as_bytes()),
+            dataset_asset_sha256: digest(ESTONIA_DATASET.as_bytes()),
+            scorer_sha256: digest(ESTONIA_SCORER.as_bytes()),
+        })
+    }
 }
 
 pub fn require_bench() -> Result<InstalledBenchToolchain, InferlabError> {
@@ -190,28 +247,115 @@ fn require_completion(path: &Path, platform: &str) -> Result<Completion, Inferla
 }
 
 fn host_platform() -> Result<&'static str, InferlabError> {
-    if cfg!(all(
-        target_os = "linux",
-        target_env = "gnu",
-        target_arch = "x86_64"
-    )) {
-        Ok("linux-x86_64")
-    } else if cfg!(all(
-        target_os = "linux",
-        target_env = "gnu",
-        target_arch = "aarch64"
-    )) {
-        Ok("linux-aarch64")
-    } else {
-        Err(InferlabError::UnsupportedToolchainPlatform {
-            platform: format!(
-                "{}-{}-{}",
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown-libc")
-            ),
-        })
+    // [[RFC-0004:C-INFERLAB-TOOLCHAIN]] The release binary is statically
+    // linked with musl, so its compilation target cannot describe the host
+    // ABI that the separately installed measurement environments must use.
+    let uname = rustix::system::uname();
+    let sysname = uname.sysname().to_string_lossy();
+    let machine = uname.machine().to_string_lossy();
+    let kernel_platform = resolve_kernel_platform(&sysname, &machine)?;
+    let pixi = pixi_host_info()?;
+    resolve_host_platform(&sysname, &machine, kernel_platform, &pixi)
+}
+
+fn resolve_kernel_platform(
+    sysname: &str,
+    machine: &str,
+) -> Result<(&'static str, &'static str), InferlabError> {
+    match (sysname, machine) {
+        ("Linux", "x86_64") => Ok(("linux-x86_64", "linux-64")),
+        ("Linux", "aarch64") => Ok(("linux-aarch64", "linux-aarch64")),
+        _ => Err(InferlabError::UnsupportedToolchainPlatform {
+            platform: format!("kernel={sysname}/{machine}"),
+        }),
     }
+}
+
+fn resolve_host_platform(
+    sysname: &str,
+    machine: &str,
+    (platform, expected_pixi_platform): (&'static str, &'static str),
+    pixi: &PixiHostInfo,
+) -> Result<&'static str, InferlabError> {
+    if pixi.platform != expected_pixi_platform {
+        return Err(InferlabError::UnsupportedToolchainPlatform {
+            platform: format!(
+                "kernel={sysname}/{machine}, pixi-platform={}",
+                pixi.platform
+            ),
+        });
+    }
+    if !pixi
+        .virtual_packages
+        .iter()
+        .any(|package| package == "__glibc" || package.starts_with("__glibc="))
+    {
+        return Err(InferlabError::UnsupportedToolchainPlatform {
+            platform: format!(
+                "kernel={sysname}/{machine}, pixi-platform={}, virtual-packages contain no __glibc",
+                pixi.platform
+            ),
+        });
+    }
+    Ok(platform)
+}
+
+fn pixi_host_info() -> Result<PixiHostInfo, InferlabError> {
+    let argv = ["pixi", "info", "--json"];
+    let bound = OperationBound::unbounded();
+    let output = crate::container::run_with_bound(&argv, Some(Path::new("/")), None, &bound, None);
+    let (status, stdout, stderr) = match output {
+        Ok(crate::container::BoundedWait::Exited {
+            status,
+            stdout,
+            stderr,
+        }) => (status, stdout, stderr),
+        Ok(crate::container::BoundedWait::Expired { .. }) => {
+            return Err(InferlabError::ToolchainVerification {
+                message: "unbounded Pixi host-platform inspection unexpectedly expired".to_owned(),
+            });
+        }
+        Ok(crate::container::BoundedWait::Interrupted { kill, .. }) => {
+            kill.map_err(|source| InferlabError::LaunchToolchain {
+                action: "Pixi host-platform inspection cleanup",
+                source,
+            })?;
+            return Err(InferlabError::LaunchToolchain {
+                action: "Pixi host-platform inspection",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "host-platform inspection was interrupted",
+                ),
+            });
+        }
+        Err(
+            crate::container::BoundedError::Launch(source)
+            | crate::container::BoundedError::Stdin(source)
+            | crate::container::BoundedError::Wait(source),
+        ) => {
+            return Err(InferlabError::LaunchToolchain {
+                action: "Pixi host-platform inspection",
+                source,
+            });
+        }
+        Err(crate::container::BoundedError::WaitCleanup { source, .. }) => {
+            return Err(InferlabError::LaunchToolchain {
+                action: "Pixi host-platform inspection",
+                source,
+            });
+        }
+    };
+    if !status.success() {
+        return Err(InferlabError::ToolchainExit {
+            action: "Pixi host-platform inspection",
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        });
+    }
+    serde_json::from_slice(&stdout).map_err(|error| InferlabError::ToolchainVerification {
+        message: format!("Pixi host-platform inspection returned invalid JSON: {error}"),
+    })
 }
 
 fn data_home() -> Result<PathBuf, InferlabError> {
@@ -240,8 +384,15 @@ fn eval_identity(platform: &str, handshake: EvalHandshake) -> EvalToolchainIdent
         manifest_sha256: digest(MANIFEST.as_bytes()),
         lock_sha256: digest(LOCK.as_bytes()),
         runner_version: handshake.runner_version,
-        runner_sha256: runner_digest(EVAL_RUNNER.as_bytes()),
+        runner_sha256: eval_runner_digest(
+            EVAL_RUNNER.as_bytes(),
+            LM_EVAL_ENTRY.as_bytes(),
+            PROTOCOL_INIT.as_bytes(),
+            PROTOCOL_RUNTIME.as_bytes(),
+            GENERATED_PROTOCOL.as_bytes(),
+        ),
         lm_eval_version: handshake.lm_eval_version,
+        bundled_task_closure_sha256: bundled_task_closure_digest(),
     }
 }
 
@@ -261,6 +412,22 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn bundled_task_closure_digest() -> String {
+    let mut digest = Sha256::new();
+    for (path, contents) in [
+        ("estonia/dataset.json", ESTONIA_DATASET.as_bytes()),
+        ("estonia/estonia.py", ESTONIA_SCORER.as_bytes()),
+        ("estonia/estonia.yaml", ESTONIA_TASK.as_bytes()),
+        ("estonia/prompt.txt", ESTONIA_PROMPT.as_bytes()),
+    ] {
+        digest.update(path.len().to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update(contents.len().to_le_bytes());
+        digest.update(contents);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn runner_digest(runner: &[u8]) -> String {
     runner_digest_parts(
         runner,
@@ -273,6 +440,22 @@ fn runner_digest(runner: &[u8]) -> String {
 fn runner_digest_parts(runner: &[u8], init: &[u8], runtime: &[u8], generated: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(runner);
+    digest.update(init);
+    digest.update(runtime);
+    digest.update(generated);
+    format!("{:x}", digest.finalize())
+}
+
+fn eval_runner_digest(
+    runner: &[u8],
+    entry: &[u8],
+    init: &[u8],
+    runtime: &[u8],
+    generated: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(runner);
+    digest.update(entry);
     digest.update(init);
     digest.update(runtime);
     digest.update(generated);
@@ -305,13 +488,20 @@ fn write_release_files(path: &Path) -> Result<(), InferlabError> {
     let eval_runner = path.join("runner/inferlab_eval_runner");
     let bench_runner = path.join("runner/inferlab_bench_runner");
     let protocol = path.join("runner/inferlab_adapter_sdk");
+    let estonia = path.join("runner/inferlab_eval_runner/bundled_tasks/estonia");
     create_dir_all(&eval_runner)?;
     create_dir_all(&bench_runner)?;
     create_dir_all(&protocol)?;
+    create_dir_all(&estonia)?;
     write(path.join("pixi.toml"), MANIFEST)?;
     write(path.join("pixi.lock"), LOCK)?;
     write(eval_runner.join("eval_client.py"), EVAL_RUNNER)?;
+    write(eval_runner.join("lm_eval_entry.py"), LM_EVAL_ENTRY)?;
     write(eval_runner.join("__init__.py"), "")?;
+    write(estonia.join("estonia.yaml"), ESTONIA_TASK)?;
+    write(estonia.join("prompt.txt"), ESTONIA_PROMPT)?;
+    write(estonia.join("dataset.json"), ESTONIA_DATASET)?;
+    write(estonia.join("estonia.py"), ESTONIA_SCORER)?;
     write(bench_runner.join("bench_client.py"), BENCH_RUNNER)?;
     write(bench_runner.join("__init__.py"), "")?;
     write(protocol.join("__init__.py"), PROTOCOL_INIT)?;
@@ -329,23 +519,65 @@ fn write(path: PathBuf, contents: &str) -> Result<(), InferlabError> {
 
 fn install_locked(path: &Path) -> Result<(), InferlabError> {
     let manifest = path.join("pixi.toml");
-    let output = Command::new("pixi")
-        .args(["install", "--manifest-path"])
-        .arg(&manifest)
-        .args(["--all", "--locked"])
-        .output()
-        .map_err(|source| InferlabError::LaunchToolchain {
-            action: "Pixi install",
-            source,
-        })?;
-    if output.status.success() {
+    let argv = vec![
+        OsString::from("pixi"),
+        OsString::from("install"),
+        OsString::from("--manifest-path"),
+        manifest.into_os_string(),
+        OsString::from("--all"),
+        OsString::from("--locked"),
+    ];
+    let bound = OperationBound::unbounded();
+    let (status, stdout, stderr) =
+        match crate::container::run_with_bound(&argv, None, None, &bound, None) {
+            Ok(crate::container::BoundedWait::Exited {
+                status,
+                stdout,
+                stderr,
+            }) => (status, stdout, stderr),
+            Ok(crate::container::BoundedWait::Expired { .. }) => {
+                return Err(InferlabError::ToolchainVerification {
+                    message: "unbounded Pixi installation unexpectedly expired".to_owned(),
+                });
+            }
+            Ok(crate::container::BoundedWait::Interrupted { kill, .. }) => {
+                kill.map_err(|source| InferlabError::LaunchToolchain {
+                    action: "Pixi install cleanup",
+                    source,
+                })?;
+                return Err(InferlabError::LaunchToolchain {
+                    action: "Pixi install",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "Pixi installation was interrupted",
+                    ),
+                });
+            }
+            Err(
+                crate::container::BoundedError::Launch(source)
+                | crate::container::BoundedError::Stdin(source)
+                | crate::container::BoundedError::Wait(source),
+            ) => {
+                return Err(InferlabError::LaunchToolchain {
+                    action: "Pixi install",
+                    source,
+                });
+            }
+            Err(crate::container::BoundedError::WaitCleanup { source, .. }) => {
+                return Err(InferlabError::LaunchToolchain {
+                    action: "Pixi install",
+                    source,
+                });
+            }
+        };
+    if status.success() {
         Ok(())
     } else {
         Err(InferlabError::ToolchainExit {
             action: "Pixi install",
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 }
@@ -513,9 +745,17 @@ fn eval_identity_matches(identity: &EvalToolchainIdentity, platform: &str) -> bo
         &identity.lock_sha256,
         platform,
     ) && identity.runner_version == EVAL_RUNNER_VERSION
-        && identity.runner_sha256 == runner_digest(EVAL_RUNNER.as_bytes())
+        && identity.runner_sha256
+            == eval_runner_digest(
+                EVAL_RUNNER.as_bytes(),
+                LM_EVAL_ENTRY.as_bytes(),
+                PROTOCOL_INIT.as_bytes(),
+                PROTOCOL_RUNTIME.as_bytes(),
+                GENERATED_PROTOCOL.as_bytes(),
+            )
         && pinned_pypi_version("eval", "lm-eval")
             .is_ok_and(|expected| identity.lm_eval_version == expected)
+        && identity.bundled_task_closure_sha256 == bundled_task_closure_digest()
 }
 
 fn bench_identity_matches(identity: &BenchToolchainIdentity, platform: &str) -> bool {
@@ -548,13 +788,31 @@ fn release_files_match(path: &Path) -> bool {
     let manifest = fs::read(path.join("pixi.toml")).ok();
     let lock = fs::read(path.join("pixi.lock")).ok();
     let eval_runner = fs::read(eval_runner_path(path)).ok();
+    let lm_eval_entry = fs::read(path.join("runner/inferlab_eval_runner/lm_eval_entry.py")).ok();
     let bench_runner = fs::read(bench_runner_path(path)).ok();
     let protocol_init = fs::read(path.join("runner/inferlab_adapter_sdk/__init__.py")).ok();
     let protocol_runtime = fs::read(path.join("runner/inferlab_adapter_sdk/runtime.py")).ok();
     let protocol = fs::read(path.join("runner/inferlab_adapter_sdk/_generated.py")).ok();
+    let bundled_task =
+        fs::read(path.join("runner/inferlab_eval_runner/bundled_tasks/estonia/estonia.yaml")).ok();
+    let bundled_prompt =
+        fs::read(path.join("runner/inferlab_eval_runner/bundled_tasks/estonia/prompt.txt")).ok();
+    let bundled_dataset =
+        fs::read(path.join("runner/inferlab_eval_runner/bundled_tasks/estonia/dataset.json")).ok();
+    let bundled_scorer =
+        fs::read(path.join("runner/inferlab_eval_runner/bundled_tasks/estonia/estonia.py")).ok();
     let on_disk_digest = |runner: Option<&[u8]>| -> Option<String> {
         Some(runner_digest_parts(
             runner?,
+            protocol_init.as_deref()?,
+            protocol_runtime.as_deref()?,
+            protocol.as_deref()?,
+        ))
+    };
+    let on_disk_eval_digest = || -> Option<String> {
+        Some(eval_runner_digest(
+            eval_runner.as_deref()?,
+            lm_eval_entry.as_deref()?,
             protocol_init.as_deref()?,
             protocol_runtime.as_deref()?,
             protocol.as_deref()?,
@@ -566,8 +824,19 @@ fn release_files_match(path: &Path) -> bool {
         && lock
             .as_deref()
             .is_some_and(|bytes| digest(bytes) == digest(LOCK.as_bytes()))
-        && on_disk_digest(eval_runner.as_deref()) == Some(runner_digest(EVAL_RUNNER.as_bytes()))
+        && on_disk_eval_digest()
+            == Some(eval_runner_digest(
+                EVAL_RUNNER.as_bytes(),
+                LM_EVAL_ENTRY.as_bytes(),
+                PROTOCOL_INIT.as_bytes(),
+                PROTOCOL_RUNTIME.as_bytes(),
+                GENERATED_PROTOCOL.as_bytes(),
+            ))
         && on_disk_digest(bench_runner.as_deref()) == Some(runner_digest(BENCH_RUNNER.as_bytes()))
+        && bundled_task.as_deref() == Some(ESTONIA_TASK.as_bytes())
+        && bundled_prompt.as_deref() == Some(ESTONIA_PROMPT.as_bytes())
+        && bundled_dataset.as_deref() == Some(ESTONIA_DATASET.as_bytes())
+        && bundled_scorer.as_deref() == Some(ESTONIA_SCORER.as_bytes())
 }
 
 fn eval_python_path(path: &Path) -> PathBuf {
@@ -665,10 +934,61 @@ fn process_holds_path(proc_dir: &Path, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::holding_processes;
+    use super::{PixiHostInfo, holding_processes, resolve_host_platform, resolve_kernel_platform};
     use std::fs;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn runtime_host_resolution_supports_both_release_architectures() -> Result<(), String> {
+        for (machine, pixi_platform, expected) in [
+            ("x86_64", "linux-64", "linux-x86_64"),
+            ("aarch64", "linux-aarch64", "linux-aarch64"),
+        ] {
+            let pixi = PixiHostInfo {
+                platform: pixi_platform.to_owned(),
+                virtual_packages: vec!["__glibc=2.35=0".to_owned()],
+            };
+            let kernel_platform =
+                resolve_kernel_platform("Linux", machine).map_err(|error| error.to_string())?;
+            assert_eq!(
+                resolve_host_platform("Linux", machine, kernel_platform, &pixi)
+                    .map_err(|error| error.to_string())?,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_host_resolution_rejects_kernel_and_pixi_architecture_drift() -> Result<(), String> {
+        let pixi = PixiHostInfo {
+            platform: "linux-aarch64".to_owned(),
+            virtual_packages: vec!["__glibc=2.35=0".to_owned()],
+        };
+
+        let kernel_platform =
+            resolve_kernel_platform("Linux", "x86_64").map_err(|error| error.to_string())?;
+        let error = match resolve_host_platform("Linux", "x86_64", kernel_platform, &pixi) {
+            Ok(platform) => return Err(format!("mismatched runtime facts admitted {platform}")),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("kernel=Linux/x86_64"));
+        assert!(error.to_string().contains("pixi-platform=linux-aarch64"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_host_resolution_reports_unsupported_kernel_facts() -> Result<(), String> {
+        let error = match resolve_kernel_platform("Darwin", "arm64") {
+            Ok((platform, _)) => return Err(format!("unsupported kernel admitted {platform}")),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("kernel=Darwin/arm64"));
+        Ok(())
+    }
 
     #[test]
     fn holders_are_named_by_pid_and_comm() -> Result<(), String> {

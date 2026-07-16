@@ -1,17 +1,18 @@
 use crate::InferlabError;
-use crate::adapter::{AdapterClient, executable_name};
+use crate::adapter::{AdapterClient, AdapterLowering, executable_name};
+use crate::toml_override::ExactTomlOverride;
 use crate::workload::{MeasurementPlan, MeasurementResolveContext, resolve_measurements};
 use crate::workspace::{
-    DEFAULT_CAPTURE_CONTROL_DEADLINE_SECONDS, LaunchBinding, LoadedWorkspace, NsysEscapes,
-    PlacementBinding, PlacementRoleBinding, ServerCaseDefinition, ServerDefinition,
+    DEFAULT_CAPTURE_CONTROL_DEADLINE_SECONDS, LaunchBinding, LoadedWorkspace, ModelDefinition,
+    ModelWeightBinding, NsysEscapes, PlacementBinding, PlacementRoleBinding, RecipeDefinition,
+    ServerCaseDefinition, ServerDefinition, StackDefinition, WorkloadSuiteDefinition,
     WorkspaceSnapshot,
 };
 use inferlab_protocol::{
-    AllocationLaunch, BuiltinRouterKind, CaptureTargetRequirement, ClientEndpointInput,
-    EndpointAssignment, EndpointProtocol, KvTransferMechanism, LaunchFileDeclaration,
-    MeasurementModelInput, Parallelism, PlanServeInput, PlanServeResult, ProcessSpec,
-    ProtocolVersion, ReadinessProbe, RenderInputDeclaration, RenderServeInput,
-    RenderedServeProcess, RoutingResult, ServeModelInput, ServeProcessAllocation,
+    AllocationLaunch, BuiltinRouterKind, CaptureTargetRequirement, EndpointAssignment,
+    EndpointProtocol, KvTransferMechanism, LaunchFileDeclaration, Parallelism, PlanServeInput,
+    PlanServeResult, ProcessSpec, ProtocolVersion, ReadinessProbe, RenderInputDeclaration,
+    RenderServeInput, RenderedServeProcess, RoutingResult, ServeModelInput, ServeProcessAllocation,
     ServeReplicaRequirement, ServeRoleInput, ServeRoleKind, ServeRoleLink, ServeRoleResult,
     ServeTopology, SettingValue, SuppliedRenderInput, TargetEndpointScheme,
 };
@@ -321,6 +322,71 @@ struct ResolvedRoleInput {
     input: ServeRoleInput,
 }
 
+/// Selected public definitions and local bindings. `LoadedWorkspace` already
+/// owns loading, semantic validation, and source identity; this stage only
+/// selects the exact workflow inputs and never reconstructs those facts.
+struct WorkflowSelection<'a> {
+    server_id: String,
+    recipe: Option<RecipePlan>,
+    server: &'a ServerDefinition,
+    model: &'a ModelDefinition,
+    stack: &'a StackDefinition,
+    stack_checks: Vec<crate::environment::PlannedEnvironmentCheck>,
+    suite: Option<&'a WorkloadSuiteDefinition>,
+    case_id: Option<String>,
+    case: Option<&'a ServerCaseDefinition>,
+    case_selection: Option<CaseSelectionSource>,
+    weight: &'a ModelWeightBinding,
+    placement_id: String,
+    placement_selection: PlacementSelectionSource,
+    placement: &'a PlacementBinding,
+}
+
+/// Effective server input after case and invocation precedence, before the
+/// integration is allowed to plan framework-specific roles and processes.
+struct EffectiveServerInput {
+    topology: ServeTopology,
+    readiness_timeout_seconds: u64,
+    routing_backend: Option<String>,
+    kv_transfer: Option<KvTransferMechanism>,
+    profiling: bool,
+    capture_control_deadline_seconds: u64,
+    override_patches: Vec<IndexedServerOverride>,
+    role_resolutions: Vec<ResolvedRoleInput>,
+    declarations: Vec<ServerDeclarationPlan>,
+    role_inputs: Vec<ServeRoleInput>,
+}
+
+struct LoweringEvidence {
+    request_sha256: String,
+    response_sha256: String,
+    timing: crate::time_bound::OperationTimingEvidence,
+}
+
+struct PlannedServeStage {
+    planned: PlanServeResult,
+    evidence: LoweringEvidence,
+    requirements: Vec<ProcessRequirement>,
+    integration_process_count: usize,
+    public_process: String,
+}
+
+struct RenderedServeStage {
+    evidence: LoweringEvidence,
+    allocations: Vec<ResolvedProcessAllocation>,
+    rendered_processes: Vec<RenderedServeProcess>,
+}
+
+struct RuntimeRealizationStage {
+    processes: Vec<ProcessPlan>,
+    public_endpoint: EndpointPlan,
+    device_count: u32,
+    selected_machines: Vec<String>,
+    network: Option<NetworkPlan>,
+    remote_workspaces: BTreeMap<String, RemoteWorkspacePlan>,
+    remote_containers: BTreeMap<String, RemoteContainerFacts>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadinessPlan {
@@ -371,6 +437,10 @@ pub struct IntegrationPlan {
     pub plan_response_sha256: String,
     pub render_request_sha256: String,
     pub render_response_sha256: String,
+    #[serde(skip)]
+    pub plan_timing: Option<crate::time_bound::OperationTimingEvidence>,
+    #[serde(skip)]
+    pub render_timing: Option<crate::time_bound::OperationTimingEvidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -629,7 +699,8 @@ pub struct EndpointPlan {
     pub host: String,
     pub port: u16,
     pub protocol: EndpointProtocol,
-    pub api_path: String,
+    pub completions_path: String,
+    pub chat_completions_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_reset: Option<inferlab_protocol::HttpActionSpec>,
 }
@@ -1225,36 +1296,36 @@ fn is_lowercase_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub fn resolve<C: AdapterClient>(
-    workspace: &LoadedWorkspace,
+fn select_workflow<'a>(
+    workspace: &'a LoadedWorkspace,
     request: &ResolveRequest<'_>,
-    adapter: &C,
-) -> Result<ResolvedExecution, InferlabError> {
-    let (server_id, recipe_selection) = match request.target {
-        ExecutionTarget::Server(server) if matches!(request.workflow, Workflow::ServeStart) => {
-            (server, None)
-        }
-        ExecutionTarget::Recipe(recipe) if matches!(request.workflow, Workflow::RecipeRun) => {
-            let definition = lookup("recipe", recipe, &workspace.config.recipes)?;
-            (definition.server.as_str(), Some((recipe, definition)))
-        }
-        ExecutionTarget::Server(_) => {
-            return Err(InferlabError::InvalidConfig {
-                message: "recipe run requires a recipe target".to_owned(),
-            });
-        }
-        ExecutionTarget::Recipe(_) => {
-            return Err(InferlabError::InvalidConfig {
-                message: "serve start requires a server target".to_owned(),
-            });
-        }
-    };
+) -> Result<WorkflowSelection<'a>, InferlabError> {
+    let (server_id, recipe_definition): (&str, Option<(&str, &RecipeDefinition)>) =
+        match request.target {
+            ExecutionTarget::Server(server) if matches!(request.workflow, Workflow::ServeStart) => {
+                (server, None)
+            }
+            ExecutionTarget::Recipe(recipe) if matches!(request.workflow, Workflow::RecipeRun) => {
+                let definition = lookup("recipe", recipe, &workspace.config.recipes)?;
+                (definition.server.as_str(), Some((recipe, definition)))
+            }
+            ExecutionTarget::Server(_) => {
+                return Err(InferlabError::InvalidConfig {
+                    message: "recipe run requires a recipe target".to_owned(),
+                });
+            }
+            ExecutionTarget::Recipe(_) => {
+                return Err(InferlabError::InvalidConfig {
+                    message: "serve start requires a server target".to_owned(),
+                });
+            }
+        };
     let server = lookup("server", server_id, &workspace.config.servers)?;
     let model = lookup("model", &server.model, &workspace.config.models)?;
     let stack = lookup("stack", &server.stack, &workspace.config.stacks)?;
     let (stack_checks, _image_postprocess) =
         crate::environment::plan_environment_checks(&workspace.root, stack)?;
-    let suite = recipe_selection
+    let suite = recipe_definition
         .map(|(_, recipe)| {
             lookup(
                 "workload suite",
@@ -1265,7 +1336,7 @@ pub fn resolve<C: AdapterClient>(
         .transpose()?;
     let (case_id, case, case_selection) = match request.case {
         Some(selected) => (
-            Some(selected),
+            Some(selected.to_owned()),
             Some(
                 server
                     .cases
@@ -1279,7 +1350,7 @@ pub fn resolve<C: AdapterClient>(
         None => {
             if let Some(selected) = server.default_case.as_deref() {
                 (
-                    Some(selected),
+                    Some(selected.to_owned()),
                     Some(&server.cases[selected]),
                     Some(CaseSelectionSource::Default),
                 )
@@ -1287,7 +1358,7 @@ pub fn resolve<C: AdapterClient>(
                 match (server.cases.iter().next(), server.cases.iter().nth(1)) {
                     (None, _) => (None, None, None),
                     (Some((id, definition)), None) => (
-                        Some(id.as_str()),
+                        Some(id.clone()),
                         Some(definition),
                         Some(CaseSelectionSource::Sole),
                     ),
@@ -1342,7 +1413,33 @@ pub fn resolve<C: AdapterClient>(
         .ok_or_else(|| InferlabError::InvalidConfig {
             message: format!("unknown placement {placement_id:?}"),
         })?;
+    Ok(WorkflowSelection {
+        server_id: server_id.to_owned(),
+        recipe: recipe_definition.map(|(id, recipe)| RecipePlan {
+            id: id.to_owned(),
+            workload_suite: recipe.workload_suite.clone(),
+        }),
+        server,
+        model,
+        stack,
+        stack_checks,
+        suite,
+        case_id,
+        case,
+        case_selection,
+        weight,
+        placement_id: placement_id.to_owned(),
+        placement_selection,
+        placement,
+    })
+}
 
+fn resolve_effective_server_input(
+    selection: &WorkflowSelection<'_>,
+    request: &ResolveRequest<'_>,
+) -> Result<EffectiveServerInput, InferlabError> {
+    let server = selection.server;
+    let case = selection.case;
     let topology = server.topology;
     let mut readiness_timeout_seconds = server.readiness_timeout_seconds;
     let mut routing_backend = server.routing_backend.clone();
@@ -1405,42 +1502,84 @@ pub fn resolve<C: AdapterClient>(
         profiling = true;
     }
 
+    let case_id = selection.case_id.as_deref();
     let role_resolutions = resolve_role_inputs(server, case_id, case, &override_patches, topology)?;
-    let declarations = server_declarations(server_id, server, case_id, case, &override_patches)?;
+    let declarations = server_declarations(
+        &selection.server_id,
+        server,
+        case_id,
+        case,
+        &override_patches,
+    )?;
     let role_inputs = role_resolutions
         .iter()
         .map(|role| role.input.clone())
-        .collect::<Vec<_>>();
-
-    let served_name = model.served_name.clone();
-    let plan_input = PlanServeInput {
-        model: ServeModelInput {
-            id: server.model.clone(),
-            served_name: served_name.clone(),
-        },
+        .collect();
+    Ok(EffectiveServerInput {
         topology,
-        routing_backend: routing_backend.clone(),
+        readiness_timeout_seconds,
+        routing_backend,
         kv_transfer,
-        roles: role_inputs.clone(),
         profiling,
-    };
-    let planning = adapter.plan_serve(
+        capture_control_deadline_seconds,
+        override_patches,
+        role_resolutions,
+        declarations,
+        role_inputs,
+    })
+}
+
+fn split_lowering<T>(lowering: AdapterLowering<T>) -> (T, LoweringEvidence) {
+    (
+        lowering.output,
+        LoweringEvidence {
+            request_sha256: lowering.request_sha256,
+            response_sha256: lowering.response_sha256,
+            timing: lowering.timing,
+        },
+    )
+}
+
+fn plan_integration<C: AdapterClient>(
+    workspace: &LoadedWorkspace,
+    selection: &WorkflowSelection<'_>,
+    effective: &mut EffectiveServerInput,
+    adapter: &C,
+) -> Result<PlannedServeStage, InferlabError> {
+    let stack = selection.stack;
+    let served_name = selection.model.served_name.clone();
+    let lowering = adapter.plan_serve(
         &workspace.root,
         &stack.integration,
         &stack.pixi_environment,
-        plan_input,
+        PlanServeInput {
+            model: ServeModelInput {
+                id: selection.server.model.clone(),
+                served_name,
+            },
+            topology: effective.topology,
+            routing_backend: effective.routing_backend.clone(),
+            kv_transfer: effective.kv_transfer,
+            roles: effective.role_inputs.clone(),
+            profiling: effective.profiling,
+        },
     )?;
-    let planned = planning.output;
+    let (planned, evidence) = split_lowering(lowering);
     validate_integration_identity(&stack.integration, &planned.integration.framework)?;
+    validate_workload_endpoint(&stack.integration, &planned.endpoint)?;
     validate_serve_graph(
         &stack.integration,
-        topology,
-        &role_inputs,
-        kv_transfer,
+        effective.topology,
+        &effective.role_inputs,
+        effective.kv_transfer,
         &planned,
     )?;
-    routing_backend = resolve_routing_backend(topology, routing_backend, &planned.routing)?;
-    for resolution in &role_resolutions {
+    effective.routing_backend = resolve_routing_backend(
+        effective.topology,
+        effective.routing_backend.take(),
+        &planned.routing,
+    )?;
+    for resolution in &effective.role_resolutions {
         let role = planned
             .roles
             .iter()
@@ -1458,42 +1597,38 @@ pub fn resolve<C: AdapterClient>(
             &role.effective_parallelism,
         )?;
     }
-    validate_capture_targets(&stack.integration, profiling, &planned.replicas)?;
+    validate_capture_targets(&stack.integration, effective.profiling, &planned.replicas)?;
     let mut requirements = expand_replica_requirements(
         &stack.integration,
-        topology,
+        effective.topology,
         &planned.replicas,
         &planned.routing,
-        placement,
-        server,
+        selection.placement,
+        selection.server,
     )?;
     let integration_process_count = requirements.len();
-    let (public_process, builtin_proxy) = match &planned.routing {
+    let public_process = match &planned.routing {
         RoutingResult::Direct { role, replica }
-        | RoutingResult::IntegrationNative { role, replica, .. } => {
-            let process_id = requirements
-                .iter()
-                .find(|process| {
-                    process.role_id == *role
-                        && process.replica_index == *replica
-                        && process.rank == 0
-                })
-                .map(|process| process.id.clone())
-                .ok_or_else(|| InferlabError::InvalidConfig {
-                    message: format!(
-                        "integration {:?} selected unknown public role {role:?} replica {replica}",
-                        stack.integration
-                    ),
-                })?;
-            (process_id, None)
-        }
+        | RoutingResult::IntegrationNative { role, replica, .. } => requirements
+            .iter()
+            .find(|process| {
+                process.role_id == *role && process.replica_index == *replica && process.rank == 0
+            })
+            .map(|process| process.id.clone())
+            .ok_or_else(|| InferlabError::InvalidConfig {
+                message: format!(
+                    "integration {:?} selected unknown public role {role:?} replica {replica}",
+                    stack.integration
+                ),
+            })?,
         RoutingResult::InferlabBuiltin {
             ports, readiness, ..
         } => {
-            let fixed_router = if !uses_explicit_replica_placement(placement) {
+            let fixed_router = if !uses_explicit_replica_placement(selection.placement) {
                 None
             } else {
-                let rank = placement
+                let rank = selection
+                    .placement
                     .roles
                     .get("router")
                     .and_then(|role| role.ranks_for_replica(0))
@@ -1524,49 +1659,69 @@ pub fn resolve<C: AdapterClient>(
                 capture_target: None,
                 fixed_devices: fixed_router,
             });
-            ("router".to_owned(), Some(&planned.routing))
+            "router".to_owned()
         }
     };
     validate_launch_dependencies(&stack.integration, &requirements)?;
+    Ok(PlannedServeStage {
+        planned,
+        evidence,
+        requirements,
+        integration_process_count,
+        public_process,
+    })
+}
+
+fn render_integration<C: AdapterClient>(
+    workspace: &LoadedWorkspace,
+    request: &ResolveRequest<'_>,
+    selection: &WorkflowSelection<'_>,
+    effective: &EffectiveServerInput,
+    planned_stage: &PlannedServeStage,
+    adapter: &C,
+) -> Result<RenderedServeStage, InferlabError> {
+    let stack = selection.stack;
+    let planned = &planned_stage.planned;
+    let builtin_proxy = matches!(planned.routing, RoutingResult::InferlabBuiltin { .. });
     let allocations = allocate_processes(
         workspace,
-        placement_id,
-        placement,
-        weight,
+        &selection.placement_id,
+        selection.placement,
+        selection.weight,
         &stack.pixi_environment,
         request
             .image
             .map(|image| image.image_id.as_str())
             .or_else(|| request.external.map(|external| external.digest.as_str())),
-        &requirements,
-        builtin_proxy.map(|_| public_process.as_str()),
+        &planned_stage.requirements,
+        builtin_proxy.then_some(planned_stage.public_process.as_str()),
     )?;
     let render_inputs =
         load_render_inputs(&workspace.root, &stack.integration, &planned.render_inputs)?;
-    let rendering = adapter.render_serve(
+    let lowering = adapter.render_serve(
         &workspace.root,
         &stack.integration,
         &stack.pixi_environment,
         RenderServeInput {
             model: ServeModelInput {
-                id: server.model.clone(),
-                served_name: served_name.clone(),
+                id: selection.server.model.clone(),
+                served_name: selection.model.served_name.clone(),
             },
-            topology,
-            routing_backend: routing_backend.clone(),
-            kv_transfer,
+            topology: effective.topology,
+            routing_backend: effective.routing_backend.clone(),
+            kv_transfer: effective.kv_transfer,
             roles: planned.roles.clone(),
             routing: planned.routing.clone(),
             links: planned.links.clone(),
-            allocations: allocations[..integration_process_count]
+            allocations: allocations[..planned_stage.integration_process_count]
                 .iter()
                 .map(|allocation| allocation.wire.clone())
                 .collect(),
             render_inputs,
-            profiling,
+            profiling: effective.profiling,
         },
     )?;
-    let rendered = rendering.output;
+    let (rendered, evidence) = split_lowering(lowering);
     if rendered.integration != planned.integration {
         return Err(InferlabError::InvalidConfig {
             message: format!(
@@ -1575,39 +1730,57 @@ pub fn resolve<C: AdapterClient>(
             ),
         });
     }
-    if rendered.processes.len() != integration_process_count {
+    if rendered.processes.len() != planned_stage.integration_process_count {
         return Err(InferlabError::InvalidConfig {
             message: format!(
                 "integration {:?} rendered {} processes for {} planned processes",
                 stack.integration,
                 rendered.processes.len(),
-                integration_process_count
+                planned_stage.integration_process_count
             ),
         });
     }
-
     let mut rendered_processes = rendered.processes;
-    if let Some(requirement) = builtin_proxy {
+    if builtin_proxy {
         rendered_processes.push(render_builtin_proxy(
-            requirement,
+            &planned.routing,
             &planned.integration.framework,
-            kv_transfer,
+            effective.kv_transfer,
             &allocations,
         )?);
     }
-    if rendered_processes.len() != requirements.len() {
+    if rendered_processes.len() != planned_stage.requirements.len() {
         return Err(InferlabError::InvalidConfig {
             message: "resolved topology process count changed during rendering".to_owned(),
         });
     }
+    Ok(RenderedServeStage {
+        evidence,
+        allocations,
+        rendered_processes,
+    })
+}
 
+fn realize_runtime(
+    workspace: &LoadedWorkspace,
+    request: &ResolveRequest<'_>,
+    selection: &WorkflowSelection<'_>,
+    effective: &EffectiveServerInput,
+    planned_stage: &PlannedServeStage,
+    rendered_stage: &RenderedServeStage,
+) -> Result<RuntimeRealizationStage, InferlabError> {
+    let planned = &planned_stage.planned;
+    let requirements = &planned_stage.requirements;
+    let public_process = &planned_stage.public_process;
+    let allocations = &rendered_stage.allocations;
+    let builtin_proxy = matches!(planned.routing, RoutingResult::InferlabBuiltin { .. });
     let mut processes = Vec::with_capacity(requirements.len());
     let mut public_endpoint = None;
     let mut device_count = 0_u32;
     for ((requirement, allocation), rendered_process) in requirements
         .iter()
-        .zip(&allocations)
-        .zip(&rendered_processes)
+        .zip(allocations)
+        .zip(&rendered_stage.rendered_processes)
     {
         let expected_rank_count = u32::try_from(
             requirements
@@ -1628,7 +1801,7 @@ pub fn resolve<C: AdapterClient>(
             return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} rendered process {:?} where {:?} was planned",
-                    stack.integration, rendered_process.process, requirement.id
+                    selection.stack.integration, rendered_process.process, requirement.id
                 ),
             });
         }
@@ -1636,7 +1809,7 @@ pub fn resolve<C: AdapterClient>(
             return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} rendered an empty argv for process {:?}",
-                    stack.integration, requirement.id
+                    selection.stack.integration, requirement.id
                 ),
             });
         }
@@ -1648,12 +1821,12 @@ pub fn resolve<C: AdapterClient>(
             return Err(InferlabError::InvalidConfig {
                 message: format!(
                     "integration {:?} attempted to select devices for process {:?}",
-                    stack.integration, requirement.id
+                    selection.stack.integration, requirement.id
                 ),
             });
         }
         let launch_files = validate_launch_file_declarations(
-            &stack.integration,
+            &selection.stack.integration,
             &requirement.id,
             &allocation.runtime_cache.path,
             &rendered_process.command,
@@ -1665,8 +1838,8 @@ pub fn resolve<C: AdapterClient>(
                 message: format!("unknown machine {machine_id:?}"),
             }
         })?;
-        if builtin_proxy.is_some()
-            && requirement.id == public_process
+        if builtin_proxy
+            && requirement.id == *public_process
             && !matches!(machine.launch, LaunchBinding::Local)
         {
             return Err(InferlabError::InvalidConfig {
@@ -1682,9 +1855,6 @@ pub fn resolve<C: AdapterClient>(
             LaunchBinding::Local => current_environment()?,
             LaunchBinding::Ssh { .. } => BTreeMap::new(),
         };
-        // Everything past this point is resolver- or integration-set: the
-        // explicit list preserves that provenance next to the composed map
-        // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
         let mut explicit_env: Vec<String> = rendered_process.command.env.keys().cloned().collect();
         env.extend(rendered_process.command.env.clone());
         env.insert(
@@ -1714,12 +1884,13 @@ pub fn resolve<C: AdapterClient>(
             host: allocation_endpoint.host.clone(),
             port: allocation_endpoint.port,
             protocol: planned.endpoint.protocol,
-            api_path: planned.endpoint.api_path.clone(),
-            prefix_cache_reset: (requirement.id == public_process)
+            completions_path: planned.endpoint.completions_path.clone(),
+            chat_completions_path: planned.endpoint.chat_completions_path.clone(),
+            prefix_cache_reset: (requirement.id == *public_process)
                 .then(|| planned.endpoint.prefix_cache_reset.clone())
                 .flatten(),
         };
-        if requirement.id == public_process {
+        if requirement.id == *public_process {
             public_endpoint = Some(endpoint.clone());
         }
         device_count += requirement.device_count;
@@ -1739,11 +1910,11 @@ pub fn resolve<C: AdapterClient>(
                 communication_interface: None,
             },
             command: CommandPlan {
-                argv: if builtin_proxy.is_some() && requirement.id == public_process {
+                argv: if builtin_proxy && requirement.id == *public_process {
                     rendered_process.command.argv.clone()
                 } else {
                     pixi_command(
-                        &stack.pixi_environment,
+                        &selection.stack.pixi_environment,
                         rendered_process.command.argv.clone(),
                     )
                 },
@@ -1755,10 +1926,10 @@ pub fn resolve<C: AdapterClient>(
             launch_files,
             readiness: readiness_plan(
                 &requirement.readiness,
-                readiness_timeout_seconds,
-                profiling,
+                effective.readiness_timeout_seconds,
+                effective.profiling,
                 &planned.roles,
-                &allocations,
+                allocations,
             )?,
             endpoint,
             container: None,
@@ -1768,15 +1939,9 @@ pub fn resolve<C: AdapterClient>(
     let public_endpoint = public_endpoint.ok_or_else(|| InferlabError::InvalidConfig {
         message: format!(
             "integration {:?} did not plan a public endpoint",
-            stack.integration
+            selection.stack.integration
         ),
     })?;
-    // The image placement gate fires before network resolution and remote
-    // workspace preflight consume the placement, so an unsupported remote
-    // placement never surfaces as a remote-environment error. External
-    // selections pass: a digest-pinned external image is pullable on every
-    // machine, while a built image has no distribution flow
-    // ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     if request.image.is_some() {
         crate::image::launch::gate_placement(&processes)?;
     }
@@ -1795,11 +1960,6 @@ pub fn resolve<C: AdapterClient>(
             process.allocation.communication_interface = Some(network.selected_interface.clone());
         }
     }
-    // A remote containerized launch replaces the serving environment with
-    // the image, so the workspace-realization preflight (revision equality,
-    // materialized Pixi environment, argv rewrite onto the remote pixi) does
-    // not apply; the container preflight instead verifies image presence and
-    // gathers machine-scoped launch facts ([[RFC-0003:C-RUNTIME-WORKFLOWS]]).
     let (remote_workspaces, remote_containers) = if let Some(external) = request.external {
         (
             BTreeMap::new(),
@@ -1815,56 +1975,108 @@ pub fn resolve<C: AdapterClient>(
             crate::server::preflight_targets(
                 &mut processes,
                 &workspace.snapshot,
-                &stack.pixi_environment,
+                &selection.stack.pixi_environment,
             )?,
             BTreeMap::new(),
         )
     };
-    let measurement_env = current_environment()?;
-    let measurement_cwd = workspace.root.join(".inferlab");
-    let measurements = match request.workflow {
-        Workflow::ServeStart => None,
-        Workflow::RecipeRun => Some(resolve_measurements(
-            suite.ok_or_else(|| InferlabError::InvalidConfig {
-                message: "recipe workflow has no workload suite".to_owned(),
-            })?,
-            &workspace.config.evals,
-            &workspace.config.benches,
-            request.overrides,
-            &MeasurementResolveContext {
-                endpoint: ClientEndpointInput {
-                    protocol: public_endpoint.protocol,
-                    host: public_endpoint.host.clone(),
-                    port: public_endpoint.port,
-                    api_path: public_endpoint.api_path.clone(),
+    Ok(RuntimeRealizationStage {
+        processes,
+        public_endpoint,
+        device_count,
+        selected_machines: allocations
+            .iter()
+            .map(|allocation| allocation.wire.machine.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        network,
+        remote_workspaces,
+        remote_containers,
+    })
+}
+
+fn compose_measurements(
+    workspace: &LoadedWorkspace,
+    request: &ResolveRequest<'_>,
+    selection: &WorkflowSelection<'_>,
+    public_endpoint: &EndpointPlan,
+    allocations: &[ResolvedProcessAllocation],
+) -> Result<Option<MeasurementPlan>, InferlabError> {
+    if matches!(request.workflow, Workflow::ServeStart) {
+        return Ok(None);
+    }
+    let command_env = current_environment()?;
+    let command_cwd = workspace.root.join(".inferlab");
+    let suite = selection
+        .suite
+        .ok_or_else(|| InferlabError::InvalidConfig {
+            message: "recipe workflow has no workload suite".to_owned(),
+        })?;
+    let model_locator = selection
+        .weight
+        .locator
+        .clone()
+        .or_else(|| {
+            allocations
+                .iter()
+                .find(|allocation| allocation.wire.role != "router" && allocation.wire.rank == 0)
+                .and_then(|allocation| allocation.wire.model_locator.clone())
+        })
+        .ok_or_else(|| InferlabError::InvalidConfig {
+            message: format!(
+                "recipe target server {:?} has no model locator usable by its measurements",
+                selection.server_id
+            ),
+        })?;
+    resolve_measurements(
+        suite,
+        &workspace.config.evals,
+        &workspace.config.benches,
+        request.overrides,
+        &MeasurementResolveContext {
+            workspace_root: &workspace.root,
+            workspace_source_exclusions: &workspace.snapshot.source_exclusions,
+            endpoint: crate::workload::WorkloadEndpoint {
+                protocol: match public_endpoint.protocol {
+                    EndpointProtocol::Http => crate::workload::WorkloadEndpointProtocol::Http,
                 },
-                model: MeasurementModelInput {
-                    locator: weight
-                        .locator
-                        .clone()
-                        .or_else(|| {
-                            allocations
-                                .iter()
-                                .find(|allocation| {
-                                    allocation.wire.role != "router"
-                                        && allocation.wire.rank == 0
-                                })
-                                .and_then(|allocation| allocation.wire.model_locator.clone())
-                        })
-                        .ok_or_else(|| InferlabError::InvalidConfig {
-                            message: format!(
-                                "recipe target server {server_id:?} has no model locator usable by its measurements"
-                            ),
-                        })?,
-                    served_name: served_name.clone(),
-                },
-                prefix_cache_reset: public_endpoint.prefix_cache_reset.clone(),
-                capture_ids: request.captures,
-                command_env: &measurement_env,
-                command_cwd: &measurement_cwd,
+                host: public_endpoint.host.clone(),
+                port: public_endpoint.port,
+                completions_path: public_endpoint.completions_path.clone(),
+                chat_completions_path: public_endpoint.chat_completions_path.clone(),
             },
-        )?),
-    };
+            model: crate::workload::MeasurementModel {
+                locator: model_locator,
+                served_name: selection.model.served_name.clone(),
+            },
+            prefix_cache_reset: public_endpoint.prefix_cache_reset.as_ref().map(|action| {
+                crate::workload::WorkloadHttpAction {
+                    method: match action.method {
+                        inferlab_protocol::HttpMethod::Post => {
+                            crate::workload::WorkloadHttpMethod::Post
+                        }
+                    },
+                    path: action.path.clone(),
+                }
+            }),
+            capture_ids: request.captures,
+            command_env: &command_env,
+            command_cwd: &command_cwd,
+        },
+    )
+    .map(Some)
+}
+
+fn assemble_role_plans(
+    integration: &str,
+    effective: &EffectiveServerInput,
+    planned_stage: &PlannedServeStage,
+    processes: Vec<ProcessPlan>,
+) -> Result<Vec<RolePlan>, InferlabError> {
+    let planned = &planned_stage.planned;
+    let requirements = &planned_stage.requirements;
+    let public_process = &planned_stage.public_process;
     let process_count = processes.len();
     let mut processes_by_id = processes
         .into_iter()
@@ -1879,14 +2091,15 @@ pub fn resolve<C: AdapterClient>(
         .roles
         .iter()
         .map(|role| {
-            let resolution = role_resolutions
+            let resolution = effective
+                .role_resolutions
                 .iter()
                 .find(|resolution| resolution.input.id == role.id);
             if let Some(resolution) = resolution {
                 validate_effective_settings(
                     &resolution.input.settings,
                     &role.effective_settings,
-                    &stack.integration,
+                    integration,
                 )?;
             }
             let replicas = planned
@@ -1968,25 +2181,27 @@ pub fn resolve<C: AdapterClient>(
                 device_count: 0,
                 ports: requirements
                     .iter()
-                    .find(|process| process.id == public_process)
+                    .find(|process| process.id == *public_process)
                     .map_or_else(Vec::new, |process| process.ports.clone()),
                 primary_ports: Vec::new(),
                 primary_readiness: requirements
                     .iter()
-                    .find(|process| process.id == public_process)
+                    .find(|process| process.id == *public_process)
                     .map_or(ReadinessProbe::ProcessAlive, |process| {
                         process.readiness.clone()
                     }),
                 worker_readiness: ReadinessProbe::ProcessAlive,
                 capture_target: None,
                 entry_process: public_process.clone(),
-                ranks: vec![processes_by_id.remove(&public_process).ok_or_else(|| {
-                    InferlabError::InvalidConfig {
-                        message: format!(
-                            "resolved router references missing process {public_process:?}"
-                        ),
-                    }
-                })?],
+                ranks: vec![
+                    processes_by_id
+                        .remove(public_process.as_str())
+                        .ok_or_else(|| InferlabError::InvalidConfig {
+                            message: format!(
+                                "resolved router references missing process {public_process:?}"
+                            ),
+                        })?,
+                ],
             }],
         });
     }
@@ -1995,13 +2210,15 @@ pub fn resolve<C: AdapterClient>(
             message: "resolved topology contains a process outside its role hierarchy".to_owned(),
         });
     }
-    let selected_machines = allocations
-        .iter()
-        .map(|allocation| allocation.wire.machine.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let (routing_implementation, routing_policy) = match &planned.routing {
+    Ok(role_plans)
+}
+
+fn resolve_routing_plan(
+    effective: &EffectiveServerInput,
+    planned_stage: &PlannedServeStage,
+) -> Result<RoutingPlan, InferlabError> {
+    let planned = &planned_stage.planned;
+    let (implementation, policy) = match &planned.routing {
         RoutingResult::InferlabBuiltin {
             implementation,
             policy,
@@ -2024,24 +2241,81 @@ pub fn resolve<C: AdapterClient>(
         }
         RoutingResult::IntegrationNative { policy, .. } => (
             RoutingImplementationPlan::Integration {
-                id: routing_backend
-                    .clone()
-                    .ok_or_else(|| InferlabError::InvalidConfig {
+                id: effective.routing_backend.clone().ok_or_else(|| {
+                    InferlabError::InvalidConfig {
                         message: "native routing requires a selected routing backend".to_owned(),
-                    })?,
+                    }
+                })?,
                 adapter_version: planned.integration.adapter_version.clone(),
             },
             policy.clone(),
         ),
         RoutingResult::Direct { .. } => (RoutingImplementationPlan::Direct, "direct".to_owned()),
     };
+    Ok(RoutingPlan {
+        backend: effective.routing_backend.clone(),
+        kv_transfer: effective.kv_transfer,
+        public_process: planned_stage.public_process.clone(),
+        policy,
+        implementation,
+    })
+}
+
+pub fn resolve<C: AdapterClient>(
+    workspace: &LoadedWorkspace,
+    request: &ResolveRequest<'_>,
+    adapter: &C,
+) -> Result<ResolvedExecution, InferlabError> {
+    let selection = select_workflow(workspace, request)?;
+    let mut effective = resolve_effective_server_input(&selection, request)?;
+    let server = selection.server;
+    let stack = selection.stack;
+    let server_id = selection.server_id.as_str();
+    let case_id = selection.case_id.as_deref();
+    let topology = effective.topology;
+    let profiling = effective.profiling;
+
+    let served_name = selection.model.served_name.clone();
+    let planned_stage = plan_integration(workspace, &selection, &mut effective, adapter)?;
+    let rendered_stage = render_integration(
+        workspace,
+        request,
+        &selection,
+        &effective,
+        &planned_stage,
+        adapter,
+    )?;
+    let planned = &planned_stage.planned;
+    let RuntimeRealizationStage {
+        processes,
+        public_endpoint,
+        device_count,
+        selected_machines,
+        network,
+        remote_workspaces,
+        remote_containers,
+    } = realize_runtime(
+        workspace,
+        request,
+        &selection,
+        &effective,
+        &planned_stage,
+        &rendered_stage,
+    )?;
+    let measurements = compose_measurements(
+        workspace,
+        request,
+        &selection,
+        &public_endpoint,
+        &rendered_stage.allocations,
+    )?;
+    let role_plans =
+        assemble_role_plans(&stack.integration, &effective, &planned_stage, processes)?;
+    let routing = resolve_routing_plan(&effective, &planned_stage)?;
     let mut execution = ResolvedExecution {
         workflow: request.workflow,
         workspace: workspace.snapshot.clone(),
-        recipe: recipe_selection.map(|(id, recipe)| RecipePlan {
-            id: id.to_owned(),
-            workload_suite: recipe.workload_suite.clone(),
-        }),
+        recipe: selection.recipe,
         stack: StackPlan {
             id: server.stack.clone(),
             integration: stack.integration.clone(),
@@ -2054,30 +2328,27 @@ pub fn resolve<C: AdapterClient>(
             } else {
                 crate::environment::CheckRealization::LocalWorkspace
             },
-            checks: stack_checks,
+            checks: selection.stack_checks,
         },
         server: ServerPlan {
             id: server_id.to_owned(),
-            case: case_id.zip(case_selection).map(|(id, selection)| CasePlan {
-                id: id.to_owned(),
-                selection,
-            }),
-            explicit_overrides: override_patches
+            case: case_id
+                .zip(selection.case_selection)
+                .map(|(id, selection)| CasePlan {
+                    id: id.to_owned(),
+                    selection,
+                }),
+            explicit_overrides: effective
+                .override_patches
                 .iter()
                 .map(|item| item.raw.clone())
                 .collect(),
-            declarations,
+            declarations: effective.declarations,
             topology,
             profiling,
-            readiness_timeout_seconds,
-            capture_control_deadline_seconds,
-            routing: RoutingPlan {
-                backend: routing_backend,
-                kv_transfer,
-                public_process,
-                policy: routing_policy,
-                implementation: routing_implementation,
-            },
+            readiness_timeout_seconds: effective.readiness_timeout_seconds,
+            capture_control_deadline_seconds: effective.capture_control_deadline_seconds,
+            routing,
             profiler_escapes: profiler_escapes_plan(server),
             model: ModelPlan {
                 id: server.model.clone(),
@@ -2087,28 +2358,30 @@ pub fn resolve<C: AdapterClient>(
             external_image: None,
             integration: IntegrationPlan {
                 id: stack.integration.clone(),
-                adapter_id: planned.integration.adapter_id,
-                adapter_version: planned.integration.adapter_version,
-                framework: planned.integration.framework,
-                framework_version: planned.integration.framework_version,
+                adapter_id: planned.integration.adapter_id.clone(),
+                adapter_version: planned.integration.adapter_version.clone(),
+                framework: planned.integration.framework.clone(),
+                framework_version: planned.integration.framework_version.clone(),
                 executable: executable_name(&stack.integration),
-                protocol_version: ProtocolVersion::V5,
-                plan_request_sha256: planning.request_sha256,
-                plan_response_sha256: planning.response_sha256,
-                render_request_sha256: rendering.request_sha256,
-                render_response_sha256: rendering.response_sha256,
+                protocol_version: ProtocolVersion::V6,
+                plan_request_sha256: planned_stage.evidence.request_sha256,
+                plan_response_sha256: planned_stage.evidence.response_sha256,
+                render_request_sha256: rendered_stage.evidence.request_sha256,
+                render_response_sha256: rendered_stage.evidence.response_sha256,
+                plan_timing: Some(planned_stage.evidence.timing),
+                render_timing: Some(rendered_stage.evidence.timing),
             },
             resources: ResourcePlan { device_count },
             placement: PlacementPlan {
-                id: placement_id.to_owned(),
-                selection: placement_selection,
+                id: selection.placement_id,
+                selection: selection.placement_selection,
                 machines: selected_machines,
                 remote_workspaces,
                 remote_containers,
             },
             network,
             roles: role_plans,
-            links: planned.links,
+            links: planned.links.clone(),
             endpoint: public_endpoint,
         },
         measurements,
@@ -2124,6 +2397,32 @@ pub fn resolve<C: AdapterClient>(
         )?;
     }
     Ok(execution)
+}
+
+fn validate_workload_endpoint(
+    integration: &str,
+    endpoint: &inferlab_protocol::EndpointRequirement,
+) -> Result<(), InferlabError> {
+    const COMPLETIONS_PATH: &str = "/v1/completions";
+    const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+
+    if endpoint.completions_path != COMPLETIONS_PATH {
+        return Err(InferlabError::InvalidConfig {
+            message: format!(
+                "integration {integration:?} declared completions_path {:?}; expected {COMPLETIONS_PATH:?}",
+                endpoint.completions_path
+            ),
+        });
+    }
+    if endpoint.chat_completions_path != CHAT_COMPLETIONS_PATH {
+        return Err(InferlabError::InvalidConfig {
+            message: format!(
+                "integration {integration:?} declared chat_completions_path {:?}; expected {CHAT_COMPLETIONS_PATH:?}",
+                endpoint.chat_completions_path
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_capture_targets(
@@ -3401,45 +3700,7 @@ fn parse_override(value: &str) -> Result<ServerOverridePatch, InferlabError> {
                 value: value.to_owned(),
                 message: "only paths under server. may be overridden".to_owned(),
             })?;
-    if setting_path.is_empty()
-        || setting_path
-            .bytes()
-            .any(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        return Err(InferlabError::InvalidOverride {
-            value: value.to_owned(),
-            message: "setting path must be one TOML key path".to_owned(),
-        });
-    }
-    let document: toml::Table =
-        toml::from_str(&format!("value = {raw_value}")).map_err(|error| {
-            InferlabError::InvalidOverride {
-                value: value.to_owned(),
-                message: format!("invalid TOML value: {error}"),
-            }
-        })?;
-    let parsed = match (document.len(), document.get("value")) {
-        (1, Some(parsed)) => parsed.clone(),
-        _ => {
-            return Err(InferlabError::InvalidOverride {
-                value: value.to_owned(),
-                message: "override must contain exactly one TOML value".to_owned(),
-            });
-        }
-    };
-    let path: toml::Table = toml::from_str(&format!("{setting_path} = 0")).map_err(|error| {
-        InferlabError::InvalidOverride {
-            value: value.to_owned(),
-            message: format!("invalid TOML key path: {error}"),
-        }
-    })?;
-    let mut nested = toml::Value::Table(path);
-    replace_override_leaf(&mut nested, parsed).map_err(|message| {
-        InferlabError::InvalidOverride {
-            value: value.to_owned(),
-            message,
-        }
-    })?;
+    let nested = ExactTomlOverride::parse(setting_path, raw_value, value)?.into_patch();
     let patch: ServerOverridePatch =
         nested
             .try_into()
@@ -3449,25 +3710,6 @@ fn parse_override(value: &str) -> Result<ServerOverridePatch, InferlabError> {
             })?;
 
     Ok(patch)
-}
-
-fn replace_override_leaf(node: &mut toml::Value, replacement: toml::Value) -> Result<(), String> {
-    if let toml::Value::Table(table) = node {
-        if table.len() != 1 {
-            return Err("setting path must contain exactly one TOML key path".to_owned());
-        }
-        let (key, child) = table
-            .iter_mut()
-            .next()
-            .ok_or_else(|| "setting path must not be empty".to_owned())?;
-        if key.is_empty() {
-            return Err("setting path contains an empty segment".to_owned());
-        }
-        replace_override_leaf(child, replacement)
-    } else {
-        *node = replacement;
-        Ok(())
-    }
 }
 
 fn setting_value(value: &toml::Value, path: &str) -> Result<SettingValue, InferlabError> {
@@ -3601,6 +3843,25 @@ mod tests {
         LaunchFileDeclaration, ParallelismAttention, ParallelismExperts, ParallelismOuter,
         RenderInputDeclaration,
     };
+    use std::error::Error;
+
+    #[test]
+    fn rejects_an_integration_that_rebinds_a_named_workload_path() -> Result<(), Box<dyn Error>> {
+        let endpoint = EndpointRequirement {
+            protocol: EndpointProtocol::Http,
+            completions_path: "/v1/completions".to_owned(),
+            chat_completions_path: "/v1/completions".to_owned(),
+            prefix_cache_reset: None,
+        };
+
+        let error = validate_workload_endpoint("fixture", &endpoint)
+            .err()
+            .ok_or("rebound chat-completions path was accepted")?;
+
+        assert!(error.to_string().contains("chat_completions_path"));
+        assert!(error.to_string().contains("/v1/chat/completions"));
+        Ok(())
+    }
 
     fn launch_file(text: &str, name: &str) -> LaunchFileDeclaration {
         let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
@@ -3699,7 +3960,8 @@ mod tests {
             },
             endpoint: EndpointRequirement {
                 protocol: EndpointProtocol::Http,
-                api_path: "/v1/completions".to_owned(),
+                completions_path: "/v1/completions".to_owned(),
+                chat_completions_path: "/v1/chat/completions".to_owned(),
                 prefix_cache_reset: None,
             },
             render_inputs: Vec::new(),

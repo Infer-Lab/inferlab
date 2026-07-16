@@ -6,8 +6,12 @@ from typing import cast
 import pytest
 from inferlab_adapter_sdk import (
     AdapterErrorCode,
+    AdapterOperationError,
     AdapterRequest,
+    AdapterRequestPlanServe,
     AdapterResponse,
+    CaseBudgetExpired,
+    CaseDeadline,
     EndpointProtocol,
     EndpointRequirement,
     IntegrationIdentity,
@@ -24,10 +28,16 @@ from inferlab_adapter_sdk import (
     ServeReplicaRequirement,
     ServeRoleKind,
     ServeRoleResult,
+    SettingValue,
     SuppliedRenderInput,
     TargetEndpointScheme,
+    effective_settings,
     handle_request,
+    integration_identity,
+    replica_id,
+    require_role,
     run_adapter,
+    validate_settings,
 )
 from inferlab_adapter_sdk._generated import (
     AdapterRequestRenderServe,
@@ -35,18 +45,92 @@ from inferlab_adapter_sdk._generated import (
     AdapterResponseOk,
     AdapterResultPlanServe,
     AdapterResultRenderServe,
+    EvalClientRequest,
+    EvalClientResult,
+    EvalDefinitionInputLmEval,
+    EvalFailureKind,
+    EvalMetricComparison,
+    EvalMetricGateConclusion,
+    EvalTaskSourceInputBundled,
+    EvalTaskSourceInputWorkspaceYaml,
 )
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
+from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 
 ROOT = Path(__file__).parents[3]
 FIXTURES = ROOT / "protocol" / "fixtures"
-SCHEMA = ROOT / "protocol" / "schema" / "adapter-protocol-v5.schema.json"
+SCHEMA = ROOT / "protocol" / "schema" / "adapter-protocol-v6.schema.json"
+
+
+class FixtureSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    port: int
 
 
 def load_json(path: Path) -> dict[str, object]:
     return cast(dict[str, object], json.loads(path.read_text()))
+
+
+def test_runtime_owns_shared_settings_translation() -> None:
+    settings = validate_settings(
+        FixtureSettings,
+        {"port": SettingValue(root=8000)},
+    )
+
+    assert settings.port == 8000
+    assert effective_settings(settings) == {"port": SettingValue(root=8000)}
+    with pytest.raises(AdapterOperationError) as raised:
+        validate_settings(FixtureSettings, {"unknown": SettingValue(root=True)})
+    assert raised.value.code == AdapterErrorCode.invalid_settings
+
+
+def test_runtime_owns_checkout_identity_and_role_conventions(tmp_path: Path) -> None:
+    package = tmp_path / "adapter"
+    package.mkdir()
+    (package / "pyproject.toml").write_text(
+        '[project]\nname = "fixture-adapter"\nversion = "1.2.3"\n',
+        encoding="utf-8",
+    )
+    module_file = package / "src" / "fixture_adapter" / "__init__.py"
+    identity = integration_identity(
+        adapter_id="fixture",
+        adapter_distribution="fixture-adapter",
+        framework="fixture-framework",
+        framework_distribution="inferlab-definitely-missing-framework",
+        module_file=str(module_file),
+    )
+    request = AdapterRequest.model_validate(
+        load_json(FIXTURES / "valid" / "plan-serve-request.json")
+    )
+    root = request.root
+    assert isinstance(root, AdapterRequestPlanServe)
+    plan_input = root.input
+    role = require_role(plan_input, ServeRoleKind.prefill)
+
+    assert identity.adapter_version == "1.2.3"
+    assert identity.framework_version == "unavailable"
+    assert replica_id(role, 0) == "prefill"
+
+
+def test_case_deadline_consumes_one_clock_and_caps_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [10.0]
+    monkeypatch.setattr("inferlab_adapter_sdk.runtime.time.monotonic", lambda: now[0])
+    deadline = CaseDeadline(10.0)
+
+    now[0] = 12.0
+    assert deadline.remaining() == 8.0
+    now[0] = 14.0
+    assert deadline.remaining(5.0) == 5.0
+    with pytest.raises(ValueError, match="attempt cap"):
+        deadline.remaining(0.0)
+    now[0] = 20.0
+    with pytest.raises(CaseBudgetExpired, match="expired"):
+        deadline.remaining()
 
 
 def fixture_plan_serve(input: PlanServeInput) -> PlanServeResult:
@@ -81,7 +165,11 @@ def fixture_plan_serve(input: PlanServeInput) -> PlanServeResult:
         ],
         links=[],
         routing=RoutingResult(root=RoutingResultDirect(role="serve", replica=0)),
-        endpoint=EndpointRequirement(protocol=EndpointProtocol(), api_path="/v1/completions"),
+        endpoint=EndpointRequirement(
+            protocol=EndpointProtocol(),
+            completions_path="/v1/completions",
+            chat_completions_path="/v1/chat/completions",
+        ),
     )
 
 
@@ -131,6 +219,57 @@ def test_generated_models_preserve_render_inputs() -> None:
     assert supplied.source_path == declaration.source_path
     assert supplied.text == "batch_scheduler:\n  enable_chunked_context: true\n"
     assert supplied.sha256 == "898caa1654c13bd4b1f2eba75d17c09b8fc3ea1370e5532a5111be220d50baa3"
+
+
+def test_generated_models_preserve_workspace_yaml_eval_task_source() -> None:
+    request = EvalClientRequest.model_validate(
+        load_json(FIXTURES / "valid" / "eval-client-request-workspace-yaml.json")
+    )
+
+    definition = request.definition.root
+    assert isinstance(definition, EvalDefinitionInputLmEval)
+    source = definition.task.root
+    assert isinstance(source, EvalTaskSourceInputWorkspaceYaml)
+    assert source.path == "/workspace/evals/custom.yaml"
+    assert definition.metric_filter == "strict-match"
+
+
+def test_generated_models_preserve_bundled_eval_task_identity() -> None:
+    request = EvalClientRequest.model_validate(
+        load_json(FIXTURES / "valid" / "eval-client-request-bundled.json")
+    )
+
+    definition = request.definition.root
+    assert isinstance(definition, EvalDefinitionInputLmEval)
+    source = definition.task.root
+    assert isinstance(source, EvalTaskSourceInputBundled)
+    assert source.name == "estonia"
+    assert source.task_identity == "inferlab_estonia"
+    assert len(source.task_closure_sha256) == 64
+
+
+def test_generated_models_preserve_typed_eval_probe_failure() -> None:
+    result = EvalClientResult.model_validate(
+        load_json(FIXTURES / "valid" / "eval-client-result-probe-failure.json")
+    )
+
+    assert result.failure_kind == EvalFailureKind.probe_generated_only_logprobs
+    assert result.raw_artifacts[0].kind == "prompt-logprob-probe"
+
+
+def test_generated_models_preserve_normalized_eval_metric_provenance() -> None:
+    result = EvalClientResult.model_validate(
+        load_json(FIXTURES / "valid" / "eval-client-result-normalized-metric.json")
+    )
+
+    metric = result.normalized_metrics["gsm8k:exact_match,strict-match"]
+    assert metric.source_identity == "gsm8k"
+    assert metric.native_metric_key == "exact_match,strict-match"
+    assert result.gate is not None
+    assert result.gate.comparison == EvalMetricComparison.at_least
+    assert result.gate.conclusion == EvalMetricGateConclusion.passed
+    assert result.native_exit_code == 0
+    assert result.native_timed_out is False
 
 
 def test_generated_models_preserve_http_target_registry_readiness() -> None:

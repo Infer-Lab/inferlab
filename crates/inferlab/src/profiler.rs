@@ -1,17 +1,26 @@
 use crate::InferlabError;
 use crate::resolve::{CommandPlan, LaunchPlan, ProcessPlan};
+use crate::time_bound::{
+    OperationBound, OperationTerminalCause, OperationTimingEvidence, Remaining,
+};
 use crate::workspace::NsysEscapes;
 use inferlab_protocol::EndpointAssignment;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::thread;
 use std::time::Duration;
 
 const DEFAULT_TRACE: [&str; 3] = ["cuda", "nvtx", "osrt"];
+const PROFILER_ARM_COMMAND_DEADLINE: Duration = Duration::from_secs(60);
+const PROFILER_FINALIZATION_DEADLINE: Duration = Duration::from_secs(300);
+const PROFILER_REPORT_VERIFICATION_DEADLINE: Duration = Duration::from_secs(30);
+const PROFILER_AGENT_DISCOVERY_DEADLINE: Duration = Duration::from_secs(10);
+const PROFILER_AGENT_TERM_GRACE: Duration = Duration::from_secs(2);
+const PROFILER_AGENT_KILL_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -383,6 +392,8 @@ pub(crate) enum CaptureActionRecord {
         stdout: String,
         stderr: String,
         succeeded: bool,
+        timing: OperationTimingEvidence,
+        cleanup: Option<crate::container::CommandCleanupEvidence>,
     },
     Http {
         process_id: String,
@@ -391,6 +402,7 @@ pub(crate) enum CaptureActionRecord {
         status: Option<u16>,
         error: Option<String>,
         succeeded: bool,
+        timing: OperationTimingEvidence,
     },
 }
 
@@ -492,6 +504,8 @@ impl CaptureSession {
                     "-p".to_owned(),
                     parent.display().to_string(),
                 ],
+                PROFILER_ARM_COMMAND_DEADLINE,
+                CommandActionMode::Operation,
             );
             let mkdir_ok = mkdir.succeeded();
             let mkdir_error = mkdir.error();
@@ -511,6 +525,8 @@ impl CaptureSession {
                 target,
                 "start-range-collection",
                 nsys_start_argv(target, &plan.output_base, count),
+                PROFILER_ARM_COMMAND_DEADLINE,
+                CommandActionMode::Operation,
             );
             let start_ok = start.succeeded();
             let start_error = start.error();
@@ -646,6 +662,8 @@ impl CaptureSession {
                         "-f".to_owned(),
                         path.display().to_string(),
                     ],
+                    PROFILER_REPORT_VERIFICATION_DEADLINE,
+                    CommandActionMode::Cleanup,
                 );
                 let verified = verification.succeeded();
                 if !verified && failure.is_none() {
@@ -728,8 +746,11 @@ fn command_action(
     target: &ProfilerTargetRecord,
     operation: &str,
     argv: Vec<String>,
+    deadline: Duration,
+    mode: CommandActionMode,
 ) -> CaptureActionRecord {
-    let output = target_output(target, &argv);
+    let bound = OperationBound::finite(deadline);
+    let output = target_output(target, &argv, &bound, mode);
     match output {
         Ok(output) => CaptureActionRecord::Command {
             target_id: target.process_id.clone(),
@@ -739,33 +760,134 @@ fn command_action(
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             succeeded: output.status.success(),
+            timing: bound.timing(
+                &format!("before_profiler_{operation}"),
+                if output.status.success() {
+                    OperationTerminalCause::Succeeded
+                } else {
+                    OperationTerminalCause::Failed
+                },
+            ),
+            cleanup: None,
         },
-        Err(error) => CaptureActionRecord::Command {
-            target_id: target.process_id.clone(),
-            operation: operation.to_owned(),
-            argv,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: error,
-            succeeded: false,
-        },
+        Err(error) => {
+            let mut timing = bound.timing(
+                &format!("before_profiler_{operation}"),
+                error.terminal_cause,
+            );
+            timing.elapsed_ms = error.operation_elapsed_ms;
+            CaptureActionRecord::Command {
+                target_id: target.process_id.clone(),
+                operation: operation.to_owned(),
+                argv,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: error.message,
+                succeeded: false,
+                timing,
+                cleanup: error.cleanup,
+            }
+        }
     }
 }
 
-fn target_output(target: &ProfilerTargetRecord, argv: &[String]) -> Result<Output, String> {
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| "profiler control command is empty".to_owned())?;
-    match &target.launch {
-        ProfilerLaunch::Local => Command::new(program)
-            .args(args)
-            .current_dir(&target.command_cwd)
-            .output()
-            .map_err(|error| format!("failed to launch profiler command {program:?}: {error}")),
+#[derive(Clone, Copy)]
+enum CommandActionMode {
+    Operation,
+    Cleanup,
+}
+
+struct TargetCommandError {
+    message: String,
+    terminal_cause: OperationTerminalCause,
+    operation_elapsed_ms: u64,
+    cleanup: Option<crate::container::CommandCleanupEvidence>,
+}
+
+impl std::fmt::Display for TargetCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+fn target_output(
+    target: &ProfilerTargetRecord,
+    argv: &[String],
+    bound: &OperationBound,
+    mode: CommandActionMode,
+) -> Result<Output, TargetCommandError> {
+    let local_argv;
+    let (command, cwd) = match &target.launch {
+        ProfilerLaunch::Local => (argv, Some(target.command_cwd.as_path())),
         ProfilerLaunch::Ssh { target: ssh_target } => {
             let script = ssh_control_script(&target.command_cwd, argv);
-            crate::server::runtime::ssh_output(ssh_target, &script)
+            local_argv = crate::ssh::ssh_argv(ssh_target, &script);
+            (local_argv.as_slice(), None)
         }
+    };
+    let outcome = match mode {
+        CommandActionMode::Operation => {
+            crate::container::run_with_bound(command, cwd, None, bound, None)
+        }
+        CommandActionMode::Cleanup => {
+            crate::container::run_cleanup_with_bound(command, cwd, None, bound, None)
+        }
+    };
+    match outcome {
+        Ok(crate::container::BoundedWait::Exited {
+            status,
+            stdout,
+            stderr,
+        }) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(crate::container::BoundedWait::Expired {
+            operation_elapsed_ms,
+            cleanup,
+            ..
+        }) => Err(TargetCommandError {
+            message: "profiler command deadline expired".to_owned(),
+            terminal_cause: OperationTerminalCause::TimedOut,
+            operation_elapsed_ms,
+            cleanup,
+        }),
+        Ok(crate::container::BoundedWait::Interrupted {
+            operation_elapsed_ms,
+            cleanup,
+            ..
+        }) => Err(TargetCommandError {
+            message: "profiler command was interrupted".to_owned(),
+            terminal_cause: OperationTerminalCause::Interrupted,
+            operation_elapsed_ms,
+            cleanup: Some(cleanup),
+        }),
+        Err(crate::container::BoundedError::Launch(error)) => Err(TargetCommandError {
+            message: format!("failed to launch profiler command: {error}"),
+            terminal_cause: OperationTerminalCause::Failed,
+            operation_elapsed_ms: bound.elapsed_ms(),
+            cleanup: None,
+        }),
+        Err(
+            crate::container::BoundedError::Stdin(error)
+            | crate::container::BoundedError::Wait(error),
+        ) => Err(TargetCommandError {
+            message: format!("profiler command failed: {error}"),
+            terminal_cause: OperationTerminalCause::Failed,
+            operation_elapsed_ms: bound.elapsed_ms(),
+            cleanup: None,
+        }),
+        Err(crate::container::BoundedError::WaitCleanup {
+            source,
+            operation_elapsed_ms,
+            cleanup,
+        }) => Err(TargetCommandError {
+            message: format!("profiler command wait failed: {source}"),
+            terminal_cause: OperationTerminalCause::Failed,
+            operation_elapsed_ms,
+            cleanup: Some(cleanup),
+        }),
     }
 }
 
@@ -827,7 +949,8 @@ fn http_action(
     deadline_seconds: u64,
 ) -> CaptureActionRecord {
     let url = format!("http://{}:{}{path}", endpoint.host, endpoint.port);
-    let result = post(&endpoint.host, endpoint.port, path, deadline_seconds);
+    let bound = OperationBound::finite(Duration::from_secs(deadline_seconds));
+    let result = post(&endpoint.host, endpoint.port, path, &bound);
     match result {
         Ok(status) => CaptureActionRecord::Http {
             process_id: process_id.to_owned(),
@@ -836,6 +959,14 @@ fn http_action(
             status: Some(status),
             error: None,
             succeeded: (200..300).contains(&status),
+            timing: bound.timing(
+                &format!("before_profiler_{operation}"),
+                if (200..300).contains(&status) {
+                    OperationTerminalCause::Succeeded
+                } else {
+                    OperationTerminalCause::Failed
+                },
+            ),
         },
         Err(error) => CaptureActionRecord::Http {
             process_id: process_id.to_owned(),
@@ -844,35 +975,109 @@ fn http_action(
             status: None,
             error: Some(error),
             succeeded: false,
+            timing: bound.timing(
+                &format!("before_profiler_{operation}"),
+                if bound.is_expired() {
+                    OperationTerminalCause::TimedOut
+                } else {
+                    OperationTerminalCause::Failed
+                },
+            ),
         },
     }
 }
 
-fn post(host: &str, port: u16, path: &str, deadline_seconds: u64) -> Result<u16, String> {
+fn post(host: &str, port: u16, path: &str, bound: &OperationBound) -> Result<u16, String> {
     let address = (host, port)
         .to_socket_addrs()
         .map_err(|error| format!("failed to resolve profiler endpoint: {error}"))?
         .next()
         .ok_or_else(|| "profiler endpoint did not resolve".to_owned())?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+    let connect_timeout = profiler_remaining(bound)?.min(Duration::from_secs(2));
+    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
         .map_err(|error| format!("failed to connect to profiler endpoint: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(deadline_seconds)))
-        .map_err(|error| format!("failed to set profiler response timeout: {error}"))?;
-    write!(
-        stream,
+    let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|error| format!("failed to write profiler request: {error}"))?;
-    let mut status_line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut status_line)
-        .map_err(|error| format!("failed to read profiler response: {error}"))?;
+    );
+    write_profiler_request(&mut stream, bound, request.as_bytes())?;
+    let status_line = read_profiler_status_line(&mut stream, bound)?;
     status_line
         .split_whitespace()
         .nth(1)
         .and_then(|status| status.parse().ok())
         .ok_or_else(|| format!("invalid profiler HTTP status line {status_line:?}"))
+}
+
+fn read_profiler_status_line(
+    stream: &mut TcpStream,
+    bound: &OperationBound,
+) -> Result<String, String> {
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        stream
+            .set_read_timeout(Some(profiler_remaining(bound)?))
+            .map_err(|error| format!("failed to set profiler response timeout: {error}"))?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err("profiler control deadline expired".to_owned());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("failed to read profiler response: {error}")),
+        };
+        profiler_remaining(bound)?;
+        if read == 0 || chunk[..read].contains(&b'\n') {
+            response.extend_from_slice(&chunk[..read]);
+            return String::from_utf8(response)
+                .map_err(|error| format!("profiler returned a non-UTF-8 status line: {error}"));
+        }
+        response.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn write_profiler_request(
+    stream: &mut TcpStream,
+    bound: &OperationBound,
+    mut request: &[u8],
+) -> Result<(), String> {
+    while !request.is_empty() {
+        stream
+            .set_write_timeout(Some(profiler_remaining(bound)?))
+            .map_err(|error| format!("failed to set profiler request timeout: {error}"))?;
+        let written = match stream.write(request) {
+            Ok(0) => return Err("failed to write profiler request: connection closed".to_owned()),
+            Ok(written) => written,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err("profiler control deadline expired".to_owned());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("failed to write profiler request: {error}")),
+        };
+        profiler_remaining(bound)?;
+        request = &request[written..];
+    }
+    Ok(())
+}
+
+fn profiler_remaining(bound: &OperationBound) -> Result<Duration, String> {
+    match bound.remaining() {
+        Remaining::Finite(remaining) => Ok(remaining),
+        Remaining::Expired => Err("profiler control deadline expired".to_owned()),
+        Remaining::Unbounded => {
+            Err("profiler control action was unexpectedly unbounded".to_owned())
+        }
+    }
 }
 
 fn collection_already_finalized(action: &CaptureActionRecord) -> bool {
@@ -889,6 +1094,8 @@ pub(crate) fn finalize_target(target: &ProfilerTargetRecord) -> CaptureActionRec
             target,
             "finalize-collection",
             nsys_stop_argv(&target.executable, &target.session),
+            PROFILER_FINALIZATION_DEADLINE,
+            CommandActionMode::Cleanup,
         ),
     }
 }
@@ -900,8 +1107,13 @@ pub(crate) fn finalization_succeeded(action: &CaptureActionRecord) -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfilerCleanupRecord {
+    pub trigger: ProfilerCleanupTrigger,
     pub session: String,
     pub strategy: String,
+    pub elapsed_ms: u64,
+    pub discovery_deadline_ms: u64,
+    pub term_grace_ms: u64,
+    pub kill_grace_ms: u64,
     pub pids: Vec<u32>,
     pub already_exited: bool,
     pub term_sent: bool,
@@ -910,21 +1122,51 @@ pub(crate) struct ProfilerCleanupRecord {
     pub error: Option<String>,
 }
 
-pub(crate) fn cleanup_target_agent(target: &ProfilerTargetRecord) -> ProfilerCleanupRecord {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProfilerCleanupTrigger {
+    StartupRollback,
+    Recovery,
+    Stop,
+}
+
+pub(crate) fn cleanup_target_agent(
+    target: &ProfilerTargetRecord,
+    trigger: ProfilerCleanupTrigger,
+) -> ProfilerCleanupRecord {
+    let started = std::time::Instant::now();
     let strategy = match &target.launch {
         ProfilerLaunch::Local => "local-pgrep-command-line",
         ProfilerLaunch::Ssh { .. } => "ssh-pgrep-command-line",
     };
     let pattern = format!("nsys --start-agent --session-name {}", target.session);
-    let output = target_output(target, &["pgrep".to_owned(), "-f".to_owned(), pattern]);
+    let discovery_bound = OperationBound::finite(PROFILER_AGENT_DISCOVERY_DEADLINE);
+    let output = target_output(
+        target,
+        &["pgrep".to_owned(), "-f".to_owned(), pattern],
+        &discovery_bound,
+        CommandActionMode::Cleanup,
+    );
     let output = match output {
         Ok(output) => output,
-        Err(error) => return cleanup_error(target, format!("failed to launch pgrep: {error}")),
+        Err(error) => {
+            return cleanup_error(
+                target,
+                trigger,
+                started,
+                format!("failed to launch pgrep: {error}"),
+            );
+        }
     };
     if output.status.code() == Some(1) {
         return ProfilerCleanupRecord {
+            trigger,
             session: target.session.clone(),
             strategy: strategy.to_owned(),
+            elapsed_ms: elapsed_ms(started),
+            discovery_deadline_ms: duration_ms(PROFILER_AGENT_DISCOVERY_DEADLINE),
+            term_grace_ms: duration_ms(PROFILER_AGENT_TERM_GRACE),
+            kill_grace_ms: duration_ms(PROFILER_AGENT_KILL_GRACE),
             pids: Vec::new(),
             already_exited: true,
             term_sent: false,
@@ -936,6 +1178,8 @@ pub(crate) fn cleanup_target_agent(target: &ProfilerTargetRecord) -> ProfilerCle
     if !output.status.success() {
         return cleanup_error(
             target,
+            trigger,
+            started,
             format!(
                 "pgrep failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -951,16 +1195,23 @@ pub(crate) fn cleanup_target_agent(target: &ProfilerTargetRecord) -> ProfilerCle
     {
         Ok(pids) => pids,
         Err(error) => {
-            return cleanup_error(target, format!("pgrep returned an invalid PID: {error}"));
+            return cleanup_error(
+                target,
+                trigger,
+                started,
+                format!("pgrep returned an invalid PID: {error}"),
+            );
         }
     };
-    let term_sent = signal_pids(target, &pids, "-TERM").unwrap_or(false);
-    let stopped_after_term = wait_for_pids(target, &pids, Duration::from_secs(2));
+    let term_bound = OperationBound::finite(PROFILER_AGENT_TERM_GRACE);
+    let term_sent = signal_pids(target, &pids, "-TERM", &term_bound).unwrap_or(false);
+    let stopped_after_term = wait_for_pids(target, &pids, &term_bound);
     let (kill_sent, verified, error) = match stopped_after_term {
         Ok(true) => (false, true, None),
         Ok(false) => {
-            let kill_sent = signal_pids(target, &pids, "-KILL").unwrap_or(false);
-            match wait_for_pids(target, &pids, Duration::from_secs(5)) {
+            let kill_bound = OperationBound::finite(PROFILER_AGENT_KILL_GRACE);
+            let kill_sent = signal_pids(target, &pids, "-KILL", &kill_bound).unwrap_or(false);
+            match wait_for_pids(target, &pids, &kill_bound) {
                 Ok(verified) => (
                     kill_sent,
                     verified,
@@ -972,8 +1223,13 @@ pub(crate) fn cleanup_target_agent(target: &ProfilerTargetRecord) -> ProfilerCle
         Err(error) => (false, false, Some(error)),
     };
     ProfilerCleanupRecord {
+        trigger,
         session: target.session.clone(),
         strategy: strategy.to_owned(),
+        elapsed_ms: elapsed_ms(started),
+        discovery_deadline_ms: duration_ms(PROFILER_AGENT_DISCOVERY_DEADLINE),
+        term_grace_ms: duration_ms(PROFILER_AGENT_TERM_GRACE),
+        kill_grace_ms: duration_ms(PROFILER_AGENT_KILL_GRACE),
         pids,
         already_exited: false,
         term_sent,
@@ -983,13 +1239,23 @@ pub(crate) fn cleanup_target_agent(target: &ProfilerTargetRecord) -> ProfilerCle
     }
 }
 
-fn cleanup_error(target: &ProfilerTargetRecord, error: String) -> ProfilerCleanupRecord {
+fn cleanup_error(
+    target: &ProfilerTargetRecord,
+    trigger: ProfilerCleanupTrigger,
+    started: std::time::Instant,
+    error: String,
+) -> ProfilerCleanupRecord {
     ProfilerCleanupRecord {
+        trigger,
         session: target.session.clone(),
         strategy: match &target.launch {
             ProfilerLaunch::Local => "local-pgrep-command-line".to_owned(),
             ProfilerLaunch::Ssh { .. } => "ssh-pgrep-command-line".to_owned(),
         },
+        elapsed_ms: elapsed_ms(started),
+        discovery_deadline_ms: duration_ms(PROFILER_AGENT_DISCOVERY_DEADLINE),
+        term_grace_ms: duration_ms(PROFILER_AGENT_TERM_GRACE),
+        kill_grace_ms: duration_ms(PROFILER_AGENT_KILL_GRACE),
         pids: Vec::new(),
         already_exited: false,
         term_sent: false,
@@ -999,7 +1265,12 @@ fn cleanup_error(target: &ProfilerTargetRecord, error: String) -> ProfilerCleanu
     }
 }
 
-fn signal_pids(target: &ProfilerTargetRecord, pids: &[u32], signal: &str) -> Result<bool, String> {
+fn signal_pids(
+    target: &ProfilerTargetRecord,
+    pids: &[u32],
+    signal: &str,
+    bound: &OperationBound,
+) -> Result<bool, String> {
     let mut succeeded = true;
     for pid in pids {
         let output = target_output(
@@ -1010,7 +1281,10 @@ fn signal_pids(target: &ProfilerTargetRecord, pids: &[u32], signal: &str) -> Res
                 "--".to_owned(),
                 pid.to_string(),
             ],
-        )?;
+            bound,
+            CommandActionMode::Cleanup,
+        )
+        .map_err(|error| error.message)?;
         succeeded &= output.status.success();
     }
     Ok(succeeded)
@@ -1019,25 +1293,34 @@ fn signal_pids(target: &ProfilerTargetRecord, pids: &[u32], signal: &str) -> Res
 fn wait_for_pids(
     target: &ProfilerTargetRecord,
     pids: &[u32],
-    timeout: Duration,
+    bound: &OperationBound,
 ) -> Result<bool, String> {
-    let deadline = std::time::Instant::now() + timeout;
     loop {
         let mut any_alive = false;
         for pid in pids {
-            any_alive |= target_pid_alive(target, *pid)?;
+            any_alive |= target_pid_alive(target, *pid, bound)?;
         }
         if !any_alive {
             return Ok(true);
         }
-        if std::time::Instant::now() >= deadline {
+        if bound.is_expired() {
             return Ok(false);
         }
-        thread::sleep(Duration::from_millis(100));
+        match bound.remaining() {
+            Remaining::Finite(remaining) => {
+                thread::sleep(Duration::from_millis(100).min(remaining));
+            }
+            Remaining::Expired => return Ok(false),
+            Remaining::Unbounded => thread::sleep(Duration::from_millis(100)),
+        }
     }
 }
 
-fn target_pid_alive(target: &ProfilerTargetRecord, pid: u32) -> Result<bool, String> {
+fn target_pid_alive(
+    target: &ProfilerTargetRecord,
+    pid: u32,
+    bound: &OperationBound,
+) -> Result<bool, String> {
     match &target.launch {
         ProfilerLaunch::Local => Ok(Path::new(&format!("/proc/{pid}")).exists()),
         ProfilerLaunch::Ssh { .. } => {
@@ -1049,7 +1332,10 @@ fn target_pid_alive(target: &ProfilerTargetRecord, pid: u32) -> Result<bool, Str
                     "--".to_owned(),
                     pid.to_string(),
                 ],
-            )?;
+                bound,
+                CommandActionMode::Cleanup,
+            )
+            .map_err(|error| error.message)?;
             match output.status.code() {
                 Some(0) => Ok(true),
                 Some(1) => Ok(false),
@@ -1062,6 +1348,14 @@ fn target_pid_alive(target: &ProfilerTargetRecord, pid: u32) -> Result<bool, Str
     }
 }
 
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    duration_ms(started.elapsed())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +1366,96 @@ mod tests {
     use inferlab_protocol::EndpointProtocol;
     use std::collections::BTreeMap;
     use std::error::Error;
+    use std::io::Read;
+
+    #[test]
+    fn expired_control_owner_prevents_a_fresh_connection_attempt() {
+        let bound = OperationBound::finite(Duration::ZERO);
+        let error = post("127.0.0.1", 9, "/start", &bound)
+            .err()
+            .unwrap_or_default();
+
+        assert_eq!(error, "profiler control deadline expired");
+    }
+
+    #[test]
+    fn control_deadline_bounds_a_trickled_status_line() -> Result<(), Box<dyn Error>> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!("HTTP/1.1 200 {}\r\n", " ".repeat(96));
+            for byte in response.bytes() {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        });
+
+        let started = std::time::Instant::now();
+        let bound = OperationBound::finite(Duration::from_secs(1));
+        let error = post("127.0.0.1", port, "/start", &bound)
+            .err()
+            .unwrap_or_default();
+        let elapsed = started.elapsed();
+        server.join().map_err(|_| "trickle fixture panicked")??;
+
+        assert!(error.contains("deadline expired"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a one-second control action lasted {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finalization_command_records_its_own_deadline_after_business_work()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempfile::tempdir()?;
+        let process = process();
+        let mut target = prepare_process(
+            "serve",
+            "prefill",
+            "prefill",
+            0,
+            &process,
+            std::slice::from_ref(&process),
+            60,
+        )?
+        .target
+        .ok_or("missing profiler target")?;
+        target.command_cwd = temp.path().to_path_buf();
+
+        let action = command_action(
+            &target,
+            "fixture-finalization",
+            vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()],
+            Duration::from_millis(50),
+            CommandActionMode::Cleanup,
+        );
+        let CaptureActionRecord::Command {
+            timing, cleanup, ..
+        } = action
+        else {
+            return Err("finalization fixture returned non-command evidence".into());
+        };
+        assert_eq!(
+            timing.budget,
+            crate::time_bound::OperationBudgetEvidence::Finite { configured_ms: 50 }
+        );
+        assert_eq!(timing.terminal_cause, OperationTerminalCause::TimedOut);
+        assert!(timing.elapsed_ms >= 50 && timing.elapsed_ms < 500);
+        assert!(cleanup.is_some_and(|cleanup| {
+            cleanup.verified
+                && cleanup.trigger == crate::container::CommandCleanupTrigger::Deadline
+                && cleanup.kill_attempted
+        }));
+        Ok(())
+    }
 
     fn process() -> ProcessPlan {
         ProcessPlan {
@@ -1116,7 +1500,8 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 8000,
                 protocol: EndpointProtocol::Http,
-                api_path: "/v1".to_owned(),
+                completions_path: "/v1/completions".to_owned(),
+                chat_completions_path: "/v1/chat/completions".to_owned(),
                 prefix_cache_reset: None,
             },
             container: None,

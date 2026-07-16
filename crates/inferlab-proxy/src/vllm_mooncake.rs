@@ -510,7 +510,11 @@ async fn send_prefill_request(
 mod tests {
     use super::*;
     use anyhow::Result;
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
     use serde_json::json;
+    use tokio::sync::Mutex;
+    use tokio::task::JoinHandle;
 
     #[test]
     fn meta_exports_byte_stable_proxy_identity() {
@@ -647,6 +651,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_dispatch_preserves_route_messages_and_unowned_fields() -> Result<()> {
+        let prefill_backend = MockBackend::default();
+        let decode_backend = MockBackend::default();
+        let (prefill, prefill_server) = spawn_backend(prefill_backend.clone()).await?;
+        let (decode, decode_server) = spawn_backend(decode_backend.clone()).await?;
+        let state = ProxyState::new(Config {
+            host: "127.0.0.1".to_owned(),
+            port: 8000,
+            prefill: vec![PrefillTarget {
+                url: prefill,
+                bootstrap_url: "http://127.0.0.1:8998".to_owned(),
+            }],
+            decode: vec![decode],
+        })?;
+        *state.inner.prefill[0].engine_ids.write().await = vec!["prefill-0".to_owned()];
+        state.set_ready();
+        let request = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 1.0,
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"enable_thinking": true}
+        });
+
+        let response = completion_route(
+            state,
+            HeaderMap::new(),
+            request.clone(),
+            "/v1/chat/completions",
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _body = to_bytes(response.into_body(), usize::MAX).await?;
+
+        let prefill_requests = prefill_backend.requests.lock().await;
+        let decode_requests = decode_backend.requests.lock().await;
+        assert_eq!(prefill_requests.len(), 1);
+        assert_eq!(decode_requests.len(), 1);
+        for key in [
+            "messages",
+            "temperature",
+            "reasoning_effort",
+            "chat_template_kwargs",
+        ] {
+            assert_eq!(prefill_requests[0][key], request[key]);
+            assert_eq!(decode_requests[0][key], request[key]);
+        }
+        prefill_server.abort();
+        decode_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn static_backend_selection_round_robins_prefill_engines_and_decode_urls() -> Result<()> {
         let state = ProxyState::new(Config {
             host: "127.0.0.1".to_owned(),
@@ -698,5 +756,30 @@ mod tests {
         assert_eq!(state.next_decode_url()?, "http://127.0.0.1:8021");
         assert_eq!(state.next_decode_url()?, "http://127.0.0.1:8020");
         Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct MockBackend {
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn mock_chat(
+        State(state): State<MockBackend>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        state.requests.lock().await.push(body);
+        Json(json!({"object": "chat.completion", "choices": []})).into_response()
+    }
+
+    async fn spawn_backend(state: MockBackend) -> Result<(String, JoinHandle<()>)> {
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_chat))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let _result = serve(listener, app).await;
+        });
+        Ok((format!("http://{address}"), server))
     }
 }

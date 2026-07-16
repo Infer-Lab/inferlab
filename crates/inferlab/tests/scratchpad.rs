@@ -91,7 +91,7 @@ fn notes_require_no_setup_and_render_with_record_summaries() -> Result<(), Box<d
     let workspace = JournalWorkspace::new()?;
     workspace.write_record(
         RECORD_A,
-        r#"{"kind":"bench","definition_id":"random-8k1k","status":"succeeded"}"#,
+        r#"{"schema_version":7,"kind":"bench","definition_id":"random-8k1k","status":"succeeded","cases":[],"summary":{"policy":"highest-feasible-rate-v1"}}"#,
     )?;
 
     // The very first command against a fresh workspace is a note: no thread

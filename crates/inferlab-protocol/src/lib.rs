@@ -5,20 +5,24 @@ use schemars::generate::SchemaSettings;
 pub use wire::{
     AdapterError, AdapterErrorCode, AdapterProtocol, AdapterRequest, AdapterResponse,
     AdapterResult, AllocationLaunch, BenchCaseInput, BenchClientRequest, BenchClientResult,
-    BenchDefinitionInput, BenchLoadInput, BuiltinRouterKind, CaptureControlRequirement,
+    BenchDatasetCacheState, BenchDatasetCatalogInput, BenchDatasetInput,
+    BenchDatasetPreparationRequest, BenchDatasetPreparationResult, BenchDefinitionInput,
+    BenchLoadInput, BenchPopulationInput, BenchRequestSloInput, BenchRequestSloResult,
+    BenchRequestSourceInput, BenchTokenCountSummary, BuiltinRouterKind, CaptureControlRequirement,
     CaptureTargetRequirement, ClientEndpointInput, ClientStatus, EndpointAssignment,
     EndpointProtocol, EndpointRequirement, EvalClientRequest, EvalClientResult,
-    EvalDefinitionInput, HttpActionSpec, HttpMethod, HttpTargetRegistryReadiness,
-    IntegrationIdentity, KvTransferMechanism, LaunchFileDeclaration, MeasurementModelInput,
-    Parallelism, ParallelismAttention, ParallelismExperts, ParallelismOuter, PlanServeInput,
-    PlanServeResult, ProcessSpec, ProtocolVersion, RawArtifact, ReadinessProbe,
-    RenderInputDeclaration, RenderServeInput, RenderServeResult, RenderedServeProcess,
-    RoutingResult, ServeModelInput, ServeProcessAllocation, ServeReplicaRequirement,
-    ServeRoleInput, ServeRoleKind, ServeRoleLink, ServeRoleResult, ServeTopology, SettingValue,
-    SuppliedRenderInput, TargetEndpointScheme,
+    EvalDefinitionInput, EvalFailureKind, EvalMetricComparison, EvalMetricGate,
+    EvalMetricGateConclusion, EvalNormalizedMetric, EvalTaskSourceInput, EvalTrialSummary,
+    HttpActionSpec, HttpMethod, HttpTargetRegistryReadiness, IntegrationIdentity,
+    KvTransferMechanism, LaunchFileDeclaration, MeasurementModelInput, Parallelism,
+    ParallelismAttention, ParallelismExperts, ParallelismOuter, PlanServeInput, PlanServeResult,
+    ProcessSpec, ProtocolVersion, RawArtifact, ReadinessProbe, RenderInputDeclaration,
+    RenderServeInput, RenderServeResult, RenderedServeProcess, RoutingResult, ServeModelInput,
+    ServeProcessAllocation, ServeReplicaRequirement, ServeRoleInput, ServeRoleKind, ServeRoleLink,
+    ServeRoleResult, ServeTopology, SettingValue, SuppliedRenderInput, TargetEndpointScheme,
 };
 
-pub const PROTOCOL_SCHEMA_ID: &str = "https://inferlab.dev/schema/adapter-protocol/v5";
+pub const PROTOCOL_SCHEMA_ID: &str = "https://inferlab.dev/schema/adapter-protocol/v6";
 
 #[must_use]
 pub fn protocol_schema() -> schemars::Schema {

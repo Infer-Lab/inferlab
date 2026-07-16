@@ -238,6 +238,7 @@ inferlab serve start example \
 
 inferlab recipe run qualify \
   --set evals.gsm8k.limit=100 \
+  --set evals.gsm8k.trials=5 \
   --set evals.gsm8k.concurrency=8 \
   --set 'benches.random-8k1k.concurrency=[1, 8]' \
   --dry-run
@@ -246,6 +247,184 @@ inferlab recipe run qualify \
 Recipe measurement patches may name only Eval and Bench definitions selected
 by that recipe's workload suite. They cannot change identities, kinds, suite
 membership, the gate, or the selected server.
+
+An lm-eval definition may set `trials` for repeated evaluation of one resolved
+single-sample `generate_until` task. Its default is `1`. The definition seed
+is the repeated base seed; when it is absent, repeated evaluation uses `1234`.
+Trial `i` uses `base_seed + i - 1`. The existing `concurrency` field controls
+those requests, and `request_body.seed` is rejected because the definition owns
+the seed schedule. Each trial repeats the complete resolved Eval; Inferlab does
+not rewrite task-owned response multiplicity, filters, or scorer behavior.
+
+## lm-eval tasks and inference requests
+
+An lm-eval definition selects exactly one task. Use a pinned lm-eval task name,
+a release-bundled Inferlab task, or a workspace-owned task YAML:
+
+```toml
+[evals.builtin]
+kind = "lm-eval"
+task = "gsm8k"
+metric = "exact_match"
+metric_filter = "strict-match"
+threshold = 0.90
+timeout_seconds = 900
+
+[evals.bundled]
+kind = "lm-eval"
+task = { bundled = "estonia" }
+metric = "estonia_pass"
+metric_filter = "strict-terminal-answer"
+threshold = 0.50
+timeout_seconds = 3600
+
+[evals.workspace-task]
+kind = "lm-eval"
+task = { yaml = "evals/long-context.yaml" }
+metric = "exact_match"
+threshold = 0.80
+timeout_seconds = 3600
+```
+
+The task, not a second Inferlab dataset layer, owns `dataset_path`,
+`dataset_name`, split selection, prompting, output type, filters, and scoring.
+Workspace YAML paths must be workspace-relative tracked `.yaml` or `.yml`
+files. Inferlab resolves their YAML include closure, records the effective task
+configuration and dataset selection, and includes that closure in source
+identity. Release-bundled tasks are addressed only by their catalog name and
+carry a release-owned closure digest.
+
+Inferlab uses the resolved model-weight locator as the Hugging Face tokenizer
+locator. This follows the normal model-directory convention and avoids a
+second tokenizer setting; the locator must contain a usable tokenizer.
+`generate_until` tasks use chat completions. Tasks whose
+resolved output type is `loglikelihood`, `loglikelihood_rolling`, or
+`multiple_choice` use completions and first run a prompt-logprob/tokenizer
+alignment probe. Dynamic Python tasks are probed conservatively as well. A
+probe failure makes support inconclusive rather than silently removing the
+task.
+
+Use `request_body` for task-specific inference parameters such as sampling,
+reasoning effort, logprobs, or chat-template arguments:
+
+```toml
+[evals.reasoning]
+kind = "lm-eval"
+task = { yaml = "evals/reasoning.yaml" }
+metric = "exact_match"
+threshold = 0.80
+timeout_seconds = 1800
+
+[evals.reasoning.request_body]
+temperature = 1.0
+reasoning_effort = "high"
+logprobs = true
+
+[evals.reasoning.request_body.chat_template_kwargs]
+enable_thinking = true
+```
+
+The same nested values may be patched for one run, for example
+`--set evals.reasoning.request_body.temperature=0.6`. `request_body` is a JSON
+request fragment, not a replacement request: Inferlab retains ownership of the
+model, prompt or messages, streaming mode, one-completion policy, output bound,
+and stop conditions. Eval also owns the repeated-trial seed schedule. Conflicts
+with those fields fail during validation and the complete effective fragment is
+preserved in dry-run and record evidence.
+
+## Serving Bench warmup and metrics
+
+A concurrency Bench may run a native warmup phase before its profiled phase:
+
+```toml
+[benches.random-8k1k]
+kind = "serving"
+request_source = { kind = "random", input_tokens = 8192, output_tokens = 1024 }
+concurrency = [1, 8]
+prompts_per_concurrency = 4
+warmup_prompts_per_concurrency = 2
+request_body = { temperature = 1.0 }
+timeout_seconds = 900
+```
+
+For concurrency `c`, the resolved warmup count is
+`c * warmup_prompts_per_concurrency`. Warmup uses the same route, request
+source, request body, and concurrency as profiling, but consumes a disjoint
+prefix of the frozen request population. It is excluded from normalized
+metrics and profiling request counts. A requested prefix-cache reset happens
+once before warmup, and the case timeout covers reset, warmup, profiling, and
+result handling; process cleanup retains its separate grace.
+
+Every successful Bench reports `request_throughput`, `output_throughput`, and
+`total_token_throughput`. For each of `request_latency_ms`, `ttft_ms`, and
+`tpot_ms`, Inferlab reports `mean`, `min`, `max`, `stddev`, `p50`, `p90`,
+`p95`, and `p99` using names such as `p95_tpot_ms`. TPOT is not applicable to
+an `output_tokens = 1` prefill-dominant workload and its TPOT metrics are then
+omitted. `prompt_cache_read_ratio` is present only when AIPerf reports valid
+cache-usage evidence. `good_request_ratio` and `goodput` are derived only when
+a request SLO is configured.
+
+## Serving Bench SLOs
+
+A static or adaptive serving Bench may constrain normalized aggregate metrics,
+individual request latency, or both. Aggregate constraints are inclusive and
+AND-composed. Request SLOs count a request as good only when every configured
+latency bound passes, then gate the case with `minimum_good_request_ratio`.
+
+```toml
+[benches.saturation]
+kind = "adaptive-serving"
+request_source = { kind = "random", input_tokens = 8192, output_tokens = 1024 }
+initial_request_rates = [1.0, 4.0]
+aggregate_slos = [
+  { metric = "request_throughput", at_least = 1.0 },
+  { metric = "p99_ttft_ms", at_most = 800.0 },
+]
+request_slo = { request_latency_ms = 5000.0, ttft_ms = 800.0, tpot_ms = 30.0, minimum_good_request_ratio = 0.99 }
+max_search_steps = 6
+min_rate_resolution = 0.25
+duration_seconds = 60
+timeout_seconds = 900
+```
+
+Adaptive Bench uses `highest-feasible-rate-v1`: it probes every initial rate,
+then uses bounded doubling and directional bisection to select only the highest
+observed feasible rate. `max_search_steps` covers automatically added probes;
+it does not truncate the declared initial list. Use command-line `--set` to
+override recipe-specific SLO values without changing the stored definition.
+
+## Serving Bench request sources
+
+Every serving Bench selects one closed request source. A random source keeps
+the existing exact synthetic token shape:
+
+```toml
+request_source = { kind = "random", input_tokens = 8192, output_tokens = 1024 }
+```
+
+The release catalog currently exposes ShareGPT as a bounded conversational
+source. Inferlab pins the Apache-2.0
+[ShareGPT Vicuna snapshot](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/tree/bcd32a724d8460ebe14e1d05b0195e30e9a46cb1):
+
+```toml
+request_source = { kind = "dataset", dataset = "sharegpt", max_input_tokens = 8192 }
+```
+
+Inferlab downloads the release-pinned snapshot on first execution, verifies
+its digest, and reuses it from
+`$XDG_CACHE_HOME/inferlab/datasets/sha256/<digest>` (normally
+`~/.cache/inferlab/datasets/sha256/<digest>`). Dry-run reports the catalog and
+cache state but does not download missing data.
+
+Each selected conversation becomes one independent chat-completions request.
+The final assistant message is held out to derive the output limit. If the
+rendered input exceeds `max_input_tokens`, Inferlab rolls back complete trailing
+user/assistant exchanges until an earlier target fits; it never truncates a
+message or discards the leading history. Set `output_tokens` inside the table
+to replace target-derived output lengths, including `output_tokens = 1` for a
+prefill-dominant run. The Bench-level `seed` controls deterministic sampling
+without replacement. Command-line overrides may change fields within the
+selected source, but cannot change `request_source.kind`.
 
 ## Validate before launch
 

@@ -1,9 +1,12 @@
 use inferlab_protocol::{
-    AdapterRequest, AdapterResponse, AdapterResult, PROTOCOL_SCHEMA_ID, ProtocolVersion,
-    ReadinessProbe, RenderInputDeclaration, SuppliedRenderInput, TargetEndpointScheme,
+    AdapterRequest, AdapterResponse, AdapterResult, EvalClientRequest, EvalClientResult,
+    EvalDefinitionInput, EvalFailureKind, EvalMetricComparison, EvalMetricGateConclusion,
+    EvalTaskSourceInput, PROTOCOL_SCHEMA_ID, ProtocolVersion, ReadinessProbe,
+    RenderInputDeclaration, SettingValue, SuppliedRenderInput, TargetEndpointScheme,
     protocol_schema,
 };
 use std::error::Error;
+use std::path::Path;
 
 const VALID_PLAN_REQUEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -49,9 +52,25 @@ const VALID_SUPPLIED_RENDER_INPUT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../protocol/fixtures/valid/supplied-render-input.json"
 ));
+const VALID_EVAL_CLIENT_REQUEST_WORKSPACE_YAML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/eval-client-request-workspace-yaml.json"
+));
+const VALID_EVAL_CLIENT_REQUEST_BUNDLED: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/eval-client-request-bundled.json"
+));
+const VALID_EVAL_CLIENT_RESULT_PROBE_FAILURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/eval-client-result-probe-failure.json"
+));
+const VALID_EVAL_CLIENT_RESULT_NORMALIZED_METRIC: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../protocol/fixtures/valid/eval-client-result-normalized-metric.json"
+));
 const GENERATED_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../protocol/schema/adapter-protocol-v5.schema.json"
+    "/../../protocol/schema/adapter-protocol-v6.schema.json"
 ));
 
 #[test]
@@ -63,11 +82,11 @@ fn valid_fixtures_deserialize_and_round_trip() -> Result<(), Box<dyn Error>> {
     let launch_file_response: AdapterResponse = serde_json::from_str(VALID_LAUNCH_FILE_RESPONSE)?;
     let error_response: AdapterResponse = serde_json::from_str(VALID_ERROR_RESPONSE)?;
 
-    assert_eq!(plan_request.protocol_version(), ProtocolVersion::V5);
-    assert_eq!(plan_response.protocol_version(), ProtocolVersion::V5);
-    assert_eq!(render_request.protocol_version(), ProtocolVersion::V5);
-    assert_eq!(render_response.protocol_version(), ProtocolVersion::V5);
-    assert_eq!(error_response.protocol_version(), ProtocolVersion::V5);
+    assert_eq!(plan_request.protocol_version(), ProtocolVersion::V6);
+    assert_eq!(plan_response.protocol_version(), ProtocolVersion::V6);
+    assert_eq!(render_request.protocol_version(), ProtocolVersion::V6);
+    assert_eq!(render_response.protocol_version(), ProtocolVersion::V6);
+    assert_eq!(error_response.protocol_version(), ProtocolVersion::V6);
 
     let AdapterResponse::Ok { result, .. } = &plan_response else {
         return Err("plan fixture did not contain a successful response".into());
@@ -76,6 +95,11 @@ fn valid_fixtures_deserialize_and_round_trip() -> Result<(), Box<dyn Error>> {
         return Err("plan fixture did not contain plan output".into());
     };
     assert!(output.render_inputs.is_empty());
+    assert_eq!(output.endpoint.completions_path, "/v1/completions");
+    assert_eq!(
+        output.endpoint.chat_completions_path,
+        "/v1/chat/completions"
+    );
 
     let AdapterRequest::RenderServe { input, .. } = &render_request else {
         return Err("render fixture did not contain a render request".into());
@@ -201,6 +225,102 @@ fn render_input_fixtures_preserve_declared_path_and_supplied_text() -> Result<()
         supplied.sha256,
         "898caa1654c13bd4b1f2eba75d17c09b8fc3ea1370e5532a5111be220d50baa3"
     );
+    Ok(())
+}
+
+#[test]
+fn eval_client_fixture_preserves_workspace_yaml_task_source() -> Result<(), Box<dyn Error>> {
+    let request: EvalClientRequest =
+        serde_json::from_str(VALID_EVAL_CLIENT_REQUEST_WORKSPACE_YAML)?;
+    let EvalDefinitionInput::LmEval {
+        task,
+        trials,
+        metric_filter,
+        request_body,
+        ..
+    } = request.definition
+    else {
+        return Err("fixture did not contain an lm-eval definition".into());
+    };
+    let EvalTaskSourceInput::WorkspaceYaml { path } = *task else {
+        return Err("fixture did not contain a workspace YAML task source".into());
+    };
+
+    assert_eq!(request.protocol_version, ProtocolVersion::V6);
+    assert_eq!(request.endpoint.completions_path, "/v1/completions");
+    assert_eq!(
+        request.endpoint.chat_completions_path,
+        "/v1/chat/completions"
+    );
+    assert_eq!(path, Path::new("/workspace/evals/custom.yaml"));
+    assert_eq!(metric_filter.as_deref(), Some("strict-match"));
+    assert_eq!(trials, 3);
+    assert_eq!(
+        request_body.get("reasoning_effort"),
+        Some(&SettingValue::String("high".to_owned()))
+    );
+    assert!(matches!(
+        request_body.get("chat_template_kwargs"),
+        Some(SettingValue::Object(values))
+            if values.get("enable_thinking") == Some(&SettingValue::Bool(true))
+    ));
+    Ok(())
+}
+
+#[test]
+fn eval_client_fixture_preserves_bundled_task_identity() -> Result<(), Box<dyn Error>> {
+    let request: EvalClientRequest = serde_json::from_str(VALID_EVAL_CLIENT_REQUEST_BUNDLED)?;
+    let EvalDefinitionInput::LmEval { task, .. } = request.definition else {
+        return Err("fixture did not contain an lm-eval definition".into());
+    };
+    let EvalTaskSourceInput::Bundled {
+        name,
+        task_identity,
+        task_closure_sha256,
+        ..
+    } = *task
+    else {
+        return Err("fixture did not contain a bundled task source".into());
+    };
+
+    assert_eq!(name, "estonia");
+    assert_eq!(task_identity, "inferlab_estonia");
+    assert_eq!(task_closure_sha256.len(), 64);
+    Ok(())
+}
+
+#[test]
+fn eval_client_result_fixture_preserves_typed_probe_failure() -> Result<(), Box<dyn Error>> {
+    let result: EvalClientResult = serde_json::from_str(VALID_EVAL_CLIENT_RESULT_PROBE_FAILURE)?;
+
+    assert_eq!(
+        result.failure_kind,
+        Some(EvalFailureKind::ProbeGeneratedOnlyLogprobs)
+    );
+    assert_eq!(result.raw_artifacts[0].kind, "prompt-logprob-probe");
+    Ok(())
+}
+
+#[test]
+fn eval_client_result_fixture_preserves_metric_gate_provenance() -> Result<(), Box<dyn Error>> {
+    let result: EvalClientResult =
+        serde_json::from_str(VALID_EVAL_CLIENT_RESULT_NORMALIZED_METRIC)?;
+    let metric = result
+        .normalized_metrics
+        .get("gsm8k:exact_match,strict-match")
+        .ok_or("normalized metric fixture had no metric")?;
+    assert_eq!(metric.source_identity, "gsm8k");
+    assert_eq!(metric.native_metric_key, "exact_match,strict-match");
+    let gate = result.gate.ok_or("normalized metric fixture had no gate")?;
+    assert_eq!(gate.comparison, EvalMetricComparison::AtLeast);
+    assert_eq!(gate.conclusion, EvalMetricGateConclusion::Passed);
+    assert_eq!(result.native_exit_code, Some(0));
+    assert!(!result.native_timed_out);
+    let summary = result
+        .trial_summary
+        .ok_or("normalized metric fixture had no trial summary")?;
+    assert_eq!(summary.requested_trials, 3);
+    assert_eq!(summary.passed_trials, 2);
     Ok(())
 }
 

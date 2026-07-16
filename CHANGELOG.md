@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-16
+
+### Added
+
+- Long-running commands now report phases, bounded item progress, lock contention, readiness failures, heartbeats, elapsed time, record directories, and durable log paths on stderr while keeping machine-readable stdout clean.
+- lm-eval definitions can select built-in tasks or workspace-local task YAML, including task-owned datasets, splits, prompting, output type, and scoring. The resolved model locator supplies the default tokenizer, and likelihood tasks receive a bounded prompt-logprob and tokenizer-alignment probe before evaluation.
+- Eval results now normalize task and metric identity deterministically, preserve raw native output and failure artifacts, and expose explicit transport, endpoint, response-shape, metric-selection, and tokenizer-alignment failures instead of silently changing task semantics.
+- The release-owned Eval runtime includes an offline long-context, single-sample generation task with strict terminal-answer scoring. Eval definitions can repeat an eligible task with deterministic per-trial seeds, existing request concurrency, incremental per-trial evidence, and pass rate over issued trials.
+- Eval and Bench definitions can carry task-specific OpenAI request parameters, including sampling, logprobs, reasoning effort, and chat-template arguments, with invocation-time nested overrides. Generate and serving workloads use named chat-completions routes, likelihood and smoke workloads use named completions routes, and Inferlab's built-in vLLM, SGLang, and TensorRT-LLM proxies support the corresponding chat path.
+- Concurrency Benches can run AIPerf-native warmup before profiling. Normalized results include request latency, TTFT, and TPOT mean/min/max/stddev/p50/p90/p95/p99 plus prompt-cache read ratio when reported.
+- Static and adaptive Benches support aggregate SLOs, per-request latency SLOs, minimum good-request ratio, goodput, and an automatically expanding and bisecting highest-feasible-rate search.
+- Serving Bench can materialize a release-pinned ShareGPT snapshot into deterministic, tokenizer-bounded single-request populations with content-verified caching and complete acquisition, truncation, population, and native-request identity evidence.
+
+### Changed
+
+- The release-owned Bench environment now uses AIPerf 0.11.0; lm-eval remains pinned at 0.4.12.
+- Adapter protocol version 6 makes completions and chat-completions routes explicit and carries the revised Eval and Bench request shapes. The 0.4.0 integration wheels are the tested lockstep set; workspaces pinned to 0.3.0 integrations must bump and relock with the binary.
+- Eval and Bench cases now consume one end-to-end case budget beginning at their first case-owned action. Readiness, adapter invocation, container operations, and profiler control likewise have explicit owning deadlines, while cleanup and finalization use separate grace periods and never consume or rewrite the preceding business-operation budget.
+- Serving Bench definitions now use the closed `request_source` union. The former flat random-token fields and adaptive `target_metric`, `target_threshold`, and `max_refinement_steps` fields have no compatibility aliases; use `aggregate_slos` and `max_search_steps`.
+- Agent commands again delegate orchestration to the agent-plugin-installer batch API and remain outside the long-running-command progress contract.
+- Workload plans, typed records, local process groups, measurement-runner operations, Python integration helpers, and server launch mechanisms now have explicit single owners. These internal boundary refactors are intended to preserve existing serving, placement, readiness, interruption, cleanup, and record behavior.
+
+### Fixed
+
+- Official static release binaries now detect the runtime Linux architecture and glibc compatibility from host facts, so measurement toolchain installation works on supported x86_64 and aarch64 glibc hosts instead of inheriting the musl build target.
+- TPOT applicability, stable Bench metric names, lm-eval metric selection, operation terminal causes, and cleanup elapsed time now come from one typed authority at each boundary instead of duplicated string or boolean inference.
+- A failed or timed-out measurement, adapter, profiler, container, or cleanup operation preserves the established business result, terminal cause, native command evidence, partial artifacts, and verified cleanup outcome without granting nested attempts fresh timeout budgets.
+
+### Security
+
+- Backend qualification remains scoped to the exact demonstrated topology, route, integration revision, and hardware baseline; public support documentation excludes credentials, private hosts, model locators, local paths, record identifiers, and private downstream revisions.
+
 ## [0.3.0] - 2026-07-14
 
 ### Changed

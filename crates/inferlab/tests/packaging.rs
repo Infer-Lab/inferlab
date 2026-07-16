@@ -37,6 +37,10 @@ fn packaged_copies_match_their_sources() -> Result<(), Box<dyn Error>> {
             "python/inferlab-eval-runner/src/inferlab_eval_runner/eval_client.py",
         ),
         (
+            "resources/toolchain-python/lm_eval_entry.py",
+            "python/inferlab-eval-runner/src/inferlab_eval_runner/lm_eval_entry.py",
+        ),
+        (
             "resources/toolchain-python/bench_client.py",
             "python/inferlab-bench-runner/src/inferlab_bench_runner/bench_client.py",
         ),
@@ -45,6 +49,22 @@ fn packaged_copies_match_their_sources() -> Result<(), Box<dyn Error>> {
             fs::read(crate_dir.join(copy))?,
             fs::read(root.join(source))?,
             "{copy} drifted from {source}"
+        );
+    }
+    for name in ["dataset.json", "estonia.py", "estonia.yaml", "prompt.txt"] {
+        assert_eq!(
+            fs::read(
+                crate_dir
+                    .join("resources/bundled-eval-tasks/estonia")
+                    .join(name),
+            )?,
+            fs::read(
+                root.join(
+                    "python/inferlab-eval-runner/src/inferlab_eval_runner/bundled_tasks/estonia",
+                )
+                .join(name),
+            )?,
+            "bundled Estonia resource {name} drifted from its package source"
         );
     }
 

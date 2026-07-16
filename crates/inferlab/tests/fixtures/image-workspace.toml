@@ -94,8 +94,7 @@ timeout_seconds = 60
 
 [benches.probe]
 kind = "serving"
-input_tokens = 128
-output_tokens = 16
+request_source = { kind = "random", input_tokens = 128, output_tokens = 16 }
 concurrency = [1]
 prompts_per_concurrency = 1
 request_rates = [1.0]
