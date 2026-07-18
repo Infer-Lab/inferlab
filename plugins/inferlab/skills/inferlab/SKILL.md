@@ -131,7 +131,7 @@ member fails validation. For a concurrency Bench,
 requests before profiling; warmup is excluded from normalized metrics. Use
 `output_tokens = 1` for a prefill-dominant Bench; TPOT is then inapplicable and
 omitted. See the
-[0.5.0 workspace authoring guide](https://github.com/Infer-Lab/inferlab/blob/v0.5.0/docs/workspace-authoring.md)
+[0.5.0 workspace authoring guide](https://github.com/Infer-Lab/InferLab/blob/v0.5.0/docs/workspace-authoring.md)
 for task-source, request-body, warmup, request-source, metric, and SLO examples.
 
 **Closed loop.** `inferlab recipe run <RECIPE> --case <CASE>` starts the

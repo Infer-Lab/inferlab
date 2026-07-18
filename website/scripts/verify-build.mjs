@@ -2,11 +2,10 @@ import { access, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { contentManifest, routeForTarget } from './content-manifest.mjs';
+import { siteBaseWithSlash as base, siteOrigin } from '../site.config.mjs';
 
 const websiteRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(websiteRoot, 'dist');
-const base = '/inferlab/';
-const siteOrigin = 'https://infer-lab.github.io';
 
 async function exists(filePath) {
   try {
@@ -25,6 +24,7 @@ for (const required of [
   'docs/architecture/rfc/rfc-0011/index.html',
   'docs/architecture/adr/adr-0019/index.html',
   'pagefind/pagefind.js',
+  'sitemap-0.xml',
 ]) {
   if (!(await exists(path.join(dist, required)))) {
     throw new Error(`missing built site output: ${required}`);
@@ -70,6 +70,17 @@ for (const htmlPath of await htmlFiles(dist)) {
   const html = await readFile(htmlPath, 'utf8');
   const relativePage = path.relative(dist, htmlPath).replaceAll(path.sep, '/');
   const pageUrl = new URL(relativePage.replace(/index\.html$/, ''), `${siteOrigin}${base}`);
+  if (relativePage !== '404.html') {
+    const canonical = html.match(/<link rel="canonical" href="([^"]+)"\s*\/?\s*>/);
+    if (!canonical) {
+      throw new Error(`${relativePage}: missing canonical page URL`);
+    }
+    if (canonical[1] !== pageUrl.href) {
+      throw new Error(
+        `${relativePage}: canonical page URL ${canonical[1]} does not match ${pageUrl.href}`,
+      );
+    }
+  }
   for (const match of html.matchAll(/(?:href|src)="([^"]+)"/g)) {
     const reference = match[1];
     if (reference.startsWith('#') || /^(?:mailto:|data:)/.test(reference)) continue;
@@ -85,6 +96,24 @@ for (const htmlPath of await htmlFiles(dist)) {
     if (!(await exists(target))) {
       throw new Error(`${relativePage}: unresolved local reference ${reference}`);
     }
+  }
+}
+
+const sitemap = await readFile(path.join(dist, 'sitemap-0.xml'), 'utf8');
+const sitemapLocations = [...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map((match) => match[1]);
+if (sitemapLocations.length === 0) {
+  throw new Error('sitemap-0.xml: expected at least one page URL');
+}
+if (new Set(sitemapLocations).size !== sitemapLocations.length) {
+  throw new Error('sitemap-0.xml: duplicate page URL');
+}
+for (const location of sitemapLocations) {
+  const url = new URL(location);
+  if (url.origin !== siteOrigin || !decodeURIComponent(url.pathname).startsWith(base)) {
+    throw new Error(`sitemap-0.xml: page URL escapes ${siteOrigin}${base}: ${location}`);
+  }
+  if (!url.pathname.endsWith('/')) {
+    throw new Error(`sitemap-0.xml: page URL path lacks trailing slash: ${location}`);
   }
 }
 

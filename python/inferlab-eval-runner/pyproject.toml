@@ -17,7 +17,7 @@ dependencies = [
 inferlab-eval-runner = "inferlab_eval_runner.eval_client:main"
 
 [project.urls]
-Repository = "https://github.com/Infer-Lab/inferlab"
+Repository = "https://github.com/Infer-Lab/InferLab"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/inferlab_eval_runner"]

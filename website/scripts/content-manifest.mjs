@@ -1,10 +1,11 @@
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { siteBase } from '../site.config.mjs';
 
 export const websiteRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const repositoryRoot = path.resolve(websiteRoot, '..');
-export const siteBase = '/inferlab';
+export { siteBase };
 
 const fixedEntries = [
   {

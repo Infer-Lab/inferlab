@@ -1,5 +1,25 @@
 # InferLab
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Infer-Lab/InferLab/main/website/src/assets/inferlab-mark.svg" width="112" alt="InferLab logo">
+</p>
+
+<p align="center"><strong>Declare once. Run anywhere. Keep the evidence.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/Infer-Lab/InferLab/actions/workflows/ci.yml"><img src="https://github.com/Infer-Lab/InferLab/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/Infer-Lab/InferLab/releases/latest"><img src="https://img.shields.io/github/v/release/Infer-Lab/InferLab" alt="Latest GitHub release"></a>
+  <a href="https://crates.io/crates/inferlab"><img src="https://img.shields.io/crates/v/inferlab" alt="inferlab on crates.io"></a>
+  <a href="https://github.com/Infer-Lab/InferLab/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Infer-Lab/InferLab" alt="MIT license"></a>
+</p>
+
+<p align="center">
+  <a href="https://infer-lab.github.io/InferLab/">Website</a> ·
+  <a href="https://infer-lab.github.io/InferLab/docs/">Documentation</a> ·
+  <a href="https://github.com/Infer-Lab/InferLab/releases">Releases</a> ·
+  <a href="https://infer-lab.github.io/InferLab/docs/architecture/rfc/">Specification</a>
+</p>
+
 Reproducible LLM inference experiments. A committed **workspace** fixes the
 shareable baseline — stacks, named servers and cases, recipes, and eval/bench
 definitions. A git-ignored **local bindings** file supplies machine-private
@@ -22,12 +42,17 @@ you can inspect, compare, and reproduce.
 - **View-only TUI** — one responsive workspace console for declared definitions,
   concurrent CLI work, records, referenced logs, and journal context.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Infer-Lab/InferLab/main/docs/assets/inferlab-tui-demo.png" width="976" alt="InferLab view-only TUI showing an active recipe, a running server, a completed benchmark, and workspace evidence">
+</p>
+<p align="center"><sub>Rendered by the real InferLab TUI with synthetic demo data; no local workspace or machine identifiers are shown.</sub></p>
+
 ## Install
 
 Download a release binary (x86_64 / aarch64 Linux):
 
 ```sh
-curl -fsSL https://github.com/Infer-Lab/inferlab/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Infer-Lab/InferLab/releases/latest/download/install.sh | sh
 ```
 
 Or install from the crates registry (Rust 1.89+):
@@ -77,7 +102,7 @@ those commands resolves and validates without launching or writing one.
 
 ## Documentation
 
-- [Product and documentation website](https://infer-lab.github.io/inferlab/):
+- [Product and documentation website](https://infer-lab.github.io/InferLab/):
   the searchable public entry point for current operator guidance, RFCs, and
   ADRs.
 - [Workspace authoring](docs/workspace-authoring.md): public definitions,

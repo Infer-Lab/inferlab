@@ -11,7 +11,7 @@ version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-repository = "https://github.com/Infer-Lab/inferlab"
+repository = "https://github.com/Infer-Lab/InferLab"
 
 [workspace.dependencies]
 agent-plugin-installer = { version = "0.6", features = ["clap"] }

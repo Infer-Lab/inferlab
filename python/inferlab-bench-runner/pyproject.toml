@@ -15,7 +15,7 @@ dependencies = ["inferlab-adapter-sdk==0.4.0"]
 inferlab-bench-runner = "inferlab_bench_runner.bench_client:main"
 
 [project.urls]
-Repository = "https://github.com/Infer-Lab/inferlab"
+Repository = "https://github.com/Infer-Lab/InferLab"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/inferlab_bench_runner"]

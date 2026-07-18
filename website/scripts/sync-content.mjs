@@ -8,6 +8,7 @@ import {
   websiteRoot,
 } from './content-manifest.mjs';
 import { projectMarkdown } from './content-projection.mjs';
+import { repositoryUrl } from '../site.config.mjs';
 
 function frontmatter(title, description) {
   return `---\ntitle: ${JSON.stringify(title)}\ndescription: ${JSON.stringify(description)}\n---\n\n`;
@@ -50,7 +51,7 @@ function rewriteUrl(url, sourceEntry) {
   if (relative.startsWith('..') || path.isAbsolute(relative)) {
     throw new Error(`${sourceEntry.source}: projected link escapes repository root: ${url}`);
   }
-  return `https://github.com/Infer-Lab/inferlab/blob/main/${relative}${suffix}`;
+  return `${repositoryUrl}/blob/main/${relative}${suffix}`;
 }
 
 function projectLinks(source, entry) {

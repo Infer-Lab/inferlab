@@ -1,6 +1,11 @@
 ---
 import '../styles/product.css';
 import InferLabBrand from '../components/InferLabBrand.astro';
+import {
+  repositoryUrl,
+  siteBaseWithSlash,
+  siteOrigin,
+} from '../../site.config.mjs';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const docs = `${base}/docs/`;
@@ -19,6 +24,7 @@ const specification = `${base}/docs/architecture/rfc/rfc-0001/`;
       content="InferLab makes LLM inference experiments reproducible from declared workspace intent to durable file-first evidence."
     />
     <link rel="icon" type="image/svg+xml" href={`${base}/favicon.svg`} />
+    <link rel="canonical" href={`${siteOrigin}${siteBaseWithSlash}`} />
     <title>InferLab — Reproducible inference experiments</title>
   </head>
   <body>
@@ -29,7 +35,7 @@ const specification = `${base}/docs/architecture/rfc/rfc-0001/`;
         <a href={docs}>Docs</a>
         <a href={support}>Backends</a>
         <a href={specification}>Specification</a>
-        <a href="https://github.com/Infer-Lab/inferlab">GitHub</a>
+        <a href={repositoryUrl}>GitHub</a>
       </nav>
     </header>
 
@@ -115,7 +121,7 @@ const specification = `${base}/docs/architecture/rfc/rfc-0001/`;
         </div>
         <div class="actions">
           <a class="button primary" href={install}>Install InferLab</a>
-          <a class="button secondary" href="https://github.com/Infer-Lab/inferlab/releases">Releases</a>
+          <a class="button secondary" href={`${repositoryUrl}/releases`}>Releases</a>
         </div>
       </section>
     </main>
@@ -123,7 +129,7 @@ const specification = `${base}/docs/architecture/rfc/rfc-0001/`;
     <footer>
       <InferLabBrand href={`${base}/`} compact />
       <p>Reproducible LLM inference experiments.</p>
-      <div><a href={docs}>Documentation</a><a href="https://github.com/Infer-Lab/inferlab">Source</a><a href="https://github.com/Infer-Lab/inferlab/blob/main/LICENSE">MIT</a></div>
+      <div><a href={docs}>Documentation</a><a href={repositoryUrl}>Source</a><a href={`${repositoryUrl}/blob/main/LICENSE`}>MIT</a></div>
     </footer>
   </body>
 </html>

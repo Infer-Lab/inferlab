@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = ["pydantic>=2.13,<3"]
 
 [project.urls]
-Repository = "https://github.com/Infer-Lab/inferlab"
+Repository = "https://github.com/Infer-Lab/InferLab"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/inferlab_adapter_sdk"]

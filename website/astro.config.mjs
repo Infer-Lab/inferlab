@@ -1,11 +1,22 @@
 import { defineConfig } from 'astro/config';
+import sitemap from '@astrojs/sitemap';
 import starlight from '@astrojs/starlight';
+import {
+  repositoryUrl,
+  siteBase,
+  siteBaseWithSlash,
+  siteOrigin,
+} from './site.config.mjs';
 
 export default defineConfig({
-  site: 'https://infer-lab.github.io',
-  base: '/inferlab',
+  site: siteOrigin,
+  base: siteBase,
   trailingSlash: 'ignore',
   integrations: [
+    sitemap({
+      filter: (page) => page !== `${siteOrigin}${siteBase}`,
+      customPages: [`${siteOrigin}${siteBaseWithSlash}`],
+    }),
     starlight({
       title: 'InferLab',
       description: 'Reproducible LLM inference experiments, from declared intent to durable evidence.',
@@ -18,7 +29,7 @@ export default defineConfig({
         {
           icon: 'github',
           label: 'InferLab on GitHub',
-          href: 'https://github.com/Infer-Lab/inferlab',
+          href: repositoryUrl,
         },
       ],
       sidebar: [
