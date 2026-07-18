@@ -1,4 +1,5 @@
 use crate::InferlabError;
+use crate::operation::{OperationPosition, OperationProgress, OperationPublisher};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -83,6 +84,8 @@ struct ProgressState {
     delayed_deadline: Option<Instant>,
     visible: bool,
     active: Option<ActivePhase>,
+    observed_record: Option<String>,
+    observed_record_dir: Option<String>,
 }
 
 impl ProgressState {
@@ -93,10 +96,18 @@ impl ProgressState {
             delayed_deadline: None,
             visible: false,
             active: None,
+            observed_record: None,
+            observed_record_dir: None,
         }
     }
 
     fn begin(&mut self, now: Instant, phase: Phase) -> Option<String> {
+        if self.observed_record.is_none()
+            && let Some(record) = &phase.record
+        {
+            self.observed_record = Some(record.clone());
+            self.observed_record_dir = phase.record_dir.clone();
+        }
         let deadline = *self
             .delayed_deadline
             .get_or_insert(now + FIRST_REPORT_AFTER);
@@ -136,6 +147,22 @@ impl ProgressState {
         if let Some(active) = self.active.as_mut() {
             active.phase.readiness_failure = Some(failure.into());
         }
+    }
+
+    fn observation(&self) -> Option<OperationProgress> {
+        self.active.as_ref().map(|active| OperationProgress {
+            phase: active.phase.name.clone(),
+            item: active.phase.item.clone(),
+            position: active
+                .phase
+                .position
+                .map(|(index, total)| OperationPosition { index, total }),
+            lock: active.phase.lock.clone(),
+            readiness_failure: active.phase.readiness_failure.clone(),
+            record_ref: self.observed_record.clone(),
+            record_dir: self.observed_record_dir.clone(),
+            log_ref: active.phase.log.clone(),
+        })
     }
 
     fn wait_duration(&self, now: Instant) -> Duration {
@@ -202,6 +229,7 @@ struct SharedState {
     writer: Box<dyn Write + Send>,
     stopped: bool,
     write_error: Option<io::Error>,
+    observer: Option<OperationPublisher>,
 }
 
 struct Shared {
@@ -220,7 +248,15 @@ pub(crate) struct Progress {
 
 impl Progress {
     pub(crate) fn stderr(command: &str, mode: Mode) -> Result<Self, InferlabError> {
-        Self::with_writer(command, mode, Box::new(io::stderr()))
+        Self::with_writer(command, mode, Box::new(io::stderr()), None)
+    }
+
+    pub(crate) fn stderr_observed(
+        command: &str,
+        mode: Mode,
+        observer: OperationPublisher,
+    ) -> Result<Self, InferlabError> {
+        Self::with_writer(command, mode, Box::new(io::stderr()), Some(observer))
     }
 
     pub(crate) fn silent() -> Self {
@@ -234,6 +270,7 @@ impl Progress {
         command: &str,
         mode: Mode,
         writer: Box<dyn Write + Send>,
+        observer: Option<OperationPublisher>,
     ) -> Result<Self, InferlabError> {
         let shared = Arc::new(Shared {
             state: Mutex::new(SharedState {
@@ -241,6 +278,7 @@ impl Progress {
                 writer,
                 stopped: false,
                 write_error: None,
+                observer,
             }),
             changed: Condvar::new(),
         });
@@ -263,6 +301,7 @@ impl Progress {
         if let Some(line) = state.progress.begin(Instant::now(), phase) {
             write_line(&mut state, &line);
         }
+        publish_observation(&state)?;
         drop(state);
         shared.changed.notify_all();
         Ok(())
@@ -274,6 +313,7 @@ impl Progress {
         };
         let mut state = lock_state(shared);
         state.progress.set_readiness_failure(failure);
+        let _ = publish_observation(&state);
     }
 
     pub(crate) fn finish(mut self) -> Result<(), InferlabError> {
@@ -281,7 +321,10 @@ impl Progress {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        Ok(())
+        self.shared
+            .as_ref()
+            .and_then(|shared| lock_state(shared).observer.clone())
+            .map_or(Ok(()), |observer| observer.health())
     }
 
     fn stop_worker(&self) {
@@ -313,6 +356,7 @@ fn heartbeat_loop(shared: &Arc<Shared>) {
         let now = Instant::now();
         if let Some(line) = state.progress.due(now) {
             write_line(&mut state, &line);
+            let _ = publish_observation(&state);
         }
         let wait = state.progress.wait_duration(Instant::now());
         state = match shared.changed.wait_timeout(state, wait) {
@@ -336,6 +380,13 @@ fn write_line(state: &mut SharedState, line: &str) {
     if let Err(source) = writeln!(state.writer, "{line}").and_then(|()| state.writer.flush()) {
         state.write_error = Some(source);
     }
+}
+
+fn publish_observation(state: &SharedState) -> Result<(), InferlabError> {
+    if let (Some(observer), Some(progress)) = (&state.observer, state.progress.observation()) {
+        observer.publish(progress)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -389,6 +440,7 @@ mod tests {
             "toolchain install",
             Mode::Immediate,
             Box::new(FailingWriter),
+            None,
         );
         assert!(progress.is_ok());
         let progress = progress.ok();
@@ -486,5 +538,46 @@ mod tests {
                 .due(start + Duration::from_secs(18))
                 .is_some_and(|line| line.contains("elapsed=10s"))
         );
+    }
+
+    #[test]
+    fn operation_projection_retains_record_after_progress_moves_to_a_later_phase() {
+        let start = Instant::now();
+        let mut state = ProgressState::new("recipe run", Mode::Immediate);
+        let _ = state.begin(
+            start,
+            Phase::named("record created").record("recipe-1", "/records/recipe-1"),
+        );
+        let _ = state.begin(
+            start + Duration::from_secs(1),
+            Phase::named("server startup"),
+        );
+        let observation = state.observation();
+        assert!(observation.is_some_and(|observation| {
+            observation.phase == "server startup"
+                && observation.record_ref.as_deref() == Some("recipe-1")
+                && observation.record_dir.as_deref() == Some("/records/recipe-1")
+        }));
+    }
+
+    #[test]
+    fn nested_workflow_records_do_not_replace_the_invocation_record() {
+        let start = Instant::now();
+        let mut state = ProgressState::new("recipe run", Mode::Immediate);
+        let _ = state.begin(
+            start,
+            Phase::named("recipe record created").record("recipe-1", "/records/recipe-1"),
+        );
+        let _ = state.begin(
+            start + Duration::from_secs(1),
+            Phase::named("server record created").record("server-1", "/records/server-1"),
+        );
+
+        let observation = state.observation();
+
+        assert!(observation.is_some_and(|observation| {
+            observation.record_ref.as_deref() == Some("recipe-1")
+                && observation.record_dir.as_deref() == Some("/records/recipe-1")
+        }));
     }
 }

@@ -20,6 +20,17 @@ dist/
 .venv/
 python/**/pixi.lock
 
+# Website
+website/node_modules/
+website/dist/
+website/.astro/
+website/src/content/docs/docs/getting-started/installation.md
+website/src/content/docs/docs/guides/workspace-authoring.md
+website/src/content/docs/docs/guides/tui.md
+website/src/content/docs/docs/reference/backend-support.md
+website/src/content/docs/docs/architecture/rfc/RFC-*.md
+website/src/content/docs/docs/architecture/adr/ADR-*.md
+
 # Editor
 *.code-workspace
 

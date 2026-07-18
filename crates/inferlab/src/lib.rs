@@ -1,6 +1,7 @@
 mod adapter;
 mod adhoc;
 mod agent;
+mod atomic_json;
 mod bench_metric;
 mod cli;
 mod container;
@@ -9,6 +10,7 @@ mod environment;
 mod error;
 mod image;
 mod interrupt;
+mod operation;
 mod process_group;
 mod profiler;
 mod progress;
@@ -22,6 +24,7 @@ mod ssh;
 mod time_bound;
 mod toml_override;
 mod toolchain;
+mod tui;
 mod workload;
 mod workspace;
 

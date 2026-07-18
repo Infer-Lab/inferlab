@@ -26,26 +26,8 @@ jobs:
             asset: inferlab-aarch64-linux
     steps:
       - uses: actions/checkout@v7
-      - name: Tag matches the crate version
-        run: |
-          crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          test "${GITHUB_REF_NAME}" = "v${crate_version}"
-      - name: Python packages match the crate version
-        run: |
-          # Lockstep releases stamp one version across the binary and every
-          # workspace-side wheel (ADR-0009); a drifted pyproject would publish
-          # a wheel outside the tested same-version set. The workflow only
-          # gates agreement — it builds no wheels.
-          crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          inventory_file=$(mktemp)
-          scripts/python-package-inventory.sh all > "${inventory_file}"
-          while IFS= read -r package; do
-            pyproject="python/${package}/pyproject.toml"
-            py_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "${pyproject}" | head -1)
-            test -n "${py_version}" || { echo "${pyproject}: no version field found"; exit 1; }
-            test "${py_version}" = "${crate_version}" || { echo "${pyproject}: version ${py_version} != crate version ${crate_version}"; exit 1; }
-          done < "${inventory_file}"
-          rm -f "${inventory_file}"
+      - name: Product tag and release-owned package versions agree
+        run: scripts/check-product-release-version.sh "${GITHUB_REF_NAME}"
       - name: Toolchain + target
         run: |
           rustup set profile minimal

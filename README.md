@@ -1,4 +1,4 @@
-# Inferlab
+# InferLab
 
 Reproducible LLM inference experiments. A committed **workspace** fixes the
 shareable baseline — stacks, named servers and cases, recipes, and eval/bench
@@ -19,6 +19,8 @@ you can inspect, compare, and reproduce.
   digest; a clean-workspace run is reproducible from a fresh checkout.
 - **Operator journal** — an append-only scratchpad on the same time axis as
   the records.
+- **View-only TUI** — one responsive workspace console for declared definitions,
+  concurrent CLI work, records, referenced logs, and journal context.
 
 ## Install
 
@@ -41,7 +43,7 @@ yet.
 
 ### Agent skill
 
-Inferlab ships an operator skill for Claude Code and Codex, embedded in the
+InferLab ships an operator skill for Claude Code and Codex, embedded in the
 binary at the same version — no checkout or network access needed:
 
 ```sh
@@ -60,6 +62,7 @@ pixi install --locked --all                 # realize every stack's selected Pix
 inferlab workspace show                     # validate and browse public definitions
 inferlab stack status                       # confirm each stack realization
 inferlab toolchain install                  # measurement runtimes (only for lm-eval/Bench measurements)
+inferlab tui                                # observe this workspace; never starts or changes work
 
 inferlab recipe run my-recipe --dry-run     # validate placement, devices, commands, environment
 inferlab recipe run my-recipe --case tp2    # closed loop: serve + eval/bench + cleanup
@@ -74,10 +77,15 @@ those commands resolves and validates without launching or writing one.
 
 ## Documentation
 
+- [Product and documentation website](https://infer-lab.github.io/inferlab/):
+  the searchable public entry point for current operator guidance, RFCs, and
+  ADRs.
 - [Workspace authoring](docs/workspace-authoring.md): public definitions,
   local bindings, heterogeneous P/D placement, typed patches, and dry-run.
 - [Backend support](docs/backend-support.md): maintained backend capabilities
   and integration package names.
+- [View-only TUI](docs/tui.md): workspace observation, source labels, views,
+  keys, search, refresh, and stale-state semantics.
 - [RFC-0001 — Specification Overview And Authority Map](docs/rfc/RFC-0001.md):
   the entry point of the normative external contract; topic RFCs under
   [docs/rfc/](docs/rfc/) own workspaces/stacks, servers/execution,

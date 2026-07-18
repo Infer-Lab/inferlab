@@ -1,7 +1,7 @@
 {
   "name": "inferlab",
-  "version": "0.4.0",
-  "description": "Agent Skill for operating the Inferlab CLI: reproducible LLM inference experiments with file-first evidence.",
+  "version": "0.5.0",
+  "description": "Agent Skill for operating the InferLab CLI: reproducible LLM inference experiments with file-first evidence.",
   "author": {
     "name": "Zihua Wu"
   },
@@ -17,9 +17,9 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Inferlab",
-    "shortDescription": "Run reproducible LLM inference experiments with the Inferlab CLI.",
-    "longDescription": "A reusable Agent Skill for driving Inferlab: versioned workspaces, serve lifecycles, closed-loop eval/bench recipes, runtime images, and file-first execution records.",
+    "displayName": "InferLab",
+    "shortDescription": "Run reproducible LLM inference experiments with the InferLab CLI.",
+    "longDescription": "A reusable Agent Skill for driving InferLab: versioned workspaces, serve lifecycles, closed-loop eval/bench recipes, runtime images, and file-first execution records.",
     "developerName": "Zihua Wu",
     "category": "Developer Tools",
     "capabilities": [

@@ -17,8 +17,14 @@ case "${scope}" in
       "${python_root}"/inferlab-integration-*/pyproject.toml
     )
     ;;
+  release-owned)
+    pyprojects=(
+      "${python_root}/inferlab-bench-runner/pyproject.toml"
+      "${python_root}/inferlab-eval-runner/pyproject.toml"
+    )
+    ;;
   *)
-    echo "usage: $0 {all|workspace-side}" >&2
+    echo "usage: $0 {all|workspace-side|release-owned}" >&2
     exit 2
     ;;
 esac

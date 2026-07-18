@@ -1,11 +1,11 @@
 ---
 name: inferlab
-description: "Use when operating Inferlab: run reproducible LLM inference experiments through a versioned workspace — serve lifecycles, closed-loop eval/bench recipes, standalone benches, Nsight Systems capture, runtime images, and the scratchpad journal — always reading results from file-first execution records."
+description: "Use when operating InferLab: run reproducible LLM inference experiments through a versioned workspace — serve lifecycles, closed-loop eval/bench recipes, standalone benches, Nsight Systems capture, runtime images, and the scratchpad journal — always reading results from file-first execution records."
 ---
 
-# Inferlab Operator Workflow
+# InferLab Operator Workflow
 
-Inferlab runs reproducible LLM inference experiments. A committed **workspace**
+InferLab runs reproducible LLM inference experiments. A committed **workspace**
 fixes the shareable baseline (stacks, named servers and cases, recipes, and
 eval/bench definitions); a git-ignored **local bindings** file
 (`.inferlab/local.toml`) supplies the machine-private facts (model weight
@@ -51,7 +51,7 @@ inferlab toolchain install               # eval/bench measurement runtimes (only
 implicit `default` environment, not every named environment selected by the
 workspace's stacks — pass `--all`, or `--environment <PIXI_ENV>` for one.
 `inferlab stack status` confirms the result without requiring local bindings,
-so it's the right first Inferlab command in a fresh checkout: it reports each stack as `confirmed`,
+so it's the right first InferLab command in a fresh checkout: it reports each stack as `confirmed`,
 `never-installed`, or `not-usable`, and exits nonzero if any isn't confirmed.
 `toolchain install` adds only the eval/bench measurement runtimes and is
 needed only when you run an lm-eval or Bench measurement. Bind your local
@@ -107,7 +107,7 @@ measurement identity, kind, suite membership, gate, or server selection.
 lm-eval name (`task = "gsm8k"`), a release-bundled task
 (`task = { bundled = "estonia" }`), or a tracked workspace YAML
 (`task = { yaml = "evals/long-context.yaml" }`). The task owns its dataset,
-splits, prompting, output type, filters, and scorer. Inferlab uses the resolved
+splits, prompting, output type, filters, and scorer. InferLab uses the resolved
 model-weight locator as the Hugging Face tokenizer locator. It sends
 `generate_until` tasks to chat completions; prompt-logprob tasks use
 completions after a tokenizer/logprob alignment probe.
@@ -124,14 +124,14 @@ inferlab recipe run qualify \
   --dry-run
 ```
 
-Inferlab retains the model, prompt/messages, streaming, one-completion, output
+InferLab retains the model, prompt/messages, streaming, one-completion, output
 bound, stop, and repeated-trial seed fields. A conflicting `request_body`
 member fails validation. For a concurrency Bench,
 `warmup_prompts_per_concurrency = n` resolves `concurrency * n` native warmup
 requests before profiling; warmup is excluded from normalized metrics. Use
 `output_tokens = 1` for a prefill-dominant Bench; TPOT is then inapplicable and
 omitted. See the
-[0.4.0 workspace authoring guide](https://github.com/Infer-Lab/inferlab/blob/v0.4.0/docs/workspace-authoring.md)
+[0.5.0 workspace authoring guide](https://github.com/Infer-Lab/inferlab/blob/v0.5.0/docs/workspace-authoring.md)
 for task-source, request-body, warmup, request-source, metric, and SLO examples.
 
 **Closed loop.** `inferlab recipe run <RECIPE> --case <CASE>` starts the

@@ -1,8 +1,10 @@
-# Inferlab Adapter SDK
+# InferLab Adapter SDK
 
-Generated Pydantic protocol models and runtime helpers for Inferlab framework
-integrations. The SDK is released in lockstep with Inferlab and is normally
-installed through an exact dependency from an integration package.
+Generated Pydantic protocol models and runtime helpers for InferLab framework
+integrations. The SDK and each framework integration own independent package
+versions. An integration declares the exact SDK version it was built and tested
+against, while runtime compatibility with InferLab is governed by the adapter
+protocol version.
 
-See the [Inferlab repository](https://github.com/Infer-Lab/inferlab) for usage
+See the [InferLab repository](https://github.com/Infer-Lab/inferlab) for usage
 and protocol documentation.

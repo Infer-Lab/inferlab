@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 pub(crate) const SCRATCHPADS_DIR: &str = ".inferlab/scratchpads";
-const JOURNAL_FILE: &str = "journal.jsonl";
+pub(crate) const JOURNAL_FILE: &str = "journal.jsonl";
 
 /// Entries the default view renders before pointing at `--all`.
 const DEFAULT_TAIL: usize = 10;
@@ -28,6 +28,30 @@ struct Entry {
     topic: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     records: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct JournalObservation {
+    pub timestamp: String,
+    pub author: String,
+    pub text: String,
+    pub topic: Option<String>,
+    pub records: Vec<String>,
+}
+
+pub(crate) fn observe(root: &Path) -> Result<Vec<JournalObservation>, InferlabError> {
+    read_entries(root, &Progress::silent()).map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| JournalObservation {
+                timestamp: entry.timestamp,
+                author: entry.author,
+                text: entry.text,
+                topic: entry.topic,
+                records: entry.records,
+            })
+            .collect()
+    })
 }
 
 /// Minimal tolerant projection of a referenced record for one-line summaries.

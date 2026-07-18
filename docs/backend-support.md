@@ -1,8 +1,8 @@
 # Backend Support Matrix
 
 This public document is the authority for the operator-visible backend
-capabilities on the current Inferlab main branch. It describes workflows that
-Inferlab plans, executes, and records; it is not a list of every feature offered
+capabilities on the current InferLab main branch. It describes workflows that
+InferLab plans, executes, and records; it is not a list of every feature offered
 by the upstream frameworks.
 
 Status meanings:
@@ -18,7 +18,7 @@ Status meanings:
   establish endpoint capability.
 - **Unqualified**: no complete real public-route record establishes the
   capability for the exact path in the cell.
-- **—**: rejected by the integration or not exposed by Inferlab.
+- **—**: rejected by the integration or not exposed by InferLab.
 
 A qualified baseline is evidence for that concrete shape, not blanket
 certification of every framework version, model, device, or parallel configuration.
@@ -34,13 +34,13 @@ certification of every framework version, model, device, or parallel configurati
 | KV-transfer backend | Qualified: Mooncake and NIXL | Qualified: Mooncake and NIXL in the pairing-specific baselines below | Qualified: NIXL with the built-in proxy and native `trtllm-disaggregated` | Qualified: Mooncake for the maintained 1P1D pairing below |
 | Request routing | Qualified: direct single endpoint, built-in P/D proxy, and vLLM Router | Qualified: direct single endpoint; built-in P/D proxy and SGLang Router in the pairing-specific baselines below | Qualified: direct single endpoint, built-in proxy, and `trtllm-disaggregated` | Qualified: direct single endpoint and native `tokenspeed-smg` P/D routing for the maintained 1P1D pairing below |
 | Declared public workload paths | `/v1/completions`; `/v1/chat/completions` | `/v1/completions`; `/v1/chat/completions` | `/v1/completions`; `/v1/chat/completions` | `/v1/completions`; `/v1/chat/completions` |
-| Completion request used by Inferlab | Qualified: scalar prompt | Qualified: scalar prompt | Qualified: scalar prompt | Qualified: scalar prompt |
+| Completion request used by InferLab | Qualified: scalar prompt | Qualified: scalar prompt | Qualified: scalar prompt | Qualified: scalar prompt |
 | Chat-completions execution | Supported: direct serving lowers a selected vLLM reasoning parser, and the built-in Mooncake and NIXL P/D proxies preserve the route; no exact public-route record qualifies these paths | Supported by deterministic built-in P/D proxy coverage; the native router and every exact public route remain Unqualified | Supported by deterministic built-in P/D proxy coverage for context-first streaming and non-streaming handoff; the native router and every exact public route remain Unqualified | Unqualified: the named path is preserved; native P/D routing requires separate qualification |
 | Prefix-cache reset between cases | Limited: `POST /reset_prefix_cache` for `single`; no reset control on the P/D endpoint | `POST /flush_cache` for `single`; Qualified for the demonstrated P/D pairings below | —; P/D enforces block reuse off at launch | Qualified for `single` and the maintained P/D pairing below through `POST /flush_cache` |
 | Framework profiling capture | Supported | — | — | — |
 
 The two named paths are endpoint-contract facts, not route qualification. Chat
-execution becomes Qualified only after an Inferlab workflow produces a real
+execution becomes Qualified only after an InferLab workflow produces a real
 record through the exact integration, route, topology, routing backend, and
 model being claimed. Optional upstream API extensions such as embeddings and
 batched prompt arrays remain outside this matrix. A pending upstream pull

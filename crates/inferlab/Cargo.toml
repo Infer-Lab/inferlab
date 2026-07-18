@@ -23,11 +23,14 @@ readme = "../../README.md"
 [dependencies]
 agent-plugin-installer.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 ctrlc.workspace = true
 flate2.workspace = true
 fs2.workspace = true
-inferlab-protocol = { path = "../inferlab-protocol", version = "0.4" }
-inferlab-proxy = { path = "../inferlab-proxy", version = "0.4" }
+inferlab-protocol = { path = "../inferlab-protocol", version = "0.5" }
+inferlab-proxy = { path = "../inferlab-proxy", version = "0.5" }
+humantime.workspace = true
+ratatui.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
@@ -39,6 +42,8 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 toml.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 wait-timeout.workspace = true
 yaml_serde.workspace = true
 

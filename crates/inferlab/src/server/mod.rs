@@ -72,7 +72,21 @@ pub(crate) fn start_for_recipe(
 }
 
 pub fn status(root: &Path, id: &str) -> Result<ServerStatusReport, InferlabError> {
-    status_with_runtime(root, id, &SystemProcessRuntime, &Progress::silent())
+    status_with_runtime(root, id, &SystemProcessRuntime, &Progress::silent(), None)
+}
+
+pub(crate) fn status_with_bound(
+    root: &Path,
+    id: &str,
+    bound: &crate::time_bound::OperationBound,
+) -> Result<ServerStatusReport, InferlabError> {
+    status_with_runtime(
+        root,
+        id,
+        &SystemProcessRuntime,
+        &Progress::silent(),
+        Some(bound),
+    )
 }
 
 pub(crate) fn status_with_progress(
@@ -80,7 +94,7 @@ pub(crate) fn status_with_progress(
     id: &str,
     progress: &Progress,
 ) -> Result<ServerStatusReport, InferlabError> {
-    status_with_runtime(root, id, &SystemProcessRuntime, progress)
+    status_with_runtime(root, id, &SystemProcessRuntime, progress, None)
 }
 
 pub(crate) fn require_running(report: &ServerStatusReport) -> Result<(), InferlabError> {
@@ -641,6 +655,7 @@ fn status_with_runtime<R: ProcessObserver>(
     id: &str,
     runtime: &R,
     progress: &Progress,
+    bound: Option<&crate::time_bound::OperationBound>,
 ) -> Result<ServerStatusReport, InferlabError> {
     let record = load_record(root, id)?;
     let finalized = record.finished_unix_ms.is_some();
@@ -653,10 +668,10 @@ fn status_with_runtime<R: ProcessObserver>(
         let process_status = if finalized {
             None
         } else {
-            evidence
-                .handle
-                .as_ref()
-                .map(|handle| runtime.status(handle))
+            evidence.handle.as_ref().map(|handle| match bound {
+                Some(bound) => runtime.status_with_bound(handle, bound),
+                None => runtime.status(handle),
+            })
         };
         let observed_alive = process_status.as_ref().is_some_and(|status| status.alive);
         processes.push(ServerProcessStatusReport {
@@ -896,12 +911,14 @@ mod tests {
     use inferlab_protocol::{
         EndpointProtocol, Parallelism, ProtocolVersion, ServeRoleKind, ServeTopology,
     };
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
     struct FakeRuntime {
         spawn_results: RefCell<VecDeque<Result<runtime::ProcessHandle, LaunchFailure>>>,
         terminated: RefCell<Vec<u32>>,
+        status_calls: Cell<usize>,
+        bounded_status_calls: Cell<usize>,
     }
 
     impl ProcessLauncher for FakeRuntime {
@@ -948,6 +965,7 @@ mod tests {
 
     impl ProcessObserver for FakeRuntime {
         fn status(&self, _handle: &runtime::ProcessHandle) -> ProcessStatus {
+            self.status_calls.set(self.status_calls.get() + 1);
             ProcessStatus {
                 queried: true,
                 alive: true,
@@ -957,10 +975,16 @@ mod tests {
 
         fn status_with_bound(
             &self,
-            handle: &runtime::ProcessHandle,
+            _handle: &runtime::ProcessHandle,
             _bound: &crate::time_bound::OperationBound,
         ) -> ProcessStatus {
-            self.status(handle)
+            self.bounded_status_calls
+                .set(self.bounded_status_calls.get() + 1);
+            ProcessStatus {
+                queried: true,
+                alive: true,
+                error: None,
+            }
         }
 
         fn sync_logs(
@@ -1117,6 +1141,8 @@ mod tests {
                 )),
             ])),
             terminated: RefCell::new(Vec::new()),
+            status_calls: Cell::new(0),
+            bounded_status_calls: Cell::new(0),
         };
 
         let result =
@@ -1151,6 +1177,35 @@ mod tests {
         assert!(record.process_evidence["rank-001"].handle.is_none());
         assert!(!record.process_evidence["rank-001"].cleanup[0].verified);
         assert!(record.finished_unix_ms.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_status_uses_only_the_bounded_process_observer_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let runtime = FakeRuntime {
+            spawn_results: RefCell::new(VecDeque::from([Ok(fake_handle(51)), Ok(fake_handle(52))])),
+            terminated: RefCell::new(Vec::new()),
+            status_calls: Cell::new(0),
+            bounded_status_calls: Cell::new(0),
+        };
+        let record =
+            start_with_runtime(root.path(), resolved(), None, &runtime, &Progress::silent())?;
+        let process_count = record.process_evidence.len();
+        let bound = crate::time_bound::OperationBound::finite(std::time::Duration::from_secs(1));
+
+        let report = status_with_runtime(
+            root.path(),
+            &record.id,
+            &runtime,
+            &Progress::silent(),
+            Some(&bound),
+        )?;
+
+        assert!(report.observed_alive);
+        assert_eq!(runtime.status_calls.get(), 0);
+        assert_eq!(runtime.bounded_status_calls.get(), process_count);
         Ok(())
     }
 

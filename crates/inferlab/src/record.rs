@@ -1,6 +1,5 @@
 use crate::InferlabError;
 use serde::Serialize;
-use std::fs;
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -16,23 +15,13 @@ pub(crate) const RECORD_FILE: &str = "record.json";
 /// their own shapes (a dotfile temp and a non-atomic rewrite, respectively) and
 /// do not route through here.
 pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<(), InferlabError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| InferlabError::RecordIo {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut bytes = serde_json::to_vec_pretty(value)
-        .map_err(|source| InferlabError::RecordEncode { source })?;
-    bytes.push(b'\n');
-    fs::write(&temporary, bytes).map_err(|source| InferlabError::RecordIo {
-        path: temporary.clone(),
-        source,
-    })?;
-    fs::rename(&temporary, path).map_err(|source| InferlabError::RecordIo {
-        path: path.to_path_buf(),
-        source,
+    crate::atomic_json::write(path, value).map_err(|error| match error {
+        crate::atomic_json::AtomicJsonError::Encode(source) => {
+            InferlabError::RecordEncode { source }
+        }
+        crate::atomic_json::AtomicJsonError::Io { path, source, .. } => {
+            InferlabError::RecordIo { path, source }
+        }
     })
 }
 

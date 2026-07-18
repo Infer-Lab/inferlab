@@ -1,0 +1,22 @@
+{
+  "name": "inferlab-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "node scripts/sync-content.mjs",
+    "dev": "npm run sync && astro dev",
+    "test": "node --test scripts/*.test.mjs",
+    "check": "npm test && npm run sync && astro check",
+    "build": "npm run sync && astro build && node scripts/verify-build.mjs",
+    "verify": "npm run check && npm run build"
+  },
+  "dependencies": {
+    "@astrojs/check": "0.9.9",
+    "@astrojs/starlight": "0.41.3",
+    "astro": "7.1.1",
+    "typescript": "6.0.3"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}

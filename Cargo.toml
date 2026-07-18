@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -20,12 +20,14 @@ async-stream = "0.3"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
 flate2 = "1"
 fs2 = "0.4"
 futures-util = "0.3"
 insta = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rustix = { version = "1", features = ["process", "system"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -37,6 +39,9 @@ thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "1"
+humantime = "2"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 wait-timeout = "0.2"
 yaml_serde = "0.10"
 

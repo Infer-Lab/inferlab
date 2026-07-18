@@ -48,9 +48,15 @@ verify-rust: fmt-check build test clippy doc
 verify-python:
     pixi run verify-python
 
+# The locked static website gate, exactly what CI's website job runs
+[group("checks")]
+verify-website:
+    pixi run -e website website-install
+    pixi run -e website website-verify
+
 # Everything CI runs
 [group("checks")]
-verify: verify-rust verify-python
+verify: verify-rust verify-python verify-website
 
 # ---------------------------------------------------------------------------- #
 #                                    RELEASE                                   #

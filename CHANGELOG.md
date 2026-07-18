@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-18
+
+### Added
+
+- `inferlab tui` provides a persistent, strictly view-only console for one
+  discovered or explicitly selected workspace. Its Overview, Operations,
+  Records, and Workspace views combine declared definitions, concurrent CLI
+  observations, records, referenced logs, and scratchpad context without
+  starting or changing an experiment.
+- A static product and documentation website publishes the selected public
+  guides together with the current RFC and ADR corpus through GitHub Pages,
+  with search, locked local preview and production-build tasks, and
+  revision-matched CI deployment.
+- Public SGLang reference workflows and support documentation cover
+  disaggregated prefill/decode serving with Model Gateway, Mooncake, and NIXL,
+  while distinguishing execution-qualified pairings from supported but
+  unqualified cross-pairings.
+
+### Changed
+
+- The TUI uses a responsive infrastructure-console hierarchy, typed Global Find
+  and contextual log search, stable object navigation, and a record-local
+  Metrics surface that compares one selected metric across authoritative case
+  loads with horizontal bars and explicit missing or failed states.
+- The complete Records catalog and Global Find scale to at least 1,000 records
+  through source-aware disposable projections, tiered observation cadence, one
+  fair refresh-wide active-server probe budget, and redraws driven by observable
+  presentation changes rather than the input-poll loop.
+- The final capless IL mark and InferLab Blue brand color are applied
+  consistently across the website, favicon, plugin identity, and TUI loading
+  and accent surfaces; constrained terminals retain a compact text fallback.
+- The adapter SDK and each framework integration own independent package
+  versions and package-scoped releases. InferLab product releases continue to
+  version the Cargo workspace, embedded plugin, and internal measurement
+  runners; exact workspace pins preserve artifacts and the adapter protocol
+  version remains the runtime compatibility authority.
+- Published framework workspace baselines are clean and reproducible, with
+  generic local-binding examples and without machine-local state, credentials,
+  model locators, or cross-framework package drift.
+
+### Fixed
+
+- TUI rows and details keep recorded lifecycle, observed process liveness, and
+  refresh health separate: stopped servers no longer appear live, a dead process
+  behind a recorded-running server becomes explicit attention, and a failed
+  observation retains its prior value only as stale.
+- Healthy automatic refresh shows a stable cadence instead of oscillating
+  between `now` and elapsed ages. The indicator reports waiting before its
+  first generation, becomes overdue only after two missed intervals, measures
+  receipt age monotonically, and recovers after the next completed generation.
+- Global Find no longer combines unrelated typed fields into false matches,
+  keyboard selection opens the chosen result, referenced-log search retains its
+  owning object and selected log, and responsive layouts preserve navigation
+  and visible overflow down to the supported minimum terminal size.
+- Human-facing data-age labels remain `now` for their complete first second;
+  elapsed-duration fields retain subsecond precision.
+- Website routes accept either local trailing-slash form while publishing one
+  canonical form, human-facing brand text consistently uses InferLab, and
+  projected Markdown renders one semantic page title instead of duplicating its
+  leading heading.
+
 ## [0.4.0] - 2026-07-16
 
 ### Added

@@ -1,0 +1,24 @@
+:root {
+  --sl-color-accent-low: color-mix(in srgb, var(--inferlab-blue) 20%, var(--sl-color-black));
+  --sl-color-accent: var(--inferlab-blue);
+  --sl-color-accent-high: color-mix(in srgb, var(--inferlab-blue) 35%, var(--sl-color-white));
+  --sl-color-white: #eef8fa;
+  --sl-color-gray-1: #d7e7ea;
+  --sl-color-gray-2: #9fb4bc;
+  --sl-color-gray-3: #6f8994;
+  --sl-color-gray-4: #3b5560;
+  --sl-color-gray-5: #20343c;
+  --sl-color-gray-6: #122229;
+  --sl-color-black: #071015;
+  --sl-font: Inter, ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+html { overflow-x: clip; }
+body { min-width: 320px; overflow-x: clip; }
+.header { border-bottom-color: color-mix(in srgb, var(--sl-color-gray-5), transparent 25%); }
+.sl-markdown-content a { text-underline-offset: .2em; }
+.sidebar-content a[aria-current="page"] { font-weight: 700; }
+@media (min-width: 72rem) {
+  :root { --sl-content-width: 58rem; }
+}

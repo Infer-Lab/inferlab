@@ -13,6 +13,7 @@ jsonschema = "==4.26.0"
 types-jsonschema = "==4.26.0.20260518"
 python-build = "1.*"
 hatchling = ">=1.27,<2"
+packaging = ">=24,<27"
 uv = "0.*"
 
 [pypi-dependencies]
@@ -35,5 +36,20 @@ format-python-check = "ruff format --check python crates/inferlab/tests/fixtures
 lint-python = "ruff check python crates/inferlab/tests/fixtures/bin"
 typecheck-python = "mypy python"
 test-python = "pytest"
+test-release-versioning = "bash scripts/tests/release-versioning.sh"
 build-python = "scripts/build-python-packages.sh"
-verify-python = { depends-on = ["protocol-check", "format-python-check", "lint-python", "typecheck-python", "test-python", "build-python"] }
+verify-python = { depends-on = ["protocol-check", "format-python-check", "lint-python", "typecheck-python", "test-python", "test-release-versioning", "build-python"] }
+
+[feature.website.dependencies]
+nodejs = "24.*"
+
+[feature.website.tasks]
+website-install = "npm --prefix website ci"
+website-sync = "npm --prefix website run sync"
+website-dev = "npm --prefix website run dev -- --host 0.0.0.0"
+website-check = "npm --prefix website run check"
+website-build = "npm --prefix website run build"
+website-verify = "npm --prefix website run verify"
+
+[environments]
+website = { features = ["website"], no-default-feature = true }

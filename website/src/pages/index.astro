@@ -1,0 +1,129 @@
+---
+import '../styles/product.css';
+import InferLabBrand from '../components/InferLabBrand.astro';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const docs = `${base}/docs/`;
+const install = `${base}/docs/getting-started/installation/`;
+const support = `${base}/docs/reference/backend-support/`;
+const specification = `${base}/docs/architecture/rfc/rfc-0001/`;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta
+      name="description"
+      content="InferLab makes LLM inference experiments reproducible from declared workspace intent to durable file-first evidence."
+    />
+    <link rel="icon" type="image/svg+xml" href={`${base}/favicon.svg`} />
+    <title>InferLab — Reproducible inference experiments</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <InferLabBrand href={`${base}/`} />
+      <nav aria-label="Primary navigation">
+        <a href={docs}>Docs</a>
+        <a href={support}>Backends</a>
+        <a href={specification}>Specification</a>
+        <a href="https://github.com/Infer-Lab/inferlab">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <div class="eyebrow"><span></span> Experiment control plane / file-first evidence</div>
+          <h1 id="hero-title">Make inference experiments <em>replayable.</em></h1>
+          <p class="lede">
+            Declare the shared baseline once. Keep machine facts local. Run serving,
+            evaluation, benchmarks, images, and profiling through one evidence trail.
+          </p>
+          <div class="actions">
+            <a class="button primary" href={install}>Get started <span aria-hidden="true">→</span></a>
+            <a class="button secondary" href={docs}>Read the docs</a>
+          </div>
+          <dl class="signal-row">
+            <div><dt>Authority</dt><dd>Versioned workspace</dd></div>
+            <div><dt>Execution</dt><dd>Resolved once</dd></div>
+            <div><dt>Evidence</dt><dd>Durable records</dd></div>
+          </dl>
+        </div>
+
+        <div class="console" aria-label="Example InferLab workflow">
+          <div class="console-bar">
+            <span class="status-dot"></span>
+            <span>workspace / experiment-042</span>
+            <span class="live">DECLARED</span>
+          </div>
+          <div class="topology" aria-hidden="true">
+            <div class="node source"><small>STACK</small><b>vllm</b></div>
+            <div class="trace"></div>
+            <div class="node"><small>SERVER</small><b>deepseek</b></div>
+            <div class="trace active"></div>
+            <div class="node output"><small>RECORD</small><b>01J…A7F</b></div>
+          </div>
+          <pre><code><span class="prompt">$</span> inferlab recipe run throughput --case tp8
+<span class="muted">resolve</span>  workspace revision · source digest
+<span class="muted">launch </span>  8 ranks · readiness verified
+<span class="muted">measure</span>  eval → bench → profile
+<span class="success">complete</span> .inferlab/records/01J…A7F/</code></pre>
+          <div class="telemetry" aria-hidden="true">
+            <span style="--h: 38%"></span><span style="--h: 62%"></span><span style="--h: 47%"></span>
+            <span style="--h: 83%"></span><span style="--h: 71%"></span><span style="--h: 92%"></span>
+            <span style="--h: 66%"></span><span style="--h: 78%"></span><span style="--h: 58%"></span>
+            <span style="--h: 86%"></span><span style="--h: 73%"></span><span style="--h: 95%"></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="workflow" aria-labelledby="workflow-title">
+        <div class="section-heading">
+          <p>THE OPERATOR LOOP</p>
+          <h2 id="workflow-title">Intent in. Evidence out.</h2>
+        </div>
+        <ol>
+          <li><span>01</span><div><h3>Declare</h3><p>Commit stacks, servers, cases, recipes, and measurement definitions.</p></div></li>
+          <li><span>02</span><div><h3>Bind</h3><p>Supply machine-private placement, devices, ports, and model locations locally.</p></div></li>
+          <li><span>03</span><div><h3>Resolve</h3><p>Inspect the exact commands, topology, environment, and effective values before launch.</p></div></li>
+          <li><span>04</span><div><h3>Run & inspect</h3><p>Keep lifecycle, metrics, logs, artifacts, and cleanup outcomes in one record tree.</p></div></li>
+        </ol>
+      </section>
+
+      <section class="capabilities" aria-labelledby="capabilities-title">
+        <div class="section-heading">
+          <p>ONE EXPERIMENT SURFACE</p>
+          <h2 id="capabilities-title">From server process to comparable result.</h2>
+        </div>
+        <div class="capability-grid">
+          <article><span>01 / SERVE</span><h3>Managed lifecycles</h3><p>Launch single-role or disaggregated serving topologies with readiness, logs, and verified cleanup.</p></article>
+          <article><span>02 / MEASURE</span><h3>Eval + bench</h3><p>Compose correctness and performance workloads while preserving normalized metrics and raw artifacts.</p></article>
+          <article><span>03 / PACKAGE</span><h3>Runtime images</h3><p>Build and validate OCI image realizations from the same versioned workspace baseline.</p></article>
+          <article><span>04 / PROFILE</span><h3>Systems evidence</h3><p>Attach Nsight Systems capture windows to selected workloads without splitting the experiment record.</p></article>
+          <article><span>05 / OBSERVE</span><h3>View-only TUI</h3><p>Inspect declared definitions, current CLI work, records, logs, metrics, and journal context.</p></article>
+          <article><span>06 / REPRODUCE</span><h3>Source identity</h3><p>Carry workspace revision and content identity alongside the effective execution evidence.</p></article>
+        </div>
+      </section>
+
+      <section class="cta" aria-labelledby="cta-title">
+        <div>
+          <p>START WITH THE WORKSPACE</p>
+          <h2 id="cta-title">Your experiment should explain itself.</h2>
+        </div>
+        <div class="actions">
+          <a class="button primary" href={install}>Install InferLab</a>
+          <a class="button secondary" href="https://github.com/Infer-Lab/inferlab/releases">Releases</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <InferLabBrand href={`${base}/`} compact />
+      <p>Reproducible LLM inference experiments.</p>
+      <div><a href={docs}>Documentation</a><a href="https://github.com/Infer-Lab/inferlab">Source</a><a href="https://github.com/Infer-Lab/inferlab/blob/main/LICENSE">MIT</a></div>
+    </footer>
+  </body>
+</html>

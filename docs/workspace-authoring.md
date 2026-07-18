@@ -1,6 +1,6 @@
 # Workspace authoring
 
-An Inferlab workspace has two authorities:
+An InferLab workspace has two authorities:
 
 - committed `.inferlab/workspace.toml` and `.inferlab/workspace.d/*.toml` files
   describe shareable models, stacks, servers, cases, measurements, and recipes;
@@ -253,13 +253,13 @@ single-sample `generate_until` task. Its default is `1`. The definition seed
 is the repeated base seed; when it is absent, repeated evaluation uses `1234`.
 Trial `i` uses `base_seed + i - 1`. The existing `concurrency` field controls
 those requests, and `request_body.seed` is rejected because the definition owns
-the seed schedule. Each trial repeats the complete resolved Eval; Inferlab does
+the seed schedule. Each trial repeats the complete resolved Eval; InferLab does
 not rewrite task-owned response multiplicity, filters, or scorer behavior.
 
 ## lm-eval tasks and inference requests
 
 An lm-eval definition selects exactly one task. Use a pinned lm-eval task name,
-a release-bundled Inferlab task, or a workspace-owned task YAML:
+a release-bundled InferLab task, or a workspace-owned task YAML:
 
 ```toml
 [evals.builtin]
@@ -286,15 +286,15 @@ threshold = 0.80
 timeout_seconds = 3600
 ```
 
-The task, not a second Inferlab dataset layer, owns `dataset_path`,
+The task, not a second InferLab dataset layer, owns `dataset_path`,
 `dataset_name`, split selection, prompting, output type, filters, and scoring.
 Workspace YAML paths must be workspace-relative tracked `.yaml` or `.yml`
-files. Inferlab resolves their YAML include closure, records the effective task
+files. InferLab resolves their YAML include closure, records the effective task
 configuration and dataset selection, and includes that closure in source
 identity. Release-bundled tasks are addressed only by their catalog name and
 carry a release-owned closure digest.
 
-Inferlab uses the resolved model-weight locator as the Hugging Face tokenizer
+InferLab uses the resolved model-weight locator as the Hugging Face tokenizer
 locator. This follows the normal model-directory convention and avoids a
 second tokenizer setting; the locator must contain a usable tokenizer.
 `generate_until` tasks use chat completions. Tasks whose
@@ -326,7 +326,7 @@ enable_thinking = true
 
 The same nested values may be patched for one run, for example
 `--set evals.reasoning.request_body.temperature=0.6`. `request_body` is a JSON
-request fragment, not a replacement request: Inferlab retains ownership of the
+request fragment, not a replacement request: InferLab retains ownership of the
 model, prompt or messages, streaming mode, one-completion policy, output bound,
 and stop conditions. Eval also owns the repeated-trial seed schedule. Conflicts
 with those fields fail during validation and the complete effective fragment is
@@ -357,7 +357,7 @@ result handling; process cleanup retains its separate grace.
 
 Every successful Bench reports `request_throughput`, `output_throughput`, and
 `total_token_throughput`. For each of `request_latency_ms`, `ttft_ms`, and
-`tpot_ms`, Inferlab reports `mean`, `min`, `max`, `stddev`, `p50`, `p90`,
+`tpot_ms`, InferLab reports `mean`, `min`, `max`, `stddev`, `p50`, `p90`,
 `p95`, and `p99` using names such as `p95_tpot_ms`. TPOT is not applicable to
 an `output_tokens = 1` prefill-dominant workload and its TPOT metrics are then
 omitted. `prompt_cache_read_ratio` is present only when AIPerf reports valid
@@ -403,14 +403,14 @@ request_source = { kind = "random", input_tokens = 8192, output_tokens = 1024 }
 ```
 
 The release catalog currently exposes ShareGPT as a bounded conversational
-source. Inferlab pins the Apache-2.0
+source. InferLab pins the Apache-2.0
 [ShareGPT Vicuna snapshot](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/tree/bcd32a724d8460ebe14e1d05b0195e30e9a46cb1):
 
 ```toml
 request_source = { kind = "dataset", dataset = "sharegpt", max_input_tokens = 8192 }
 ```
 
-Inferlab downloads the release-pinned snapshot on first execution, verifies
+InferLab downloads the release-pinned snapshot on first execution, verifies
 its digest, and reuses it from
 `$XDG_CACHE_HOME/inferlab/datasets/sha256/<digest>` (normally
 `~/.cache/inferlab/datasets/sha256/<digest>`). Dry-run reports the catalog and
@@ -418,7 +418,7 @@ cache state but does not download missing data.
 
 Each selected conversation becomes one independent chat-completions request.
 The final assistant message is held out to derive the output limit. If the
-rendered input exceeds `max_input_tokens`, Inferlab rolls back complete trailing
+rendered input exceeds `max_input_tokens`, InferLab rolls back complete trailing
 user/assistant exchanges until an earlier target fits; it never truncates a
 message or discards the leading history. Set `output_tokens` inside the table
 to replace target-derived output lengths, including `output_tokens = 1` for a

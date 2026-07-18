@@ -299,6 +299,21 @@ pub enum InferlabError {
         source: serde_json::Error,
     },
 
+    #[error("failed to {operation} operation observation {path}: {source}")]
+    OperationObservationIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to encode operation observation {path}: {source}")]
+    OperationObservationEncode {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("failed to write command output: {source}")]
     WriteOutput {
         #[source]
@@ -372,6 +387,9 @@ impl InferlabError {
             | Self::DatasetPreparation { .. } => "E4002",
             Self::RecordIo { .. } | Self::RecordDecode { .. } | Self::RecordEncode { .. } => {
                 "E5001"
+            }
+            Self::OperationObservationIo { .. } | Self::OperationObservationEncode { .. } => {
+                "E5002"
             }
             Self::Scratchpad { .. } => "E6001",
             Self::Agent { .. } => "E7001",

@@ -6,6 +6,13 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -40,3 +47,34 @@ jobs:
         with:
           cache: true
       - run: pixi run verify-python
+
+  website:
+    name: Website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          cache: true
+      - run: pixi run -e website website-install
+      - run: pixi run -e website website-verify
+      - if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: website/dist
+
+  deploy-pages:
+    name: Deploy GitHub Pages
+    if: github.event_name == 'push'
+    needs: [rust, python, website]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy the validated public snapshot
+        id: deployment
+        uses: actions/deploy-pages@v5

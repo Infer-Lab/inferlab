@@ -951,6 +951,29 @@ pub struct WorkspaceSnapshot {
     pub pixi_lock_sha256: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceIdentity {
+    pub revision: String,
+    pub dirty: bool,
+}
+
+/// Lightweight projection of the same Git revision and dirty authority used
+/// by resolved execution snapshots. Runtime records, observations, the local
+/// binding file, caches, and scratchpads remain outside source identity.
+pub(crate) fn workspace_identity(root: &Path) -> Result<WorkspaceIdentity, InferlabError> {
+    let exclusions = [
+        PathBuf::from(DEFAULT_LOCAL_FILE),
+        PathBuf::from(".inferlab/cache"),
+        PathBuf::from(".inferlab/records"),
+        PathBuf::from(".inferlab/runtime"),
+        PathBuf::from(".inferlab/scratchpads"),
+    ];
+    Ok(WorkspaceIdentity {
+        revision: git_text(root, &["rev-parse", "HEAD"])?,
+        dirty: !workspace_mutations(root, &exclusions)?.is_empty(),
+    })
+}
+
 pub fn discover_workspace(explicit: Option<&Path>) -> Result<PathBuf, InferlabError> {
     if let Some(path) = explicit {
         let root = if path.ends_with(WORKSPACE_FILE) {
